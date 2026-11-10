@@ -15,8 +15,10 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Result from "effect/Result";
 import * as Sink from "effect/Sink";
@@ -163,6 +165,55 @@ const localRemoteShellLayer = (home: string) =>
   );
 
 describe("ssh tunnel scripts", () => {
+  it.effect("connects and reuses a healthy tunnel when HTTP replies take 2.5 seconds", () =>
+    Effect.gen(function* () {
+      let tunnels = 0;
+      let kills = 0;
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.sync(() => {
+          if (commandArgs(command).includes("-N")) {
+            tunnels += 1;
+            return makeRunningProcess(() => {
+              kills += 1;
+            });
+          }
+          return makeSuccessfulProcess('{"remotePort":3773}\n');
+        }),
+      );
+      const requests = yield* Queue.unbounded<void>();
+      const slowHttpClient = HttpClient.make((request) =>
+        Queue.offer(requests, undefined).pipe(
+          Effect.andThen(Effect.sleep("2500 millis")),
+          Effect.as(HttpClientResponse.fromWeb(request, new Response("", { status: 200 }))),
+        ),
+      );
+      const layer = Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Layer.succeed(HttpClient.HttpClient, slowHttpClient),
+        Layer.succeed(NetService.NetService, testNetService),
+        SshAuth.SshPasswordPrompt.disabledLayer,
+        SshTunnel.SshEnvironmentManager.layer({ resolveCliRunner: Effect.succeed(ARCHIVE) }),
+      );
+      yield* Effect.gen(function* () {
+        const manager = yield* SshTunnel.SshEnvironmentManager;
+        const target = { alias: "devbox", hostname: "devbox", username: null, port: null };
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const connection = yield* Effect.forkChild(
+            manager.ensureEnvironment(target).pipe(Effect.timeoutOption("3 seconds")),
+          );
+          yield* Queue.take(requests);
+          yield* TestClock.adjust("3 seconds");
+          const result = yield* Fiber.join(connection);
+          assert.isTrue(Option.isSome(result), "A healthy slow tunnel must become ready.");
+        }
+        assert.equal(tunnels, 1);
+        assert.equal(kills, 0);
+      }).pipe(Effect.provide(layer), Effect.scoped);
+    }),
+  );
+
   it("rejects archive versions that are not a single exact version segment", () => {
     for (const archiveVersion of [
       "../other",
