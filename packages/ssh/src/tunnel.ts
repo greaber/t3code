@@ -10,6 +10,7 @@ import { extractJsonObject, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { satisfiesSemverRange } from "@t3tools/shared/semver";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -60,13 +61,16 @@ const REMOTE_LAUNCH_BASE_TIMEOUT_MS = 90_000;
 // Matches the node-script launch command's ssh run without the launch lock wait.
 const SSH_TUNNEL_CONNECT_TIMEOUT_MS = REMOTE_LAUNCH_BASE_TIMEOUT_MS;
 const SSH_TUNNEL_FORWARD_PROBE_INTERVAL_MS = 100;
-// Cold archive launches download ~70 MB, which takes hours on a slow link. Downloads fail only
-// when they stall, so archive launches have no overall deadline; ssh keepalives still end
-// one whose connection dies. Another launch waits this long for a concurrent install.
+// Cold archive launches download ~70 MB, which can take an hour on a slow link. Downloads fail
+// only when they stall; the generous launch deadline only ends one stuck elsewhere, and ssh
+// keepalives end one whose connection dies. Another launch waits this long for a concurrent install.
 const REMOTE_ARCHIVE_STALL_BYTES_PER_SECOND = 1024;
 const REMOTE_ARCHIVE_STALL_SECONDS = 60;
 const REMOTE_ARCHIVE_LOCK_WAIT_SECONDS = 360;
+const REMOTE_ARCHIVE_LAUNCH_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const REMOTE_ARCHIVE_PAIRING_TIMEOUT_MS = 900_000;
+// An update restart must not reconnect to a server that is still shutting down.
+const REMOTE_STOP_WAIT_SECONDS = 60;
 const REMOTE_REUSE_READY_TIMEOUT_MS = 2_000;
 const REMOTE_PID_EXIT_WAIT_MS = 2_000;
 // The server answers HTTP before it writes server-runtime.json, which is how
@@ -577,11 +581,20 @@ cat >"$RUNNER_NEXT" <<'SH'
 SH
 chmod 700 "$RUNNER_NEXT"
 T3_ARCHIVE_MODE=@@T3_ARCHIVE_MODE@@
+# Helpers run from RUNNER. RUNNER_FILE stays the runner of the server it
+# started; this launch's runner replaces it only when it starts one.
+RUNNER="$RUNNER_NEXT"
 if [ "$T3_ARCHIVE_MODE" = "1" ]; then
   # The archive ships the helpers below inside the executable; the remote
-  # needs no Node at all. Resolving the runner once here also downloads the
-  # archive before the port and readiness probes rely on it.
-  "$RUNNER_NEXT" --version >/dev/null
+  # needs no Node at all. Reusing this launcher's running server needs no
+  # download: its own runner has them. Otherwise resolving the new runner here
+  # downloads the archive before the port and readiness probes rely on it.
+  RECORDED_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ "$(cat "$MANAGED_FILE" 2>/dev/null || true)" = "managed" ] && [ -x "$RUNNER_FILE" ] && [ -n "$RECORDED_PID" ] && kill -0 "$RECORDED_PID" 2>/dev/null; then
+    RUNNER="$RUNNER_FILE"
+  else
+    "$RUNNER_NEXT" --version >/dev/null
+  fi
 elif ! ensure_remote_node_path; then
   printf 'Remote host is missing node on PATH. Install Node or configure a supported version manager for non-interactive shells.\\n' >&2
   exit 1
@@ -628,9 +641,6 @@ while ! (set -C; printf '%s\\n' "$$" >"$LAUNCH_LOCK") 2>/dev/null; do
   sleep 1
   LAUNCH_LOCK_WAITED=$((LAUNCH_LOCK_WAITED + 1))
 done
-# RUNNER_FILE stays the runner of the server it started; this launch's runner
-# replaces it only when it starts one.
-RUNNER="$RUNNER_NEXT"
 pick_port() {
   if [ "$T3_ARCHIVE_MODE" = "1" ]; then
     "$RUNNER" __ssh-helper pick-port "$PORT_FILE" "@@T3_DEFAULT_REMOTE_PORT@@" "@@T3_REMOTE_PORT_SCAN_WINDOW@@"
@@ -778,6 +788,11 @@ if [ -z "$REMOTE_PORT" ] && [ -z "$DEFAULT_RUNTIME_INFO" ]; then
   done
 fi
 if [ -z "$REMOTE_PORT" ]; then
+  if [ "$RUNNER" != "$RUNNER_NEXT" ]; then
+    # The server this launch meant to reuse is gone, so start the new runner.
+    "$RUNNER_NEXT" --version >/dev/null
+    RUNNER="$RUNNER_NEXT"
+  fi
   REMOTE_PORT="$(pick_port)" || true
   if [ -z "$REMOTE_PORT" ]; then
     if [ "$T3_ARCHIVE_MODE" = "1" ]; then
@@ -821,19 +836,45 @@ printf '{"remotePort":%s,"serverKind":"%s"}\\n' "$REMOTE_PORT" "\${REMOTE_MANAGE
 const REMOTE_PAIRING_SCRIPT = `set -eu
 STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
 DEFAULT_SERVER_HOME="$HOME/.t3"
-RUNNER_FILE="$STATE_DIR/run-t3.sh"
-REMOTE_PID="$(cat "$STATE_DIR/pid" 2>/dev/null || true)"
+RUNTIME_FILE="$DEFAULT_SERVER_HOME/userdata/server-runtime.json"
 mkdir -p "$STATE_DIR"
-# A running managed server issues the token with its own version; a newer one
-# would migrate the database under it.
-if [ "$(cat "$STATE_DIR/managed" 2>/dev/null || true)" != "managed" ] || [ -z "$REMOTE_PID" ] || ! kill -0 "$REMOTE_PID" 2>/dev/null || [ ! -x "$RUNNER_FILE" ]; then
-  cat >"$RUNNER_FILE" <<'SH'
+runtime_field() {
+  sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\\{0,1\\}\\([^",}]*\\).*/\\1/p' "$RUNTIME_FILE" 2>/dev/null | head -n 1
+}
+# A live server that owns this home issues the token with its own version: a
+# newer binary would migrate the database under it. Find that server's runner
+# through any alias's launch record, or its installed runtime.
+PAIR_RUNNER=""
+OWNER_PID="$(runtime_field pid)"
+if [ -z "$OWNER_PID" ] || ! kill -0 "$OWNER_PID" 2>/dev/null; then
+  OWNER_PID=""
+  if [ "$(cat "$STATE_DIR/managed" 2>/dev/null || true)" = "managed" ]; then
+    OWNER_PID="$(cat "$STATE_DIR/pid" 2>/dev/null || true)"
+  fi
+fi
+if [ -n "$OWNER_PID" ] && kill -0 "$OWNER_PID" 2>/dev/null; then
+  for LAUNCH_DIR in "$STATE_DIR" "$DEFAULT_SERVER_HOME"/ssh-launch/*; do
+    if [ "$(cat "$LAUNCH_DIR/pid" 2>/dev/null || true)" = "$OWNER_PID" ] && [ -x "$LAUNCH_DIR/run-t3.sh" ]; then
+      PAIR_RUNNER="$LAUNCH_DIR/run-t3.sh"
+      break
+    fi
+  done
+  OWNER_VERSION="$(runtime_field serverVersion)"
+  case "$OWNER_VERSION" in */* | .*) OWNER_VERSION="" ;; esac
+  OWNER_RUNTIME="$DEFAULT_SERVER_HOME/runtime/versions/$OWNER_VERSION"
+  if [ -z "$PAIR_RUNNER" ] && [ -n "$OWNER_VERSION" ] && [ -x "$OWNER_RUNTIME/t3" ] && [ "$(cat "$OWNER_RUNTIME/.install-complete" 2>/dev/null || true)" = "$OWNER_VERSION" ]; then
+    PAIR_RUNNER="$OWNER_RUNTIME/t3"
+  fi
+fi
+if [ -z "$PAIR_RUNNER" ]; then
+  PAIR_RUNNER="$STATE_DIR/run-t3.pair.$$"
+  trap 'rm -f "$PAIR_RUNNER"' EXIT
+  cat >"$PAIR_RUNNER" <<'SH'
 @@T3_RUNNER_SCRIPT@@
 SH
-  chmod 700 "$RUNNER_FILE"
+  chmod 700 "$PAIR_RUNNER"
 fi
-PAIRING_BASE_DIR="$DEFAULT_SERVER_HOME"
-"$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --json
+"$PAIR_RUNNER" auth pairing create --base-dir "$DEFAULT_SERVER_HOME" --json
 `;
 
 const REMOTE_STOP_SCRIPT = `set -eu
@@ -846,12 +887,12 @@ REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
 if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
   kill "$REMOTE_PID" 2>/dev/null || true
   WAIT_COUNT=0
-  while kill -0 "$REMOTE_PID" 2>/dev/null && [ "$WAIT_COUNT" -lt 20 ]; do
+  while kill -0 "$REMOTE_PID" 2>/dev/null && [ "$WAIT_COUNT" -lt @@T3_STOP_WAIT_TICKS@@ ]; do
     WAIT_COUNT=$((WAIT_COUNT + 1))
     sleep 0.1
   done
   if kill -0 "$REMOTE_PID" 2>/dev/null; then
-    printf 'Remote T3 server with PID %s did not stop within 2 seconds. Its ownership files were kept.\\n' "$REMOTE_PID" >&2
+    printf 'Remote T3 server with PID %s did not stop within @@T3_STOP_WAIT_SECONDS@@ seconds. Its ownership files were kept.\\n' "$REMOTE_PID" >&2
     exit 1
   fi
 fi
@@ -954,6 +995,8 @@ function buildRemotePairingScript(stateKey: string, input?: RemoteT3RunnerOption
 function buildRemoteStopScript(stateKey: string): string {
   return applyScriptPlaceholders(REMOTE_STOP_SCRIPT, {
     T3_STATE_KEY: stateKey,
+    T3_STOP_WAIT_TICKS: String(REMOTE_STOP_WAIT_SECONDS * 10),
+    T3_STOP_WAIT_SECONDS: String(REMOTE_STOP_WAIT_SECONDS),
   });
 }
 
@@ -982,7 +1025,9 @@ export const launchOrReuseRemoteServer = Effect.fn("ssh/tunnel.launchOrReuseRemo
     const result = yield* runSshCommand(target, {
       remoteCommandArgs: ["sh", "-l", "-s", "--", stateKey],
       stdin: buildRemoteLaunchScript(runner),
-      timeoutMs: isNodeScriptRunner(runner) ? REMOTE_LAUNCH_TIMEOUT_MS : null,
+      timeoutMs: isNodeScriptRunner(runner)
+        ? REMOTE_LAUNCH_TIMEOUT_MS
+        : REMOTE_ARCHIVE_LAUNCH_TIMEOUT_MS,
       ...(input?.authSecret === undefined ? {} : { authSecret: input.authSecret }),
       ...(input?.batchMode === undefined ? {} : { batchMode: input.batchMode }),
       ...(input?.interactiveAuth === undefined ? {} : { interactiveAuth: input.interactiveAuth }),
@@ -1093,6 +1138,7 @@ const stopRemoteServer = Effect.fn("ssh/tunnel.stopRemoteServer")(function* (
   yield* runSshCommand(target, {
     remoteCommandArgs: ["sh", "-s"],
     stdin: buildRemoteStopScript(stateKey),
+    timeoutMs: (REMOTE_STOP_WAIT_SECONDS + 30) * 1000,
     ...(input?.authSecret === undefined ? {} : { authSecret: input.authSecret }),
     ...(input?.batchMode === undefined ? {} : { batchMode: input.batchMode }),
     ...(input?.interactiveAuth === undefined ? {} : { interactiveAuth: input.interactiveAuth }),
@@ -1478,6 +1524,17 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
   const tunnels = new Map<string, SshTunnelEntry>();
   const targetLocks = yield* KeyedLock.make<string>();
   const authSecrets = new Map<string, string>();
+  // Disconnect cancels a connect queued or running for the same target, so a
+  // stuck launch cannot keep Switch off or Remove waiting behind it.
+  const connectCancellations = new Map<string, Deferred.Deferred<void>>();
+  const connectCancellation = (key: string) => {
+    let cancellation = connectCancellations.get(key);
+    if (cancellation === undefined) {
+      cancellation = Deferred.makeUnsafe<void>();
+      connectCancellations.set(key, cancellation);
+    }
+    return cancellation;
+  };
 
   // Keep one lock per target so reconnect cannot reuse a server while stop is pending.
   const withTargetLock = Effect.fn("ssh/tunnel.withTargetLock")(function* <A, E, R>(
@@ -1793,7 +1850,8 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
       ...sshRunnerLogFields(runner),
       key,
     });
-    return yield* withTargetLock(
+    const cancellation = connectCancellation(key);
+    const connect = withTargetLock(
       key,
       Effect.gen(function* () {
         const entry = yield* ensureTunnelEntry(key, resolvedTarget, runner);
@@ -1826,6 +1884,19 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
         };
       }),
     );
+    return yield* Effect.raceFirst(
+      connect,
+      Deferred.await(cancellation).pipe(
+        Effect.andThen(
+          Effect.fail(
+            new SshLaunchError({
+              message: `Connecting to ${resolvedTarget.alias} stopped because it was disconnected.`,
+              stdout: "",
+            }),
+          ),
+        ),
+      ),
+    );
   });
 
   const disconnectEnvironment = Effect.fn("ssh/tunnel.disconnectEnvironment")(function* (
@@ -1839,6 +1910,11 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
       ...(target.port !== null ? { port: target.port } : {}),
     };
     const key = targetConnectionKey(resolvedTarget);
+    const pendingConnect = connectCancellations.get(key);
+    if (pendingConnect !== undefined) {
+      connectCancellations.delete(key);
+      yield* Deferred.succeed(pendingConnect, undefined);
+    }
     yield* withTargetLock(
       key,
       Effect.gen(function* () {

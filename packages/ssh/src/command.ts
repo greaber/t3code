@@ -38,8 +38,7 @@ export interface RunSshCommandOptions extends SshAuthOptions {
   readonly preHostArgs?: ReadonlyArray<string>;
   readonly remoteCommandArgs?: ReadonlyArray<string>;
   readonly stdin?: string;
-  /** `null` runs without a deadline; ssh keepalives still end a dead connection. */
-  readonly timeoutMs?: number | null;
+  readonly timeoutMs?: number;
   /** Keep the end of long failed-command stdout, where the final cause usually is. */
   readonly keepErrorOutputTail?: boolean;
 }
@@ -220,7 +219,7 @@ const runSshCommandInScope = Effect.fn("ssh/command.runSshCommand.inScope")(func
     ...sshTargetLogFields(target),
     command: [sshCommand, ...args],
     hasStdin: input.stdin !== undefined,
-    timeoutMs: input.timeoutMs === undefined ? DEFAULT_SSH_COMMAND_TIMEOUT_MS : input.timeoutMs,
+    timeoutMs: input.timeoutMs ?? DEFAULT_SSH_COMMAND_TIMEOUT_MS,
   });
   const child = yield* spawner
     .spawn(
@@ -308,16 +307,10 @@ export const runSshCommand = Effect.fn("ssh/command.runSshCommand")(function* (
   SshCommandError | SshInvalidTargetError,
   ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
 > {
-  const timeoutMs =
-    input.timeoutMs === undefined ? DEFAULT_SSH_COMMAND_TIMEOUT_MS : input.timeoutMs;
-  const command = Effect.scopedWith((commandScope) =>
+  return yield* Effect.scopedWith((commandScope) =>
     runSshCommandInScope(target, input, commandScope),
-  );
-  if (timeoutMs === null) {
-    return yield* command;
-  }
-  return yield* command.pipe(
-    Effect.timeoutOption(Duration.millis(timeoutMs)),
+  ).pipe(
+    Effect.timeoutOption(Duration.millis(input.timeoutMs ?? DEFAULT_SSH_COMMAND_TIMEOUT_MS)),
     Effect.flatMap((result) =>
       Option.match(result, {
         onSome: Effect.succeed,
@@ -325,7 +318,7 @@ export const runSshCommand = Effect.fn("ssh/command.runSshCommand")(function* (
         onNone: Effect.fnUntraced(function* () {
           yield* Effect.logWarning("ssh.command.timedOut", {
             ...sshTargetLogFields(target),
-            timeoutMs,
+            timeoutMs: input.timeoutMs ?? DEFAULT_SSH_COMMAND_TIMEOUT_MS,
             remoteCommandArgs: input.remoteCommandArgs ?? [],
             preHostArgs: input.preHostArgs ?? [],
             hasStdin: input.stdin !== undefined,
@@ -334,7 +327,7 @@ export const runSshCommand = Effect.fn("ssh/command.runSshCommand")(function* (
             command: ["ssh"],
             exitCode: null,
             stderr: "",
-            message: `SSH command timed out after ${timeoutMs}ms.`,
+            message: `SSH command timed out after ${input.timeoutMs ?? DEFAULT_SSH_COMMAND_TIMEOUT_MS}ms.`,
           });
         }),
       }),
