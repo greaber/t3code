@@ -4548,22 +4548,24 @@ function claudeSubagentModelSelection(
   return { instanceId, model, ...(offered ? { options: [{ id: "effort", value: effort }] } : {}) };
 }
 
-const PENDING_CLAUDE_SUBAGENT_CAP = 64;
-const PENDING_CLAUDE_SUBAGENT_FRAME_CAP = 256;
+// Generous bounds on state for subagents that never register; overflow is logged, not silent.
+const PENDING_CLAUDE_SUBAGENT_CAP = 4096;
+const PENDING_CLAUDE_SUBAGENT_FRAME_CAP = 65_536;
 
+/** Returns the tool use whose launch details were evicted to stay within the cap. */
 function rememberPendingClaudeSubagentLaunch(
   pending: Map<string, PendingClaudeSubagentLaunch>,
   toolUseId: string,
   launch: PendingClaudeSubagentLaunch,
-): void {
+): string | null {
   pending.set(toolUseId, { ...pending.get(toolUseId), ...launch });
   if (pending.size <= PENDING_CLAUDE_SUBAGENT_CAP) {
-    return;
+    return null;
   }
   const oldest = pending.keys().next();
-  if (!oldest.done) {
-    pending.delete(oldest.value);
-  }
+  if (oldest.done) return null;
+  pending.delete(oldest.value);
+  return oldest.value;
 }
 
 function rememberClaudeSubagentLaunch(
@@ -4573,8 +4575,8 @@ function rememberClaudeSubagentLaunch(
   toolUseId: string,
   input: ClaudeNativeToolInput,
   ownerToolUseId: string | null,
-): void {
-  if (context.subagentsByToolUseId.has(toolUseId)) return;
+): string | null {
+  if (context.subagentsByToolUseId.has(toolUseId)) return null;
   const requested = firstStringInputField(input, ["model"]);
   const model =
     requested !== "inherit"
@@ -4588,13 +4590,11 @@ function rememberClaudeSubagentLaunch(
     ...(effort === undefined ? {} : { effort }),
     ...(ownerToolUseId === null ? {} : { ownerToolUseId }),
   };
-  if (
-    launch.model !== undefined ||
+  return launch.model !== undefined ||
     launch.effort !== undefined ||
     launch.ownerToolUseId !== undefined
-  ) {
-    rememberPendingClaudeSubagentLaunch(pending, toolUseId, launch);
-  }
+    ? rememberPendingClaudeSubagentLaunch(pending, toolUseId, launch)
+    : null;
 }
 
 type ClaudeApprovalResponse = {
@@ -5281,9 +5281,17 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         // Buffered idle outcomes must not settle a resumed child again.
         const appliedSubagentOutcomes = new WeakSet<SDKMessage>();
         // Subagent frames can precede the task_started that registers their owner.
-        const pendingSubagentFramesByToolUseId = yield* Ref.make(
-          new Map<string, ReadonlyArray<SDKMessage>>(),
-        );
+        const pendingSubagentFramesByToolUseId = yield* Ref.make(new Map<string, SDKMessage[]>());
+        const warnEvictedSubagentLaunch = (
+          context: ActiveClaudeTurnContext,
+          evictedToolUseId: string | null,
+        ) =>
+          evictedToolUseId === null
+            ? Effect.void
+            : Effect.logWarning("orchestration-v2.claude-subagent-launch-dropped", {
+                providerTurnId: context.providerTurnId,
+                parentToolUseId: evictedToolUseId,
+              });
         // A gateway's relative reset counts from the result's arrival, not its replay.
         const bufferedResultArrivals = new WeakMap<SDKMessage, DateTime.Utc>();
         const wakeBuffers = yield* Ref.make(
@@ -9487,10 +9495,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             if (parentToolUseId !== null && model !== undefined) {
               const subagent = yield* resolveSubagentByToolUseId(context, parentToolUseId);
               if (subagent === undefined) {
-                rememberPendingClaudeSubagentLaunch(
-                  pendingSubagentLaunchesByToolUseId,
-                  parentToolUseId,
-                  { model },
+                yield* warnEvictedSubagentLaunch(
+                  context,
+                  rememberPendingClaudeSubagentLaunch(
+                    pendingSubagentLaunchesByToolUseId,
+                    parentToolUseId,
+                    { model },
+                  ),
                 );
               } else if (subagent.task.status === "running" && subagent.task.model !== model) {
                 yield* updateClaudeSubagentNode({
@@ -9512,11 +9523,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             const droppedToolUseId = yield* Ref.modify(
               pendingSubagentFramesByToolUseId,
               (current) => {
-                const frames = current.get(frameParentToolUseId) ?? [];
-                if (frames.length >= PENDING_CLAUDE_SUBAGENT_FRAME_CAP) {
-                  return [frameParentToolUseId, current] as const;
+                const frames = current.get(frameParentToolUseId);
+                if (frames !== undefined) {
+                  if (frames.length >= PENDING_CLAUDE_SUBAGENT_FRAME_CAP) {
+                    return [frameParentToolUseId, current] as const;
+                  }
+                  // Appending in place keeps a long burst linear; the map is local to this session.
+                  frames.push(message);
+                  return [null, current] as const;
                 }
-                const next = new Map(current).set(frameParentToolUseId, [...frames, message]);
+                const next = new Map(current).set(frameParentToolUseId, [message]);
                 const oldest = next.keys().next();
                 if (next.size > PENDING_CLAUDE_SUBAGENT_CAP && !oldest.done) {
                   next.delete(oldest.value);
@@ -9788,13 +9804,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           for (const toolUse of claudeToolUseBlocksFromAssistantMessage(message)) {
             const nativeToolInput = claudeNativeToolInputFromUnknown(toolUse.input);
             if (toolUse.name === "Agent") {
-              rememberClaudeSubagentLaunch(
-                modelCatalog,
+              yield* warnEvictedSubagentLaunch(
                 context,
-                pendingSubagentLaunchesByToolUseId,
-                toolUse.id,
-                nativeToolInput,
-                parentToolUseIdFromSdkMessage(message),
+                rememberClaudeSubagentLaunch(
+                  modelCatalog,
+                  context,
+                  pendingSubagentLaunchesByToolUseId,
+                  toolUse.id,
+                  nativeToolInput,
+                  parentToolUseIdFromSdkMessage(message),
+                ),
               );
               continue;
             }
@@ -10406,13 +10425,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const heldForEcho = context.heldRootFrames.length > 0;
           const startToolCall = toolName !== "Agent" && options?.startToolCall !== false;
           if (toolName === "Agent") {
-            rememberClaudeSubagentLaunch(
-              modelCatalog,
+            yield* warnEvictedSubagentLaunch(
               context,
-              pendingSubagentLaunchesByToolUseId,
-              nativeRequestId,
-              nativeToolInput,
-              null,
+              rememberClaudeSubagentLaunch(
+                modelCatalog,
+                context,
+                pendingSubagentLaunchesByToolUseId,
+                nativeRequestId,
+                nativeToolInput,
+                null,
+              ),
             );
           } else if (startToolCall && !heldForEcho) {
             yield* ensureToolCallStarted({

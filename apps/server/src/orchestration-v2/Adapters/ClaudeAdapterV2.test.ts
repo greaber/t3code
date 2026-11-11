@@ -15098,6 +15098,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         const TASK_ID = "task-early-subagent";
         const TOOL_USE_ID = "toolu-early-subagent";
         const FINAL_REPORT = "Early auditor done.";
+        const EARLY_BURST = Array.from({ length: 300 }, (_, index) => `Early ${index}.`);
         const harness = yield* makeWakeHarness;
         const now = yield* DateTime.now;
         yield* harness.runtime.startTurn(
@@ -15123,6 +15124,14 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             uuid: "00000000-0000-4000-8000-000000000322",
             toolUseId: "toolu-early-bash",
           }),
+          // A long early burst still reaches the subagent once it registers.
+          ...EARLY_BURST.flatMap((text, index) =>
+            makeSubagentAssistantFrames({
+              parentToolUseId: TOOL_USE_ID,
+              uuid: `00000000-0000-4000-8001-${String(index).padStart(12, "0")}`,
+              text,
+            }),
+          ),
           makeSubagentTaskStartedFrame({
             taskId: TASK_ID,
             toolUseId: TOOL_USE_ID,
@@ -15170,6 +15179,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         );
         assert.deepEqual(routing.assistantTexts(routing.childThreadId), [
           "Starting early.",
+          ...EARLY_BURST,
           "Still working.",
           FINAL_REPORT,
         ]);
