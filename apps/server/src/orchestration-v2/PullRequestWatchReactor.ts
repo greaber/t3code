@@ -45,7 +45,9 @@ import {
 
 /** Checks take minutes; faster sweeps waste the account's shared host quota. */
 const SWEEP_MINUTES = 2;
+/** Failed reads in a row before the agent is told; later reads back off up to the cap. */
 const READ_FAILURE_LIMIT = 8;
+const READ_BACKOFF_CAP_MS = 30 * 60_000;
 /** Group reads in flight at once, inside the host's own request limit. */
 const GROUP_READS = 4;
 /** Without fingerprints, reread quiet PRs on snapshot changes or this interval to catch edits. */
@@ -93,6 +95,14 @@ interface LastRead {
   readonly remarks: string | null;
 }
 
+interface ReadFailures {
+  readonly count: number;
+  /** Sweeps skip the group until then; host change feeds still read it. */
+  readonly retryAt: number;
+  /** The agent was told reads are failing, so it is told when they recover. */
+  readonly noticed: boolean;
+}
+
 interface ReadPlan {
   readonly detail: boolean;
   readonly activity: boolean;
@@ -100,14 +110,7 @@ interface ReadPlan {
 
 const watchKey = ({ thread, watch }: WatchTarget) => `${thread.id} ${watch.startedAt}`;
 
-type WatchEndReason =
-  | "merged"
-  | "closed"
-  | "unreadable"
-  | "comment-limit"
-  | "settled"
-  | "subagent"
-  | "stopped";
+type WatchEndReason = "merged" | "closed" | "comment-limit" | "settled" | "subagent" | "stopped";
 
 interface WatchLife {
   readonly threadId: string;
@@ -253,7 +256,7 @@ export const make = Effect.gen(function* () {
   const ended = (target: WatchTarget, reason: WatchEndReason) =>
     Effect.suspend(() => reportEnd(lifeKey(target), lifeOf(target), reason));
 
-  const readFailures = new Map<string, number>();
+  const readFailures = new Map<string, ReadFailures>();
   /** The last sweep's groups, whose pull requests get host change feeds. */
   let currentGroups: ReadonlyArray<WatchGroup> = [];
   // A pass reads watches and records new ones, so passes must not overlap.
@@ -302,19 +305,25 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const giveUp = (target: WatchTarget) =>
-    record(target, null, {
-      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because it failed to read it from the host ${READ_FAILURE_LIMIT} times in a row. Check it yourself, and call watch_pull_request to watch it again.`,
+  const reportUnreadable = (target: WatchTarget) =>
+    record(target, target.watch, {
+      text: `T3 Code failed to read pull request #${target.link.number} (${target.link.url}) from the host ${READ_FAILURE_LIMIT} times in a row. It is still watching and retries less often, at least every 30 minutes, and will say when it can read it again. Check it yourself if you need it sooner, or call unwatch_pull_request to stop.`,
       notification: {
         source: { kind: "monitor" },
         outcome: "failed",
-        summary: `#${target.link.number}: stopped watching, could not read it`,
+        summary: `#${target.link.number}: cannot read it, still watching`,
       },
-    }).pipe(
-      Effect.tap(() => woke(target)),
-      Effect.catch(() => record(target, null)),
-      Effect.tap(() => ended(target, "unreadable")),
-    );
+    }).pipe(Effect.tap(() => woke(target)));
+
+  const reportReadable = (target: WatchTarget) =>
+    record(target, target.watch, {
+      text: `T3 Code can read pull request #${target.link.number} (${target.link.url}) from the host again and is still watching it.`,
+      notification: {
+        source: { kind: "monitor" },
+        outcome: "updated",
+        summary: `#${target.link.number}: readable again`,
+      },
+    }).pipe(Effect.tap(() => woke(target)));
 
   const readRemarks = Effect.fn("PullRequestWatchReactor.readRemarks")(
     function* (
@@ -507,19 +516,32 @@ export const make = Effect.gen(function* () {
       lastReads.delete(group.key);
       const reason = providerFailureReason(read.cause);
       if (reason === "rate-limited") return;
-      // Transport and host failures can outlast the failure limit; keep the watch for recovery.
+      const previous = readFailures.get(group.key);
+      // Transport and host failures can outlast an outage; they do not count toward the notice.
       if (reason === "failed") {
-        readFailures.delete(group.key);
+        if (previous?.noticed !== true) readFailures.delete(group.key);
         return yield* Effect.failCause(read.cause);
       }
-      const failures = (readFailures.get(group.key) ?? 0) + 1;
-      readFailures.set(group.key, failures);
-      if (failures >= READ_FAILURE_LIMIT && (yield* eachTarget(group, giveUp))) {
-        readFailures.delete(group.key);
-      }
+      const count = (previous?.count ?? 0) + 1;
+      const backoffMs =
+        count < READ_FAILURE_LIMIT
+          ? 0
+          : Math.min(
+              READ_BACKOFF_CAP_MS,
+              SWEEP_MINUTES * 60_000 * 2 ** (count - READ_FAILURE_LIMIT + 1),
+            );
+      const noticed =
+        previous?.noticed === true ||
+        (count >= READ_FAILURE_LIMIT && (yield* eachTarget(group, reportUnreadable)));
+      readFailures.set(group.key, { count, retryAt: now + backoffMs, noticed });
       return yield* Effect.failCause(read.cause);
     }
-    readFailures.delete(group.key);
+    if (readFailures.get(group.key)?.noticed === true) {
+      // Keep the notice owed if telling the agent fails, so a later read retries it.
+      if (yield* eachTarget(group, reportReadable)) readFailures.delete(group.key);
+    } else {
+      readFailures.delete(group.key);
+    }
     const [detail, activity] = read.value;
     for (const target of group.targets) {
       const life = lifeOf(target);
@@ -624,6 +646,7 @@ export const make = Effect.gen(function* () {
       const key = `${target.thread.projectId} ${threadPullRequestKeyOf(target.link)}`;
       byPullRequest.set(key, [...(byPullRequest.get(key) ?? []), target]);
     }
+    const now = yield* Clock.currentTimeMillis;
     const groups = [...byPullRequest].map(([key, members]): WatchGroup => ({
       key,
       targets: members,
@@ -653,7 +676,9 @@ export const make = Effect.gen(function* () {
     // as soon as its own answer lands rather than waiting on the slowest host.
     const reads = yield* Semaphore.make(GROUP_READS);
     yield* Effect.forEach(
-      groups,
+      changed === undefined
+        ? groups.filter((group) => (readFailures.get(group.key)?.retryAt ?? 0) <= now)
+        : groups,
       (group) =>
         // The host just reported a change, so a cached fingerprint may predate it.
         (changed === undefined
