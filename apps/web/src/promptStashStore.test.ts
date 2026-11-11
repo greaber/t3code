@@ -8,10 +8,8 @@ import {
 import { removeLocalStorageItem } from "./hooks/useLocalStorage";
 
 import {
-  MAX_STASH_ENTRIES,
   PROMPT_STASH_STORAGE_KEY,
-  MAX_STASH_ENTRY_ATTACHMENT_CHARS,
-  partitionStashAttachments,
+  keepImagesThatFit,
   usePromptStashStore,
   writePromptStashStorageForTest,
   type PromptStashEntry,
@@ -48,32 +46,41 @@ function resetPromptStashStore() {
   removeLocalStorageItem(PROMPT_STASH_STORAGE_KEY);
 }
 
-describe("partitionStashAttachments", () => {
-  it("keeps attachments within the budget and reports dropped names in order", () => {
-    const small = {
-      id: "a",
-      name: "small.png",
-      mimeType: "image/png",
-      sizeBytes: 10,
-      dataUrl: "x".repeat(10),
-    };
-    const huge = {
-      id: "b",
-      name: "huge.png",
-      mimeType: "image/png",
-      sizeBytes: MAX_STASH_ENTRY_ATTACHMENT_CHARS,
-      dataUrl: "x".repeat(MAX_STASH_ENTRY_ATTACHMENT_CHARS),
-    };
-    const alsoSmall = {
-      id: "c",
-      name: "also-small.png",
-      mimeType: "image/png",
-      sizeBytes: 10,
-      dataUrl: "x".repeat(10),
-    };
-    const { kept, droppedNames } = partitionStashAttachments([small, huge, alsoSmall]);
-    expect(kept.map((attachment) => attachment.id)).toEqual(["a", "c"]);
-    expect(droppedNames).toEqual(["huge.png"]);
+describe("keepImagesThatFit", () => {
+  const image = (id: string, chars: number) => ({
+    id,
+    name: `${id}.png`,
+    mimeType: "image/png",
+    sizeBytes: chars,
+    dataUrl: "x".repeat(chars),
+  });
+
+  it("keeps every image that storage accepts, dropping the largest first when it is full", () => {
+    const images = [image("small", 10), image("huge", 1_000), image("medium", 100)];
+    const writes: Array<ReadonlyArray<string>> = [];
+    const fits = keepImagesThatFit(images, (kept) => {
+      writes.push(kept.map((attachment) => attachment.id));
+      return { written: true };
+    });
+    expect(fits.kept).toEqual(images);
+    expect(fits.droppedNames).toEqual([]);
+
+    writes.length = 0;
+    const full = keepImagesThatFit(images, (kept, dropped) => {
+      writes.push([...kept.map((attachment) => attachment.id), ...dropped]);
+      return { written: kept.reduce((sum, attachment) => sum + attachment.dataUrl.length, 0) < 50 };
+    });
+    expect(full.kept.map((attachment) => attachment.id)).toEqual(["small"]);
+    expect(full.droppedNames).toEqual(["huge.png", "medium.png"]);
+    expect(writes).toEqual([
+      ["small", "huge", "medium"],
+      ["small", "medium", "huge.png"],
+      ["small", "huge.png", "medium.png"],
+    ]);
+
+    const nothingFits = keepImagesThatFit(images, () => ({ written: false }));
+    expect(nothingFits.kept).toEqual([]);
+    expect(nothingFits.result.written).toBe(false);
   });
 });
 
@@ -114,16 +121,15 @@ describe("promptStashStore", () => {
     expect(usePromptStashStore.getState().takeEntry("citation-stash").entry).toBeNull();
   });
 
-  it("evicts the oldest entry past the cap and returns it", () => {
+  it("keeps every stashed entry, newest first", () => {
     const store = usePromptStashStore.getState();
-    for (let index = 0; index < MAX_STASH_ENTRIES; index += 1) {
-      expect(store.stashEntry(makeEntry({ id: `entry-${index}` })).evicted).toBeNull();
+    for (let index = 0; index < 50; index += 1) {
+      expect(store.stashEntry(makeEntry({ id: `entry-${index}` })).written).toBe(true);
     }
-    const { evicted } = store.stashEntry(makeEntry({ id: "overflow" }));
-    expect(evicted?.id).toBe("entry-0");
     const entries = usePromptStashStore.getState().entries;
-    expect(entries).toHaveLength(MAX_STASH_ENTRIES);
-    expect(entries[0]?.id).toBe("overflow");
+    expect(entries).toHaveLength(50);
+    expect(entries[0]?.id).toBe("entry-49");
+    expect(entries.at(-1)?.id).toBe("entry-0");
   });
 
   // regression: #4787 stashed prompts were lost when switching providers

@@ -192,6 +192,12 @@ the current prompt and its attachments for later. Wait for uploads to finish fir
 With an empty composer, the same shortcut restores a single stash or opens the
 stash menu when there are several.
 
+Stashes are kept in browser storage, which holds a few megabytes for the whole
+site. There is no limit on the number of stashes; when storage is full, T3 Code
+keeps your existing stashes, leaves the new prompt in the composer, and tells you
+to delete stashes you no longer need. Images that do not fit are left out with a
+warning.
+
 Stashes containing uploaded files must be restored in their original environment.
 Those files are retained for 24 hours. After an upload expires, restore the prompt
 and use **Attach again** or remove the missing file before sending.

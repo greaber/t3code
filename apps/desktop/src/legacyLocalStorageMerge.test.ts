@@ -74,7 +74,7 @@ describe("mergeLegacyLocalStorage", () => {
     assert.equal(storage.getItem("t3code:composer-drafts:v1"), current);
   });
 
-  it("caps the merged stash at the store's entry limit, dropping the oldest V1 entries", () => {
+  it("keeps every merged stash entry, V2 entries first", () => {
     const v2Ids = Array.from({ length: 15 }, (_, index) => `v2-${index}`);
     const v1Ids = Array.from({ length: 10 }, (_, index) => `v1-${index}`);
     const storage = memoryStorage({ "t3code:prompt-stash:v2": stash(...v2Ids) });
@@ -82,7 +82,7 @@ describe("mergeLegacyLocalStorage", () => {
     const ids = JSON.parse(storage.getItem("t3code:prompt-stash:v2")!).state.entries.map(
       (entry: { id: string }) => entry.id,
     );
-    assert.deepStrictEqual(ids, [...v2Ids, ...v1Ids.slice(0, 5)]);
+    assert.deepStrictEqual(ids, [...v2Ids, ...v1Ids]);
   });
 
   it("keeps importing other keys after one write fails, and reports the failure", () => {
