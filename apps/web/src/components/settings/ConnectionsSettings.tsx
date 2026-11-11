@@ -297,7 +297,6 @@ function ConnectionsSettingsContent({
           environmentId: environment.environmentId,
           serverLabel: environment.label,
           selfUpdate,
-          installation: environment.serverConfig?.environment.capabilities.serverInstallation,
           desktopAppUpdate,
           targetVersion: mismatch.clientVersion,
         },
@@ -1205,9 +1204,6 @@ function ConnectionsSettingsContent({
                         primaryEnvironment ? `${primaryEnvironment.label} server` : "server"
                       }
                       selfUpdate={resolveServerSelfUpdateCapability(primaryServerConfig)}
-                      installation={
-                        primaryServerConfig?.environment.capabilities.serverInstallation
-                      }
                       desktopAppUpdate={supportsDesktopAppUpdate(primaryServerConfig)}
                       targetVersion={primaryVersionMismatch.clientVersion}
                       label={

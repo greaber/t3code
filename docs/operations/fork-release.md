@@ -41,7 +41,9 @@ version, so build the desktop app from the same commit as the release.
    publishes release `v<version>` with the archives and `SHA256SUMS`, marked latest.
 
 Upstream's `release.yml` also matches the tag, but its jobs are gated on `pingdotgg/t3code` and
-skip.
+skip. Upstream workflows that run on Blacksmith runners without such a gate (`ci.yml` and others
+that use `blacksmith-*` runners) would sit queued on the fork, so disable them in the fork's
+**Actions** settings (Actions → the workflow → **Disable workflow**).
 
 ## Desktop app
 

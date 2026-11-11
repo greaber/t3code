@@ -60,7 +60,6 @@ export function useAutoBalanceUpdateBanner(
         environmentId: environment.environmentId,
         serverLabel: environment.label,
         selfUpdate,
-        installation: environment.serverConfig?.environment.capabilities.serverInstallation,
         desktopAppUpdate,
         targetVersion: state.status === "idle" ? mismatch!.clientVersion : state.targetVersion,
         connected: environment.connection.phase === "connected",

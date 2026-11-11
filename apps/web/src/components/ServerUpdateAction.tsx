@@ -10,7 +10,6 @@ import { environmentSession } from "~/state/session";
 import type {
   DesktopUpdateChannel,
   EnvironmentId,
-  ServerInstallation,
   ServerSelfUpdateCapability,
 } from "@t3tools/contracts";
 import type { ServerUpdateStage, ServerUpdateState } from "@t3tools/client-runtime/state/server";
@@ -87,7 +86,6 @@ export interface ServerUpdateTarget {
   readonly environmentId: EnvironmentId;
   readonly serverLabel: string;
   readonly selfUpdate: ServerSelfUpdateCapability | null;
-  readonly installation?: ServerInstallation | undefined;
   readonly desktopAppUpdate?: boolean;
   readonly targetVersion: string;
   /** Set only by a track switch; the host's desktop app moves to this track. */
@@ -281,7 +279,7 @@ export function ServerUpdateAction({
       toastManager.add({
         type: "success",
         title: "Update command copied",
-        description: `Run \`${command}\` on ${serverLabel}, then restart t3 with your usual options.`,
+        description: `Run \`${command}\` on ${serverLabel}, then restart the server as \`~/.local/bin/t3\` with your usual options; another t3 earlier on PATH would run instead.`,
       });
     },
     onError: (error) => {

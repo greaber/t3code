@@ -409,7 +409,10 @@ describe("t3 pair", () => {
           ]);
           assert.isTrue(Exit.isFailure(exit));
           if (Exit.isFailure(exit)) {
-            assert.include(String(Cause.squash(exit.cause)), "t3@0.0.45 pair");
+            assert.include(
+              String(Cause.squash(exit.cause)),
+              "greaber/t3code/v0.0.45/scripts/install.sh | T3CODE_VERSION=0.0.45 sh",
+            );
           }
         }),
       "127.0.0.1",

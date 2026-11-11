@@ -82,7 +82,6 @@ describe("versionSkew", () => {
     },
   );
 
-  // regression: #7579 versions were compared as strings, not semver
   it("warns when a fork server is behind a newer fork build of the same core version", () => {
     branding.APP_VERSION = "0.1.9-grant.2";
     expect(resolveVersionMismatch("0.1.9-grant.1")).toEqual({
@@ -94,6 +93,7 @@ describe("versionSkew", () => {
     expect(resolveVersionMismatch("0.1.7")).not.toBeNull();
   });
 
+  // regression: #7579 versions were compared as strings, not semver
   it("treats a nightly server built past the client as ahead, not skew", () => {
     expect(resolveVersionMismatch("0.0.35-nightly.20260818.1124")).toBeNull();
   });

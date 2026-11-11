@@ -124,7 +124,6 @@ export function collectServerUpdateTargets(
       environmentId: machine.environmentId,
       serverLabel: machine.label,
       selfUpdate,
-      installation: config.environment.capabilities.serverInstallation,
       desktopAppUpdate,
       targetVersion,
     };
@@ -241,7 +240,6 @@ export function collectChannelSwitchTargets(
       environmentId: machine.environmentId,
       serverLabel: machine.label,
       selfUpdate,
-      installation: config?.environment.capabilities.serverInstallation,
       desktopAppUpdate: config !== null && supportsDesktopAppUpdate(config),
       targetVersion,
       ...(selfUpdate === "desktop-managed" ? { channel: release.channel } : {}),

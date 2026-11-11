@@ -64,6 +64,13 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match package version $version." >&2
             exit 1
           fi
+          # A manual run from a branch that moved past an existing tag must not
+          # publish archives built from a different commit than the tag names.
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/v$version" --jq .sha 2>/dev/null || true)"
+          if [[ -n "$tag_sha" && "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::Tag v$version points at $tag_sha, not $GITHUB_SHA." >&2
+            exit 1
+          fi
           if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::Release v$version already exists; bump the version." >&2
             exit 1
