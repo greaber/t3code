@@ -16,7 +16,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import {
-  DEFAULT_HANDOFF_TOKEN_CAP,
+  MAX_HANDOFF_TOKEN_CAP,
   handoffTokenCapConfig,
   handoffCoverage,
   historicalMessage,
@@ -348,9 +348,10 @@ function makeLegacyImportSummary(items: ReadonlyArray<OrchestrationV2TurnItem>):
 const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffService.layer")(
   function* () {
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
-    const tokenCap = yield* handoffTokenCapConfig.pipe(
-      Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
-    );
+    // Delivery narrows this to the target model's window, which is unknown here.
+    const tokenCap =
+      (yield* handoffTokenCapConfig.pipe(Effect.orElseSucceed(() => undefined))) ??
+      MAX_HANDOFF_TOKEN_CAP;
 
     const prepareLegacyImport = Effect.fn("orchestrationV2.contextHandoff.prepareLegacyImport")(
       function* (input: {

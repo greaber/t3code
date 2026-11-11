@@ -149,8 +149,9 @@ it.layer(layerTest)("ContextHandoffService legacy import", (it) => {
         createdAt: DateTime.makeUnsafe("2026-01-02T00:00:00.000Z"),
       });
 
+      // Delivery narrows history to the target window; preparation keeps the whole message.
       assert.include(
-        handoff.history?.omittedItemIds ?? [],
+        handoff.history?.messages.map((message) => message.itemId) ?? [],
         TurnItemId.make("turn-item:long-single-token"),
       );
       assert.isAtMost(handoff.summaryText.length, 32_000);

@@ -37,7 +37,6 @@ import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts"
 import * as ContextHandoffService from "./ContextHandoffService.ts";
 import { isActiveRun } from "./CommandPolicy.ts";
 import {
-  DEFAULT_HANDOFF_TOKEN_CAP,
   handoffTokenCapConfig,
   handoffBudget,
   attachmentTokenAllowance,
@@ -45,7 +44,11 @@ import {
   historicalMessage,
   latestNativeContextUsage,
 } from "@t3tools/provider-core/server/handoffBudget";
-import { deliverContextHandoffs, withInlineContext } from "./ContextHandoffDelivery.ts";
+import {
+  deliverContextHandoffs,
+  omittedHistoryNotice,
+  withInlineContext,
+} from "./ContextHandoffDelivery.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -868,9 +871,7 @@ export const layer: Layer.Layer<
         restartCancelledWork.length === 0
           ? ""
           : restartCancelledBackgroundWorkNote(restartCancelledWork);
-      const tokenCap = yield* handoffTokenCapConfig.pipe(
-        Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
-      );
+      const tokenCap = yield* handoffTokenCapConfig.pipe(Effect.orElseSucceed(() => undefined));
       const handoffContextForThread = (loadedProviderThread: OrchestrationV2ProviderThread) => {
         const measuredContext = latestNativeContextUsage(projection, providerThread);
         const previousSelection =
@@ -1572,6 +1573,44 @@ export const layer: Layer.Layer<
           ],
         });
       });
+      const recordOmittedHistoryNotice = Effect.fn("ProviderTurnStartService.recordOmittedHistory")(
+        function* (omittedItems: number) {
+          const now = yield* DateTime.now;
+          yield* eventSink.write({
+            events: [
+              {
+                id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                type: "turn-item.updated",
+                threadId: projection.thread.id,
+                runId: run.id,
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: now,
+                payload: {
+                  id: idAllocator.derive.runSignalTurnItem({
+                    runId: run.id,
+                    signal: "context-handoff-omitted",
+                  }),
+                  threadId: projection.thread.id,
+                  runId: run.id,
+                  nodeId: runningRootNode.id,
+                  providerThreadId: runningProviderThread.id,
+                  providerTurnId: null,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal: run.ordinal * 100 - 1,
+                  status: "completed",
+                  title: null,
+                  startedAt: now,
+                  completedAt: now,
+                  updatedAt: now,
+                  type: "system_notice",
+                  message: omittedHistoryNotice(omittedItems),
+                },
+              },
+            ],
+          });
+        },
+      );
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
           const delivery = yield* deliverContextHandoffs({
@@ -1627,6 +1666,9 @@ export const layer: Layer.Layer<
           yield* Effect.forEach(
             [
               delivery.delivered,
+              ...(delivery.omittedItems === 0
+                ? []
+                : [recordOmittedHistoryNotice(delivery.omittedItems)]),
               ...(sideChatContext === "" || sideChatHandoff === undefined || nativeThreadId == null
                 ? []
                 : [

@@ -10,13 +10,25 @@ import type {
 } from "@t3tools/contracts";
 
 import * as Config from "effect/Config";
+import * as Option from "effect/Option";
 
-export const DEFAULT_HANDOFF_TOKEN_CAP = 16_000;
-const HANDOFF_BYTE_CAP = 64_000;
-export const handoffTokenCapConfig = Config.Int("T3CODE_CONTEXT_HANDOFF_TOKEN_CAP").pipe(
-  Config.withDefault(DEFAULT_HANDOFF_TOKEN_CAP),
-  Config.map((value) => Math.max(1_024, Math.min(HANDOFF_BYTE_CAP, value))),
-);
+/** History allowance when the target model's window is unknown. */
+export const DEFAULT_HANDOFF_TOKEN_CAP = 200_000;
+/** Clamp ceiling for overrides, and the selection bound before the target window is known. */
+export const MAX_HANDOFF_TOKEN_CAP = 1_000_000;
+/** An operator override, or undefined to size each handoff from the target model's window. */
+export const handoffTokenCapConfig = Config.option(
+  Config.Int("T3CODE_CONTEXT_HANDOFF_TOKEN_CAP").pipe(
+    Config.map((value) => Math.max(1_024, Math.min(MAX_HANDOFF_TOKEN_CAP, value))),
+  ),
+).pipe(Config.map(Option.getOrUndefined));
+
+/** Half a known window leaves the other half for instructions, tools, and the work itself. */
+function defaultHandoffTokenCap(knownWindow: number | undefined): number {
+  return knownWindow === undefined || knownWindow <= 0
+    ? DEFAULT_HANDOFF_TOKEN_CAP
+    : Math.min(MAX_HANDOFF_TOKEN_CAP, Math.floor(knownWindow / 2));
+}
 
 // Only accepted roots with matching native identity count; row reuse must not revive old usage.
 export function latestNativeContextUsage(
@@ -97,7 +109,7 @@ export function attachmentTokenAllowance(attachments: ReadonlyArray<ChatAttachme
 
 // One UTF-8 byte per token is a pessimistic estimate, not a guarantee for custom models.
 export function handoffBudget(input: {
-  readonly tokenCap: number;
+  readonly tokenCap: number | undefined;
   readonly userText: string;
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly providerThread: OrchestrationV2ProviderThread;
@@ -105,8 +117,9 @@ export function handoffBudget(input: {
   readonly modelContextWindow?: number | undefined;
 }): number {
   const usage = input.providerThread.contextUsage;
+  const knownWindow = input.modelContextWindow ?? usage?.maxTokens;
   const window = Math.min(
-    input.modelContextWindow ?? usage?.maxTokens ?? 128_000,
+    knownWindow ?? 128_000,
     usage?.maxTokens ?? Infinity,
     usage?.autoCompactThreshold ?? Infinity,
   );
@@ -116,9 +129,7 @@ export function handoffBudget(input: {
   return Math.max(
     0,
     Math.min(
-      input.tokenCap,
-      // Cap imported history only; adapters own attachment transport limits.
-      HANDOFF_BYTE_CAP,
+      input.tokenCap ?? defaultHandoffTokenCap(knownWindow),
       window - native - current - Math.max(16_000, Math.ceil(window / 4)),
     ),
   );

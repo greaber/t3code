@@ -46,6 +46,7 @@ import {
   canReuseCodexContextUsage,
 } from "../Adapters/CodexAdapterV2.ts";
 import { AcpProviderCapabilitiesV2 } from "@t3tools/provider-acp/server/adapter";
+import { omittedHistoryNotice } from "../ContextHandoffDelivery.ts";
 import * as EventSink from "../EventSink.ts";
 import * as EventStore from "../EventStore.ts";
 import * as LegacyV1ThreadImporter from "../legacy/LegacyV1ThreadImporter.ts";
@@ -1183,6 +1184,14 @@ describe("orchestration v2 provider switching", () => {
                 const delivery = retried.contextHandoffs.at(-1)!.delivery!;
                 assert.include(delivery.omittedItemIds ?? [], missedRequest.id);
                 assert.notInclude(delivery.itemIds, missedRequest.id);
+                assert.deepEqual(
+                  retried.turnItems.flatMap((item) =>
+                    item.type === "system_notice" && item.runId === retried.runs.at(-1)!.id
+                      ? [item.message]
+                      : [],
+                  ),
+                  [omittedHistoryNotice(1)],
+                );
               } else assert.include(delta, "First target request");
               assert.notInclude(delta, "Original request with constraints");
               assert.notInclude(delta, "Original partial work");
