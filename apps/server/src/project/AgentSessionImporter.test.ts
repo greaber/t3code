@@ -325,11 +325,15 @@ it.effect(
         importedCount: 3,
         skippedCount: 2,
         skipped: [
-          tooLarge,
           {
-            provider: "claudeAgent",
-            filePath: unresumable.source.filePath,
+            reason: "too_large",
+            count: 1,
+            examples: [{ provider: "codex", filePath: tooLarge.filePath }],
+          },
+          {
             reason: "unresumable",
+            count: 1,
+            examples: [{ provider: "claudeAgent", filePath: unresumable.source.filePath }],
           },
         ],
       });
@@ -421,7 +425,13 @@ it.effect(
       expect(yield* importer.run).toEqual({
         importedCount: 0,
         skippedCount: 1,
-        skipped: [{ provider: "codex", filePath: source.source.filePath, reason: "import_failed" }],
+        skipped: [
+          {
+            reason: "import_failed",
+            count: 1,
+            examples: [{ provider: "codex", filePath: source.source.filePath }],
+          },
+        ],
       });
       expect(yield* events.read({ threadId }).pipe(Stream.runCollect)).toEqual([]);
       expect(yield* Effect.option(projections.getThread(threadId))).toEqual(Option.none());
@@ -433,7 +443,13 @@ it.effect(
       expect(yield* importer.run).toEqual({
         importedCount: 0,
         skippedCount: 1,
-        skipped: [{ provider: "codex", filePath: source.source.filePath, reason: "import_failed" }],
+        skipped: [
+          {
+            reason: "import_failed",
+            count: 1,
+            examples: [{ provider: "codex", filePath: source.source.filePath }],
+          },
+        ],
       });
       const committed = yield* events.read({ threadId }).pipe(Stream.runCollect);
       expect(committed).toHaveLength(6);

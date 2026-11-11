@@ -3,8 +3,9 @@ import {
   normalizeProjectPathForComparison,
 } from "@t3tools/client-runtime/state/projects";
 import type {
+  AgentSessionImportResult,
   AgentSessionImportSkipReason,
-  AgentSessionImportSkipped,
+  AgentSessionImportSkippedGroup,
   AgentSessionProjectCandidate,
   EnvironmentId,
   ProjectId,
@@ -181,17 +182,21 @@ const SKIP_REASON_LABELS: Record<AgentSessionImportSkipReason, string> = {
   import_failed: "Could not be saved",
 };
 
-/** Skipped transcripts grouped by reason, in first-seen order. */
-export function groupSkippedImports(skipped: ReadonlyArray<AgentSessionImportSkipped>) {
-  const groups = new Map<AgentSessionImportSkipReason, Array<string>>();
-  for (const entry of skipped) {
-    const filePaths = groups.get(entry.reason) ?? [];
-    filePaths.push(entry.filePath);
-    groups.set(entry.reason, filePaths);
-  }
-  return Array.from(groups, ([reason, filePaths]) => ({
-    reason,
-    label: SKIP_REASON_LABELS[reason],
-    filePaths,
-  }));
+export function skippedImportLabel(reason: AgentSessionImportSkipReason): string {
+  return SKIP_REASON_LABELS[reason];
+}
+
+/** Skips that importing again cannot change do not keep a project marked unfinished. */
+const PERMANENT_SKIP_REASONS: ReadonlySet<AgentSessionImportSkipReason> = new Set([
+  "no_conversation",
+]);
+
+export function hasRetryableImportSkips(
+  result: Pick<AgentSessionImportResult, "skippedCount" | "skipped">,
+): boolean {
+  if (result.skipped === undefined) return result.skippedCount > 0;
+  return result.skipped.some(
+    (group: AgentSessionImportSkippedGroup) =>
+      group.count > 0 && !PERMANENT_SKIP_REASONS.has(group.reason),
+  );
 }

@@ -2,6 +2,7 @@ import { EnvironmentId, ProjectId, type AgentSessionProjectCandidate } from "@t3
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  hasRetryableImportSkips,
   groupOnboardingProjects,
   isNewOnboardingProject,
   partitionOnboardingProjects,
@@ -250,5 +251,27 @@ describe("projects on multiple computers", () => {
     const first = { ...candidate("/code/app"), environmentId: "first" };
     const second = { ...candidate("/code/app"), environmentId: "second" };
     expect(partitionOnboardingProjects([first, second], now).recent).toEqual([first, second]);
+  });
+});
+
+describe("hasRetryableImportSkips", () => {
+  it("keeps a project unfinished only for skips another import could change", () => {
+    const group = (reason: "no_conversation" | "import_limit", count: number) => ({
+      reason,
+      count,
+      examples: [],
+    });
+    expect(
+      hasRetryableImportSkips({ skippedCount: 4, skipped: [group("no_conversation", 4)] }),
+    ).toBe(false);
+    expect(
+      hasRetryableImportSkips({
+        skippedCount: 5,
+        skipped: [group("no_conversation", 4), group("import_limit", 1)],
+      }),
+    ).toBe(true);
+    // Older servers report only a count.
+    expect(hasRetryableImportSkips({ skippedCount: 1 })).toBe(true);
+    expect(hasRetryableImportSkips({ skippedCount: 0 })).toBe(false);
   });
 });

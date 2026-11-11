@@ -1,7 +1,7 @@
 import { useAuth } from "@clerk/react";
 import { useAtomValue } from "@effect/atom-react";
 import type {
-  AgentSessionImportSkipped,
+  AgentSessionImportSkippedGroup,
   AgentSessionProjectCandidate,
   EnvironmentId,
   ProjectId,
@@ -17,6 +17,7 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import {
+  mergeSkippedImportGroups,
   AgentSessionSource,
   AuthProvidersManageScope,
   AuthRelayReadScope,
@@ -53,7 +54,8 @@ import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
 import { completeOnboarding } from "../../onboarding/firstRun";
 import {
   groupOnboardingProjects,
-  groupSkippedImports,
+  hasRetryableImportSkips,
+  skippedImportLabel,
   partitionOnboardingProjects,
   onboardingProjectKey,
   resolveOnboardingLandingProject,
@@ -1513,7 +1515,7 @@ function useProjectImport({
         ? selection.filter((candidate) => importedProjects.has(candidate.key)).length
         : 0;
     let skippedThreadCount = 0;
-    const skippedThreads: Array<AgentSessionImportSkipped> = [];
+    let skippedThreads: Array<AgentSessionImportSkippedGroup> = [];
     const refreshEnvironments = new Set<EnvironmentId>();
     // Resolves false when the run stopped early: a newer run, an unmount, or lost access.
     const importEach = async () => {
@@ -1573,14 +1575,17 @@ function useProjectImport({
             (importedThreads.get(candidate.key) ?? 0) + threadImportResult.value.importedCount,
           );
           skippedThreadCount += threadImportResult.value.skippedCount;
-          skippedThreads.push(...(threadImportResult.value.skipped ?? []));
+          skippedThreads = mergeSkippedImportGroups([
+            ...skippedThreads,
+            ...(threadImportResult.value.skipped ?? []),
+          ]);
           if (threadImportResult.value.importedCount > 0) {
             projectsWithImportedHistoryRef.current.set(
               candidate.key,
               scopeProjectRef(environmentId, projectId),
             );
           }
-          if (threadImportResult.value.skippedCount === 0) {
+          if (!hasRetryableImportSkips(threadImportResult.value)) {
             importedProjectsCount += 1;
             importedProjects.set(candidate.key, scopeProjectRef(environmentId, projectId));
           }
@@ -1639,27 +1644,30 @@ function useProjectImport({
 
 interface ImportWarning {
   readonly description: string;
-  readonly skipped: ReadonlyArray<AgentSessionImportSkipped>;
+  readonly skipped: ReadonlyArray<AgentSessionImportSkippedGroup>;
 }
 
 function SkippedImportList({
   skipped,
 }: {
-  readonly skipped: ReadonlyArray<AgentSessionImportSkipped>;
+  readonly skipped: ReadonlyArray<AgentSessionImportSkippedGroup>;
 }) {
   return (
     <div className="flex flex-col gap-2 text-xs">
-      {groupSkippedImports(skipped).map((group) => (
+      {skipped.map((group) => (
         <div key={group.reason}>
           <div className="font-medium text-foreground">
-            {group.label} ({group.filePaths.length})
+            {skippedImportLabel(group.reason)} ({group.count})
           </div>
           <ul className="flex flex-col gap-0.5 text-muted-foreground">
-            {group.filePaths.map((filePath) => (
-              <li key={filePath} className="break-all font-mono">
-                {filePath}
+            {group.examples.map((example) => (
+              <li key={example.filePath} className="break-all font-mono">
+                {example.filePath}
               </li>
             ))}
+            {group.count > group.examples.length ? (
+              <li>and {(group.count - group.examples.length).toLocaleString("en-US")} more</li>
+            ) : null}
           </ul>
         </div>
       ))}

@@ -10,7 +10,6 @@ import {
   resolveProviderInstanceEnabled,
   type AgentSessionImportSource,
   type AgentSessionImportSkipReason,
-  type AgentSessionImportSkipped,
   type AgentSessionProjectCandidate,
   type AgentSessionProjectGit,
   type AgentSessionScanResult,
@@ -211,6 +210,12 @@ export interface AgentSessionThread {
   readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
 }
 
+export interface AgentSessionSkippedTranscript {
+  readonly provider: AgentSessionSource;
+  readonly filePath: string;
+  readonly reason: AgentSessionImportSkipReason;
+}
+
 export type AgentSessionRecentThread =
   | {
       readonly _tag: "Importable";
@@ -221,7 +226,7 @@ export type AgentSessionRecentThread =
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
   | {
       readonly _tag: "Skipped";
-      readonly skipped: AgentSessionImportSkipped;
+      readonly skipped: AgentSessionSkippedTranscript;
     };
 
 export class AgentSessionScanner extends Context.Service<

@@ -102,7 +102,8 @@ count), conversations with more than 10 million records, unreadable files, and
 sessions with no user messages. Each import attempt reads up to 4 GiB per
 project; open the Welcome page again and pick the project in **Review all** to
 continue past that. Completed conversations are not imported again. When anything
-is skipped, the warning after setup lists each file and why it was skipped.
+is skipped, the warning after setup groups the files by reason, with up to 50
+paths per reason. Sessions with no user messages never count against a project.
 
 You can start without importing. While an import runs, T3 Code stays on the
 Welcome page. If you quit, open the Welcome page again from **Settings → About**; the

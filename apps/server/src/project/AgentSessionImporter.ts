@@ -18,7 +18,8 @@ import {
   type AgentSessionImportInput,
   type AgentSessionImportResult,
   type AgentSessionImportSkipReason,
-  type AgentSessionImportSkipped,
+  type AgentSessionImportSkippedGroup,
+  mergeSkippedImportGroups,
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
@@ -266,12 +267,24 @@ const make = Effect.gen(function* () {
     const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
     const importedThreadIds = new Set<ThreadId>();
     let importedCount = 0;
-    const skipped: Array<AgentSessionImportSkipped> = [];
+    let skippedCount = 0;
+    let skipped: Array<AgentSessionImportSkippedGroup> = [];
+    const skip = (entry: AgentSessionScanner.AgentSessionSkippedTranscript) => {
+      skippedCount += 1;
+      skipped = mergeSkippedImportGroups([
+        ...skipped,
+        {
+          reason: entry.reason,
+          count: 1,
+          examples: [{ provider: entry.provider, filePath: entry.filePath }],
+        },
+      ]);
+    };
 
     yield* Stream.runForEach(outcomes, (outcome) =>
       Effect.gen(function* () {
         if (outcome._tag === "Skipped") {
-          skipped.push(outcome.skipped);
+          skip(outcome.skipped);
           return;
         }
         const source = outcome.source;
@@ -454,14 +467,14 @@ const make = Effect.gen(function* () {
           importedThreadIds.add(threadId);
           importedCount += 1;
         } else if (typeof imported === "string") {
-          skipped.push({ provider: source.provider, filePath: source.filePath, reason: imported });
+          skip({ provider: source.provider, filePath: source.filePath, reason: imported });
         }
       }),
     );
 
     return {
       importedCount,
-      skippedCount: skipped.length,
+      skippedCount,
       skipped,
     } satisfies AgentSessionImportResult;
   });
