@@ -240,68 +240,75 @@ it.effect(
     }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
-it.effect("a fixed-time run missed by hours runs once, then keeps its daily time", () =>
-  Effect.gen(function* () {
-    const dueAt = DateTime.makeZonedUnsafe(
-      { year: 2026, month: 7, day: 1, hour: 9, minute: 0, second: 0, millisecond: 0 },
-      { timeZone: DateTime.zoneMakeLocal(), adjustForTimeZone: true },
-    );
-    yield* TestClock.setTime(DateTime.toEpochMillis(dueAt) - 1_000);
-    const launches = yield* Ref.make(0);
-    const layerDependencies = Layer.mergeAll(
-      NodeCrypto.layer,
-      Scheduler.layer,
-      ManagedPolicy.layerTest(),
-      Layer.mock(ThreadLaunchService.ThreadLaunchService)({
-        launch: () =>
-          Ref.update(launches, (count) => count + 1).pipe(
-            Effect.as({ threadId: "thread-missed-run", resumed: false } as never),
-          ),
-      }),
-      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
-        namedProjectsRoot: "/projects",
-        isScratchProject: () => Effect.succeed(false),
-      }),
-      Layer.mock(ThreadManagementService.ThreadManagementService)({}),
-      Layer.mock(SecretRequests.SecretRequests)({}),
-    );
-    const serviceLayer = ScheduledTaskService.layer.pipe(Layer.provide(layerDependencies));
-    const created = yield* Effect.gen(function* () {
-      const service = yield* ScheduledTaskService.ScheduledTaskService;
-      return yield* service.upsert(
-        yield* decodeUpsertInput({
-          title: "Morning review",
-          prompt: "Review the open pull requests.",
-          enabled: true,
-          schedule: { type: "fixed_time", timeOfDay: "09:00" },
-          projectId: "project-missed-run",
-          workspaceStrategy: { type: "root" },
-          modelSelection: { instanceId: "codex", model: "gpt-5.4" },
-          runtimeMode: "full-access",
-          interactionMode: "default",
+it.effect.each([
+  // Several missed days produce one catch-up run.
+  { late: { days: 3, hours: 6 }, nextInDays: 4 },
+  // A catch-up minutes before the next occurrence stands in for it.
+  { late: { hours: 23, minutes: 50 }, nextInDays: 2 },
+] as const)(
+  "a fixed-time run missed by $late runs once, then keeps its daily time",
+  ({ late, nextInDays }) =>
+    Effect.gen(function* () {
+      const dueAt = DateTime.makeZonedUnsafe(
+        { year: 2026, month: 7, day: 1, hour: 9, minute: 0, second: 0, millisecond: 0 },
+        { timeZone: DateTime.zoneMakeLocal(), adjustForTimeZone: true },
+      );
+      yield* TestClock.setTime(DateTime.toEpochMillis(dueAt) - 1_000);
+      const launches = yield* Ref.make(0);
+      const layerDependencies = Layer.mergeAll(
+        NodeCrypto.layer,
+        Scheduler.layer,
+        ManagedPolicy.layerTest(),
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+          launch: () =>
+            Ref.update(launches, (count) => count + 1).pipe(
+              Effect.as({ threadId: "thread-missed-run", resumed: false } as never),
+            ),
         }),
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+          namedProjectsRoot: "/projects",
+          isScratchProject: () => Effect.succeed(false),
+        }),
+        Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
       );
-    }).pipe(
-      Effect.provide(serviceLayer),
-      // The server is down while several days of occurrences pass.
-      Effect.provideService(ServerActivation, Effect.never),
-    );
-    yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.add(dueAt, { days: 3, hours: 6 })));
-    yield* Effect.gen(function* () {
-      const service = yield* ScheduledTaskService.ScheduledTaskService;
-      const completedRun = yield* service.subscribeList().pipe(
-        Stream.map(({ tasks }) => tasks.find((task) => task.id === created.task.id)),
-        Stream.filter((task) => task !== undefined && task.runCount > 0),
-        Stream.runHead,
-        Effect.forkChild,
+      const serviceLayer = ScheduledTaskService.layer.pipe(Layer.provide(layerDependencies));
+      const created = yield* Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        return yield* service.upsert(
+          yield* decodeUpsertInput({
+            title: "Morning review",
+            prompt: "Review the open pull requests.",
+            enabled: true,
+            schedule: { type: "fixed_time", timeOfDay: "09:00" },
+            projectId: "project-missed-run",
+            workspaceStrategy: { type: "root" },
+            modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          }),
+        );
+      }).pipe(
+        Effect.provide(serviceLayer),
+        // The server is down while several days of occurrences pass.
+        Effect.provideService(ServerActivation, Effect.never),
       );
-      yield* TestClock.adjust("6 seconds");
-      const task = Option.getOrThrow(yield* Fiber.join(completedRun));
-      expect(task?.nextRunAt).toBe(
-        DateTime.formatIso(DateTime.toUtc(DateTime.add(dueAt, { days: 4 }))),
-      );
-      yield* TestClock.adjust("6 seconds");
-      expect(yield* Ref.get(launches)).toBe(1);
-    }).pipe(Effect.provide(serviceLayer));
-  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.add(dueAt, late)));
+      yield* Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        const completedRun = yield* service.subscribeList().pipe(
+          Stream.map(({ tasks }) => tasks.find((task) => task.id === created.task.id)),
+          Stream.filter((task) => task !== undefined && task.runCount > 0),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+        yield* TestClock.adjust("6 seconds");
+        const task = Option.getOrThrow(yield* Fiber.join(completedRun));
+        expect(task?.nextRunAt).toBe(
+          DateTime.formatIso(DateTime.toUtc(DateTime.add(dueAt, { days: nextInDays }))),
+        );
+        yield* TestClock.adjust("6 seconds");
+        expect(yield* Ref.get(launches)).toBe(1);
+      }).pipe(Effect.provide(serviceLayer));
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );

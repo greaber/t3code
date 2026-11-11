@@ -1029,7 +1029,12 @@ export const layer = Layer.effect(
             // A manual run that starts before a one-time run must not use it up.
             nextRunAt: nextRunAt(
               scheduleSource,
-              scheduleSource.schedule.type === "once" ? startedAt : completedAt,
+              scheduleSource.schedule.type === "once"
+                ? startedAt
+                : trigger === "scheduled" && scheduleSource.schedule.type === "fixed_time"
+                  ? // A late catch-up stands in for an occurrence due within the hour after it.
+                    DateTime.max(completedAt, DateTime.add(startedAt, { hours: 1 }))
+                  : completedAt,
             ),
             lastRunStatus,
             lastRunError,
