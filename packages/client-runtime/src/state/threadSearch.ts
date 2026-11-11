@@ -1,6 +1,7 @@
 import {
   EnvironmentId,
   OrchestrationSearchThreadsInput,
+  THREAD_SEARCH_MAX_EXCLUDED_THREADS,
   ProjectId,
   type OrchestrationThreadSearchMatch,
   type OrchestrationV2SearchThreadsInput,
@@ -20,6 +21,9 @@ import { threadSearchPullRequests } from "@t3tools/shared/threadPullRequests";
 
 import type { EnvironmentThreadShell } from "./models.ts";
 import { getThreadSortTimestamp } from "./threadSort.ts";
+
+// Pages a search reads on its own, past ones without matches, before showing "more".
+const EMPTY_PAGES_PER_REQUEST = 3;
 
 // When this client last sent an open per thread, by its own clock: a server
 // timestamp would be off by any clock skew. The server merges opens closer
@@ -54,6 +58,8 @@ export interface ThreadSearchResultsState {
   readonly isLoading: boolean;
   /** Older messages may hold more matches; `loadMore` reads the next page. */
   readonly hasMore: boolean;
+  /** The search listed as many threads as later pages can leave out, and stopped there. */
+  readonly partial: boolean;
   /** Rows of matching older settled threads, which shells that omit them do not hold. */
   readonly rows: ReadonlyArray<{
     readonly environmentId: EnvironmentId;
@@ -127,7 +133,13 @@ export function createThreadSearchResultsAtomFamily<E>(options: {
     Atom.make((get): ThreadSearchResultsState => {
       const parsedKey = parseThreadSearchKey(key);
       if (Option.isNone(parsedKey)) {
-        return { matches: [], isLoading: false, hasMore: false, rows: EMPTY_SEARCH_ROWS };
+        return {
+          matches: [],
+          isLoading: false,
+          hasMore: false,
+          partial: false,
+          rows: EMPTY_SEARCH_ROWS,
+        };
       }
 
       const [environmentIds, query, scope = {}] = parsedKey.value;
@@ -138,6 +150,7 @@ export function createThreadSearchResultsAtomFamily<E>(options: {
       const rows: Array<ThreadSearchResultsState["rows"][number]> = [];
       let isLoading = false;
       let hasMore = false;
+      let partial = false;
 
       for (const environmentId of environmentIds) {
         const before = options.olderSettledBefore
@@ -169,14 +182,27 @@ export function createThreadSearchResultsAtomFamily<E>(options: {
             });
           }
         }
-        // Later pages leave out the threads earlier ones returned. A page that found nothing
-        // continues on its own, so "more" never shows without matches to load.
+        // Later pages leave out the threads earlier ones returned. Each request reads until a
+        // page finds matches or a few in a row find none, so a long history without matches
+        // shows "more" instead of reading on unseen.
         const wanted = get(requestedPages(JSON.stringify([key, environmentId])));
         const excludedThreadIds = value?.matches.map((match) => match.threadId) ?? [];
         let cursor = value?.cursor;
-        let lastPageMatched = (value?.matches.length ?? 0) > 0;
-        let pages = 1;
-        while (cursor !== undefined && (pages < wanted || !lastPageMatched)) {
+        let request = 1;
+        let satisfied = (value?.matches.length ?? 0) > 0;
+        let emptyPages = satisfied ? 0 : 1;
+        while (cursor !== undefined) {
+          if (satisfied || emptyPages >= EMPTY_PAGES_PER_REQUEST) {
+            if (request >= wanted) break;
+            request += 1;
+            satisfied = false;
+            emptyPages = 0;
+          }
+          if (excludedThreadIds.length >= THREAD_SEARCH_MAX_EXCLUDED_THREADS) {
+            partial = true;
+            cursor = undefined;
+            break;
+          }
           const next = get(
             options.getSearchAtom(environmentId, {
               query,
@@ -193,8 +219,8 @@ export function createThreadSearchResultsAtomFamily<E>(options: {
           matches.push(...nextValue.matches.map((match) => ({ ...match, environmentId })));
           excludedThreadIds.push(...nextValue.matches.map((match) => match.threadId));
           cursor = nextValue.cursor;
-          lastPageMatched = nextValue.matches.length > 0;
-          if (lastPageMatched) pages += 1;
+          if (nextValue.matches.length > 0) satisfied = true;
+          else emptyPages += 1;
         }
         hasMore ||= cursor !== undefined;
       }
@@ -203,6 +229,7 @@ export function createThreadSearchResultsAtomFamily<E>(options: {
         matches,
         isLoading,
         hasMore,
+        partial,
         rows: rows.length === 0 ? EMPTY_SEARCH_ROWS : rows,
       };
     }).pipe(Atom.withLabel(`${options.labelPrefix}:${key}`)),

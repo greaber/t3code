@@ -815,9 +815,10 @@ export function HomeScreen(props: HomeScreenProps) {
                 // Lifted above the rows so an iOS filter menu's dismissal morph is not covered.
                 ListHeaderComponentStyle={{ zIndex: 1 }}
                 ListFooterComponent={
-                  hasSearchQuery && threadSearch.hasMore ? (
+                  hasSearchQuery && (threadSearch.hasMore || threadSearch.partial) ? (
                     <ThreadSearchMoreRow
                       loading={threadSearch.isPending}
+                      partial={threadSearch.partial}
                       onPress={threadSearch.loadMore}
                     />
                   ) : settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (

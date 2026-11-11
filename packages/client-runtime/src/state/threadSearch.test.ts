@@ -64,8 +64,20 @@ it("ignores invalid search keys", () => {
     const state = registry.get(searchAtom(makeThreadSearchKey([envA], "a".repeat(201))));
     const malformedState = registry.get(searchAtom("not json{{"));
 
-    expect(state).toEqual({ matches: [], isLoading: false, hasMore: false, rows: [] });
-    expect(malformedState).toEqual({ matches: [], isLoading: false, hasMore: false, rows: [] });
+    expect(state).toEqual({
+      matches: [],
+      isLoading: false,
+      hasMore: false,
+      partial: false,
+      rows: [],
+    });
+    expect(malformedState).toEqual({
+      matches: [],
+      isLoading: false,
+      hasMore: false,
+      partial: false,
+      rows: [],
+    });
     expect(searchCount).toBe(0);
   } finally {
     registry.dispose();
@@ -102,6 +114,7 @@ it("merges successful environments and silently ignores failures", () => {
     matches: [{ ...result.matches[0], environmentId: envA }],
     isLoading: false,
     hasMore: false,
+    partial: false,
     rows: [],
   });
   expect(threadSearchMatchKey(state.matches[0]!)).toBe('["env-a","thread-a"]');
@@ -109,7 +122,7 @@ it("merges successful environments and silently ignores failures", () => {
   registry.dispose();
 });
 
-it("loads later pages on request, excluding earlier threads, and passes over empty pages", () => {
+it("loads later pages on request, passing over at most three empty pages on its own", () => {
   const match = (id: string) => ({
     threadId: ThreadId.make(id),
     projectId: ProjectId.make("project-a"),
@@ -117,9 +130,12 @@ it("loads later pages on request, excluding earlier threads, and passes over emp
     snippet: "needle",
     messageCreatedAt: null,
   });
-  // Keyed by the page's cursor: page 1 finds nothing, so page 2 follows on its own.
+  // Keyed by the page's cursor. Pages 50..30 find nothing; 20 does.
   const pages: Record<string, OrchestrationSearchThreadsResult> = {
-    first: { matches: [match("a")], cursor: { before: 30 } },
+    first: { matches: [match("a")], cursor: { before: 60 } },
+    60: { matches: [], cursor: { before: 50 } },
+    50: { matches: [], cursor: { before: 40 } },
+    40: { matches: [], cursor: { before: 30 } },
     30: { matches: [], cursor: { before: 20 } },
     20: { matches: [match("b")], cursor: { before: 10 } },
     10: { matches: [match("c")] },
@@ -134,12 +150,17 @@ it("loads later pages on request, excluding earlier threads, and passes over emp
   });
   const registry = AtomRegistry.make();
   const key = makeThreadSearchKey([envA], "needle");
-  const threadIds = () =>
-    registry.get(search.results(key)).matches.map((found) => found.threadId as string);
+  const state = () => registry.get(search.results(key));
+  const threadIds = () => state().matches.map((found) => found.threadId as string);
   const unmount = registry.mount(search.results(key));
 
   expect(threadIds()).toEqual(["a"]);
-  expect(registry.get(search.results(key)).hasMore).toBe(true);
+  expect(state().hasMore).toBe(true);
+  // Three empty pages in a row stop the read and offer more.
+  search.loadMore(registry, key);
+  expect(threadIds()).toEqual(["a"]);
+  expect(inputs.at(-1)?.cursor).toEqual({ before: 40 });
+  expect(state().hasMore).toBe(true);
   search.loadMore(registry, key);
   expect(threadIds()).toEqual(["a", "b"]);
   expect(inputs.at(-1)).toEqual({
@@ -149,7 +170,7 @@ it("loads later pages on request, excluding earlier threads, and passes over emp
   });
   search.loadMore(registry, key);
   expect(threadIds()).toEqual(["a", "b", "c"]);
-  expect(registry.get(search.results(key)).hasMore).toBe(false);
+  expect(state()).toMatchObject({ hasMore: false, partial: false });
   expect(inputs.at(-1)?.excludedThreadIds).toEqual(["a", "b"]);
 
   unmount();

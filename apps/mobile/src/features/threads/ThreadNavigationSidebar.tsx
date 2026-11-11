@@ -558,10 +558,11 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
     />
   );
   const searchMoreRow =
-    props.searchQuery.trim().length > 0 && threadSearch.hasMore ? (
+    props.searchQuery.trim().length > 0 && (threadSearch.hasMore || threadSearch.partial) ? (
       <ThreadSearchMoreRow
         pane="sidebar"
         loading={threadSearch.isPending}
+        partial={threadSearch.partial}
         onPress={threadSearch.loadMore}
       />
     ) : null;

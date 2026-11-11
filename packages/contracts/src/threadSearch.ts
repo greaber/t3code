@@ -15,6 +15,9 @@ export type OrchestrationThreadSearchSource = typeof OrchestrationThreadSearchSo
 /** Longer queries are cut to this before they are sent. */
 export const THREAD_SEARCH_QUERY_MAX_LENGTH = 200;
 
+/** How many threads later pages can leave out, and so how many a search can list. */
+export const THREAD_SEARCH_MAX_EXCLUDED_THREADS = 2_000;
+
 /** Where the next page of message matches starts: messages older than `before`. */
 export const OrchestrationThreadSearchCursor = Schema.Struct({
   before: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -32,7 +35,9 @@ export const OrchestrationSearchThreadsInput = Schema.Struct({
   /** The previous page's `cursor`, for the next page. */
   cursor: Schema.optionalKey(OrchestrationThreadSearchCursor),
   /** Threads earlier pages of this search returned, so later pages leave them out. */
-  excludedThreadIds: Schema.optionalKey(Schema.Array(ThreadId)),
+  excludedThreadIds: Schema.optionalKey(
+    Schema.Array(ThreadId).check(Schema.isMaxLength(THREAD_SEARCH_MAX_EXCLUDED_THREADS)),
+  ),
 });
 export type OrchestrationSearchThreadsInput = typeof OrchestrationSearchThreadsInput.Type;
 

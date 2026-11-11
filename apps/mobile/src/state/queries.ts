@@ -57,6 +57,7 @@ const EMPTY_THREAD_SEARCH_ATOM = Atom.make<ThreadSearchResultsState>({
   matches: EMPTY_THREAD_SEARCH_MATCHES,
   isLoading: false,
   hasMore: false,
+  partial: false,
   rows: [],
 }).pipe(Atom.withLabel("mobile:thread-search:empty"));
 
@@ -209,6 +210,8 @@ export function useThreadSearch(
   readonly matches: ReadonlyArray<EnvironmentThreadSearchMatch>;
   /** Older messages may hold more matches for the shown query. */
   readonly hasMore: boolean;
+  /** The search stopped at the most threads it can list; older matches are not shown. */
+  readonly partial: boolean;
   readonly loadMore: () => void;
   /** The query `matches` are for, which lags the typed one while a search runs. */
   readonly query: string;
@@ -267,6 +270,7 @@ export function useThreadSearch(
     query: visible.query,
     isPending,
     hasMore: searchKey !== null && visible.query === settledQuery && result.hasMore,
+    partial: searchKey !== null && visible.query === settledQuery && result.partial,
     loadMore: () => {
       if (searchKey !== null) threadSearch.loadMore(appAtomRegistry, searchKey);
     },

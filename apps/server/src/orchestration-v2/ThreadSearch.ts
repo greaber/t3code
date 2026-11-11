@@ -107,7 +107,7 @@ const MESSAGE_HIT_LIMIT = 2000;
 // threads would otherwise read every hit before the page answers.
 const MESSAGE_CANDIDATE_PAGE = 10_000;
 // Without the index, how many messages one page scans.
-const MESSAGE_SCAN_PAGE = 50_000;
+const MESSAGE_SCAN_PAGE = 20_000;
 const NON_ASCII = /[\u0080-\uffff]/;
 
 /** SQLite's lower() folds ASCII only, so a short word is checked as each spelling it can match. */

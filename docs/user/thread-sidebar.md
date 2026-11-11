@@ -234,6 +234,8 @@ the matching message; on an iPad with a keyboard, `Cmd+K` opens the same
 palette. The palette shows the best few message matches. The sidebar search on
 web and desktop and the thread list search on mobile list every match: when a
 long history holds more, **Search older messages** below the results loads them.
+A search lists up to 2,000 threads with matching messages and says so when it
+stops there.
 
 Use **Settings → Keybindings** to find or customize shortcuts for searching files
 and copying a thread reference. A copied reference uses the thread's pull request
