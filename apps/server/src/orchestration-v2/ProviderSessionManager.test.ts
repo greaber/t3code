@@ -1955,6 +1955,132 @@ it.effect(
     }),
 );
 
+it.effect("ProviderSessionManagerV2 keeps a session whose pending-work check fails", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const threadId = ThreadId.make("thread-failed-work-probe");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({ idAllocator, threadId, now: yield* DateTime.now }),
+        ],
+      });
+      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+
+      yield* TestClock.adjust("5 minutes");
+      assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+      assert.equal((yield* Ref.get(state)).closeCount, 0);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 60_000,
+          hasPendingBackgroundWork: Effect.die("probe failed"),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 keeps an idle thread loaded when its pending-work check fails",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const projectId = yield* idAllocator.allocate.project({
+          fixtureName: "provider-session-manager-failed-thread-probe",
+        });
+        const threadId = yield* idAllocator.allocate.thread({
+          fixtureName: "provider-session-manager-failed-thread-probe",
+          projectId,
+        });
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* runtime.events.pipe(Stream.runDrain, Effect.forkScoped);
+        const appThread = (yield* projectionStore.getThreadProjection(threadId)).thread;
+        yield* runtime.startTurn({
+          appThread,
+          threadId,
+          runId,
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          rootNodeId: idAllocator.derive.rootNode({ runId }),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+            text: "hello",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+        const queue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(queue);
+        yield* Queue.offer(queue!, {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId: providerThread.id,
+          providerTurnId: idAllocator.derive.providerTurn({
+            driver: CODEX_DRIVER,
+            nativeTurnId: "native-turn-failed-thread-probe",
+          }),
+          runOrdinal: 1,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+
+        yield* TestClock.adjust("5 minutes");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60_000,
+            hasPendingBackgroundWork: Effect.succeed(true),
+            hasPendingBackgroundWorkForThread: Effect.die("probe failed"),
+          }),
+        ),
+        Effect.scoped,
+      );
+    }),
+);
+
 it.effect.each([
   [undefined, 30 * 60 * 1000],
   ["120000", 120_000],
