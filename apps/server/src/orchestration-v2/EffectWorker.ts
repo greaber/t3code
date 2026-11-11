@@ -629,18 +629,12 @@ export class OrchestrationEffectWorkerV2 extends Context.Service<
 >()("t3/orchestration-v2/EffectWorker/OrchestrationEffectWorkerV2") {}
 
 // Retry backoff blocks the thread's later effects, so effects a user waits on keep a short
-// budget (about 1.5 s) and surface their failure; cleanup nobody waits on retries for about
-// ten minutes before giving up.
+// budget (about 1.5 s) and surface their failure; background cleanup, which does not block,
+// retries for about ten minutes before giving up.
 const INTERACTIVE_EFFECT_MAX_ATTEMPTS = 5;
 const BACKGROUND_EFFECT_MAX_ATTEMPTS = 28;
 const BACKGROUND_EFFECT_TYPES: ReadonlySet<EffectOutbox.OrchestrationEffectRequestV2["type"]> =
-  new Set([
-    "provider-session.detach",
-    "scheduled-tasks.cleanup",
-    "terminal.cleanup",
-    "preview.cleanup",
-    "attachment.cleanup",
-  ]);
+  new Set(EffectOutbox.BACKGROUND_EFFECT_TYPES);
 const retryDelayMs = (attemptCount: number) =>
   Math.min(30_000, 100 * 2 ** Math.max(0, attemptCount - 1));
 
