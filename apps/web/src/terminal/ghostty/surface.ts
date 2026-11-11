@@ -531,6 +531,8 @@ export interface GhosttyTerminalSurfaceOptions {
   readonly onLinkHover?: (text: string | null) => void;
   /** The host must prevent the default menu; native Paste cannot reach a canvas terminal. */
   readonly onContextMenu?: (event: MouseEvent) => void;
+  /** The user scrolled up to the oldest row the view holds. */
+  readonly onScrollbackStart?: () => void;
 }
 
 export class GhosttyTerminalSurface {
@@ -774,6 +776,20 @@ export class GhosttyTerminalSurface {
     this.cursorOn = true;
     this.scrollbarDirty = true;
     this.requestRender();
+  }
+
+  /**
+   * Replaces the contents with `data`, which only adds older output in front of what is
+   * shown, keeping the rows the user is reading in place.
+   */
+  prependAndWrite(data: string): void {
+    if (this.disposed) return;
+    const before = this.core.scrollbarState();
+    this.resetAndWrite(data);
+    const after = this.core.scrollbarState();
+    if (before === null || after === null) return;
+    const rowsBelow = before.total - before.len - before.offset;
+    if (rowsBelow > 0) this.scrollViewport(after.total - after.len - rowsBelow - after.offset);
   }
 
   resetAndWrite(data: string): void {
@@ -1930,6 +1946,9 @@ export class GhosttyTerminalSurface {
       const offset = Math.max(0, Math.min(state.offset + delta, maxOffset));
       delta = offset - state.offset;
       this.scrollbarState = { ...state, offset };
+    }
+    if (delta < 0 && state !== null && state.offset + delta <= 0) {
+      this.options.onScrollbackStart?.();
     }
     if (delta === 0) return;
     this.core.scroll(delta);

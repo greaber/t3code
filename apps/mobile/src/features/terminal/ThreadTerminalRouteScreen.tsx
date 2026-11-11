@@ -7,7 +7,11 @@ import {
   ThreadId,
   sessionGrantsScope,
 } from "@t3tools/contracts";
-import { type KnownTerminalSession } from "@t3tools/client-runtime/state/terminal";
+import {
+  canLoadOlderTerminalOutput,
+  DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
+  type KnownTerminalSession,
+} from "@t3tools/client-runtime/state/terminal";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppBar } from "../../components/ui/AppBar";
 import { useNativeColumnLayoutMetrics } from "../../native/native-layout-metrics";
@@ -105,6 +109,8 @@ function TerminalHeader(props: {
   readonly onIncreaseFontSize: () => void;
   readonly onOpenNewTerminal: () => void;
   readonly onSelectTerminal: (terminalId: string) => void;
+  /** Null when the view already holds all the output the server keeps, or all that fits. */
+  readonly onLoadOlderOutput: (() => void) | null;
 }) {
   return (
     <AppBar
@@ -159,6 +165,17 @@ function TerminalHeader(props: {
                     selected: session.terminalId === props.terminalId,
                     onPress: () => props.onSelectTerminal(session.terminalId),
                   })),
+                  ...(props.onLoadOlderOutput === null
+                    ? []
+                    : [
+                        {
+                          id: "terminal-load-older",
+                          title: "Load earlier output",
+                          icon: "arrow.up",
+                          subtitle: "Older output the environment still keeps",
+                          onPress: props.onLoadOlderOutput,
+                        },
+                      ]),
                   {
                     id: "terminal-new",
                     disabled: !props.canOperateTerminal,
@@ -829,6 +846,20 @@ function ThreadTerminal(props: {
         onIncreaseFontSize={handleIncreaseFontSize}
         onOpenNewTerminal={handleOpenNewTerminal}
         onSelectTerminal={handleSelectTerminal}
+        onLoadOlderOutput={
+          canLoadOlderTerminalOutput(terminal.output, DEFAULT_MAX_TERMINAL_BUFFER_BYTES)
+            ? () =>
+                void terminalEnvironment.loadOlderOutput(
+                  appAtomRegistry,
+                  {
+                    environmentId: selectedThread.environmentId,
+                    threadId: selectedThread.id,
+                    terminalId,
+                  },
+                  terminal.output,
+                )
+            : null
+        }
       />
 
       <ScreenContent>

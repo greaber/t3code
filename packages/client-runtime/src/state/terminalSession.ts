@@ -1,6 +1,7 @@
 import type {
   EnvironmentId,
   TerminalAttachStreamEvent,
+  TerminalHistoryPage,
   TerminalMetadataStreamEvent,
   TerminalSessionSnapshot,
   TerminalSummary,
@@ -10,11 +11,13 @@ import { DEFAULT_MAX_TERMINAL_BUFFER_BYTES } from "@t3tools/contracts";
 import {
   appendOutput,
   EMPTY_TERMINAL_OUTPUT_STATE,
+  prependOutput,
   resetOutput,
   type TerminalOutputState,
 } from "./terminalOutput.ts";
 
 export {
+  canLoadOlderTerminalOutput,
   INITIAL_TERMINAL_OUTPUT_CURSOR,
   readTerminalOutputUpdate,
   terminalOutputText,
@@ -113,7 +116,14 @@ function terminalBufferStateFromSnapshot(
   current: TerminalBufferState = EMPTY_TERMINAL_BUFFER_STATE,
 ): TerminalBufferState {
   return {
-    output: resetOutput(current.output, snapshot.history, maxBufferBytes),
+    output: resetOutput(
+      current.output,
+      snapshot.history,
+      maxBufferBytes,
+      snapshot.historyOffset === undefined
+        ? undefined
+        : { offset: snapshot.historyOffset, older: snapshot.olderHistory ?? false },
+    ),
     grid: nextGrid(current.grid, snapshot),
     status: snapshot.status,
     error: null,
@@ -156,12 +166,24 @@ export function combineTerminalSessionState(
   };
 }
 
+/** A page of older output the client asked for, applied in order with the stream's events. */
+export interface TerminalOlderHistoryEvent {
+  readonly type: "olderHistory";
+  readonly page: TerminalHistoryPage;
+}
+
 export function applyTerminalAttachStreamEvent(
   current: TerminalBufferState,
-  event: TerminalAttachStreamEvent,
+  event: TerminalAttachStreamEvent | TerminalOlderHistoryEvent,
   maxBufferBytes = DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
 ): TerminalBufferState {
   switch (event.type) {
+    case "olderHistory": {
+      const output = prependOutput(current.output, event.page, maxBufferBytes);
+      return output === current.output
+        ? current
+        : { ...current, output, version: current.version + 1 };
+    }
     case "snapshot": {
       if (current.version === 0) {
         return terminalBufferStateFromSnapshot(event.snapshot, maxBufferBytes, current);

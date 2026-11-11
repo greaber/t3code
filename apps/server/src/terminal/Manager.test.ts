@@ -383,6 +383,8 @@ it("preserves line and byte limits across arbitrary chunks, Unicode, ANSI sequen
         history.append(chunk);
         expected = retainedHistory(expected + chunk, maxLines, maxBytes);
         expect(history.value()).toBe(expected);
+        expect(history.textFrom(history.startOffset)).toBe(expected);
+        expect(history.endOffset - history.startOffset).toBe(expected.length);
       }
     }
   }
@@ -404,6 +406,82 @@ it("bounds long partial lines and joins surrogate pairs across chunk boundaries"
     expect(history.value()).toBe(expected);
     expect(Buffer.byteLength(history.value())).toBeLessThanOrEqual(maxBytes);
   }
+});
+
+it("pages retained output back to its start without gaps or oversized pages", () => {
+  const history = new TerminalManager.BoundedTerminalHistory(40, "", 2_000);
+  for (let line = 0; line < 100; line += 1)
+    history.append(`line ${line} 名🚀 ${"x".repeat(line % 70)}\n`);
+  const latest = history.endOffset;
+  history.append("prompt$ ");
+
+  const pages: string[] = [];
+  let before = latest;
+  for (;;) {
+    const page = history.pageBefore(before, 300);
+    expect(Buffer.byteLength(page.data)).toBeLessThanOrEqual(300);
+    expect(page.offset + page.data.length).toBe(before);
+    // Pages after the first start at a line.
+    if (page.older) expect(history.textFrom(page.offset - 1)?.[0]).toBe("\n");
+    pages.unshift(page.data);
+    before = page.offset;
+    if (!page.older) break;
+  }
+  expect(before).toBe(history.startOffset);
+  expect(pages.join("") + "prompt$ ").toBe(history.value());
+
+  // Offsets keep naming the same text after newer output trims older lines.
+  const kept = history.textFrom(latest);
+  history.append("more\n".repeat(30));
+  expect(history.textFrom(latest)).toBe(kept + "more\n".repeat(30));
+  expect(history.pageBefore(history.startOffset - 1, 300)).toEqual({
+    data: "",
+    offset: history.startOffset,
+    older: false,
+  });
+  history.clear();
+  expect(history.pageBefore(latest, 300).older).toBe(false);
+});
+
+it("appends history files and rewrites them only when cleared or mostly trimmed", () => {
+  const history = new TerminalManager.BoundedTerminalHistory(3, "", 1_000);
+  let file = "";
+  const persist = () => {
+    const write = TerminalManager.planHistoryFileWrite(history, 64);
+    file = write.append ? file + write.text : write.text;
+    history.persisted = write.persisted;
+    expect(Buffer.byteLength(file)).toBe(write.persisted.fileBytes);
+    // Loading keeps the file's newest lines, which are exactly the history.
+    if (!history.endsInHighSurrogate) {
+      expect(new TerminalManager.BoundedTerminalHistory(3, file, 1_000).value()).toBe(
+        history.value(),
+      );
+    }
+    return write.append;
+  };
+
+  history.append("one\ntwo\n");
+  expect(persist()).toBe(false);
+  history.append("three\nfour\n");
+  expect(persist()).toBe(true);
+  expect(file).toBe("one\ntwo\nthree\nfour\n");
+  history.append("x".repeat(80) + "\n");
+  expect(persist()).toBe(true);
+  history.append("a\nb\nc\n");
+  // The trimmed prefix outgrew both the retained text and the minimum.
+  expect(persist()).toBe(false);
+  expect(file).toBe(history.value());
+
+  // A split surrogate waits for its pair instead of being written as U+FFFD.
+  history.append("\ud83d");
+  expect(persist()).toBe(true);
+  history.append("\ude80\n");
+  expect(persist()).toBe(true);
+  expect(file.endsWith("🚀\n")).toBe(true);
+
+  history.clear();
+  expect(persist()).toBe(false);
+  expect(file).toBe("");
 });
 
 it.layer(
@@ -1014,6 +1092,36 @@ it.layer(
 
       const reopened = yield* manager.open(openInput());
       expect(reopened.history).toBe("\nline3-continued\nline4");
+    }),
+  );
+
+  it.effect("attaches with the newest output and pages older output contiguously", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager(1_000_000, {
+        historyByteLimit: 64 * 1024 * 1024,
+      });
+      yield* manager.open(openInput());
+      const lines = Array.from({ length: 40_000 }, (_, index) => `output line ${index}\n`);
+      for (let index = 0; index < lines.length; index += 1_000) {
+        ptyAdapter.processes[0]!.emitData(lines.slice(index, index + 1_000).join(""));
+      }
+      const attached = yield* manager.open(openInput());
+      expect(attached.olderHistory).toBe(true);
+      expect(attached.history.endsWith(lines.at(-1)!)).toBe(true);
+
+      let text = attached.history;
+      let before = attached.historyOffset!;
+      for (let older = true; older;) {
+        const page = yield* manager.historyPage({
+          threadId: "thread-1",
+          terminalId: DEFAULT_TERMINAL_ID,
+          before,
+        });
+        text = page.data + text;
+        before = page.offset;
+        older = page.olderHistory;
+      }
+      expect(text).toBe(lines.join(""));
     }),
   );
 

@@ -1,6 +1,8 @@
 import {
   type EnvironmentId,
   type TerminalAttachInput,
+  type TerminalAttachStreamEvent,
+  type TerminalHistoryPage,
   type TerminalCloseInput,
   type TerminalOpenInput,
   type TerminalResizeInput,
@@ -10,6 +12,7 @@ import {
   WS_METHODS,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { AsyncResult, Atom, type AtomRegistry } from "effect/reactivity";
 
@@ -28,8 +31,14 @@ import {
   EMPTY_TERMINAL_BUFFER_STATE,
   nextTerminalAttachSeedState,
   type TerminalBufferState,
+  type TerminalOlderHistoryEvent,
 } from "./terminalSession.ts";
-import { terminalOutputText } from "./terminalOutput.ts";
+import {
+  canLoadOlderTerminalOutput,
+  terminalOutputText,
+  type TerminalOutputState,
+} from "./terminalOutput.ts";
+import { DEFAULT_MAX_TERMINAL_BUFFER_BYTES } from "@t3tools/contracts";
 
 export function createTerminalEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -51,30 +60,61 @@ export function createTerminalEnvironmentAtoms<R, E>(
     readonly input: { readonly threadId: string; readonly terminalId?: string | undefined };
   }) => JSON.stringify([environmentId, input.threadId, input.terminalId ?? null]);
   const lifecycleConcurrency = { mode: "serial" as const, key: terminalThreadKey };
+  // Older pages are requested beside the stream and applied in order with its events.
+  const olderHistoryListeners = new Map<string, Set<(page: TerminalHistoryPage) => void>>();
+  const olderHistoryKey = (input: { readonly threadId: string; readonly terminalId: string }) =>
+    JSON.stringify([input.threadId, input.terminalId]);
+  const withOlderHistory = <E, R>(
+    input: { readonly threadId: string; readonly terminalId: string },
+    stream: Stream.Stream<TerminalAttachStreamEvent, E, R>,
+  ) =>
+    stream.pipe(
+      Stream.merge(
+        Stream.callback<TerminalOlderHistoryEvent>((queue) =>
+          Effect.acquireRelease(
+            Effect.sync(() => {
+              const key = olderHistoryKey(input);
+              const listener = (page: TerminalHistoryPage) => {
+                Queue.offerUnsafe(queue, { type: "olderHistory", page });
+              };
+              let listeners = olderHistoryListeners.get(key);
+              if (!listeners) olderHistoryListeners.set(key, (listeners = new Set()));
+              listeners.add(listener);
+              return () => {
+                listeners.delete(listener);
+                if (listeners.size === 0) olderHistoryListeners.delete(key);
+              };
+            }),
+            (release) => Effect.sync(release),
+          ),
+        ),
+        { haltStrategy: "left" },
+      ),
+      Stream.scan(nextTerminalAttachSeedState, applyTerminalAttachStreamEvent),
+    );
+  const pendingOlderHistory = new Set<string>();
   const atoms = {
     observe: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:terminal:observe",
       subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.terminalObserve>) =>
-        Stream.suspend(() =>
-          subscribe(WS_METHODS.terminalObserve, input).pipe(
-            Stream.scan(nextTerminalAttachSeedState, applyTerminalAttachStreamEvent),
-          ),
-        ),
+        Stream.suspend(() => withOlderHistory(input, subscribe(WS_METHODS.terminalObserve, input))),
     }),
     attach: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:terminal:attach",
       subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.terminalAttach>) => {
         // Retry an unanswered first attach unchanged so it can still open the shell.
         let replied = false;
-        return subscribeDynamic(WS_METHODS.terminalAttach, () =>
-          Effect.sync(() => (replied ? { ...input, resume: true } : input)),
-        ).pipe(
-          Stream.onFirst(() =>
-            Effect.sync(() => {
-              replied = true;
-            }),
+        return withOlderHistory(
+          input,
+          subscribeDynamic(WS_METHODS.terminalAttach, () =>
+            Effect.sync(() => (replied ? { ...input, resume: true } : input)),
+          ).pipe(
+            Stream.onFirst(() =>
+              Effect.sync(() => {
+                replied = true;
+              }),
+            ),
           ),
-          Stream.scan(nextTerminalAttachSeedState, applyTerminalAttachStreamEvent),
         );
       },
     }),
@@ -115,9 +155,61 @@ export function createTerminalEnvironmentAtoms<R, E>(
       scheduler: lifecycleScheduler,
       concurrency: lifecycleConcurrency,
     }),
+    history: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:terminal:history",
+      tag: WS_METHODS.terminalHistory,
+      onSuccess: (target, _registry, page) =>
+        Effect.sync(() => {
+          for (const listener of olderHistoryListeners.get(olderHistoryKey(target.input)) ?? []) {
+            listener(page);
+          }
+        }),
+    }),
+  };
+  /**
+   * Fetches the page of server output just before what `output` holds, when there is one
+   * and it fits. The page reaches the terminal's attach or observe state as it lands.
+   */
+  const loadOlderOutput = async (
+    registry: AtomRegistry.AtomRegistry,
+    target: {
+      readonly environmentId: EnvironmentId;
+      readonly threadId: string;
+      readonly terminalId: string;
+    },
+    output: TerminalOutputState,
+  ): Promise<void> => {
+    if (
+      output.historyOffset === null ||
+      !canLoadOlderTerminalOutput(output, DEFAULT_MAX_TERMINAL_BUFFER_BYTES)
+    ) {
+      return;
+    }
+    const key = JSON.stringify([target.environmentId, target.threadId, target.terminalId]);
+    if (pendingOlderHistory.has(key)) return;
+    pendingOlderHistory.add(key);
+    try {
+      await runAtomCommand(
+        registry,
+        atoms.history,
+        {
+          environmentId: target.environmentId,
+          input: {
+            threadId: target.threadId,
+            terminalId: target.terminalId,
+            before: output.historyOffset,
+          },
+        },
+        // An older server lacks the method; the view keeps what it has.
+        { reportFailure: false },
+      );
+    } finally {
+      pendingOlderHistory.delete(key);
+    }
   };
   return {
     ...atoms,
+    loadOlderOutput,
     createSession: (options: TerminalSessionOptions) => createTerminalSession(atoms, options),
   };
 }

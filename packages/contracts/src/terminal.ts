@@ -3,7 +3,10 @@ import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const DEFAULT_TERMINAL_ID = "term-1";
-export const DEFAULT_MAX_TERMINAL_BUFFER_BYTES = 512 * 1024;
+/** How much output a client keeps per terminal, including older pages it loaded. */
+export const DEFAULT_MAX_TERMINAL_BUFFER_BYTES = 8 * 1024 * 1024;
+/** The newest output an attach sends, and the size of each older page after it. */
+export const TERMINAL_HISTORY_PAGE_BYTES = 512 * 1024;
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const TerminalColsSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
@@ -69,6 +72,21 @@ export const TerminalWriteInput = Schema.Struct({
 });
 export type TerminalWriteInput = Schema.Codec.Encoded<typeof TerminalWriteInput>;
 
+/** Output the server keeps from before `before`, an offset from a snapshot or earlier page. */
+export const TerminalHistoryInput = Schema.Struct({
+  ...TerminalSessionInput.fields,
+  before: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type TerminalHistoryInput = Schema.Codec.Encoded<typeof TerminalHistoryInput>;
+
+export const TerminalHistoryPage = Schema.Struct({
+  data: Schema.String,
+  /** Where `data` starts; pass it as `before` for the page before this one. */
+  offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  olderHistory: Schema.Boolean,
+});
+export type TerminalHistoryPage = typeof TerminalHistoryPage.Type;
+
 export const TerminalResizeInput = Schema.Struct({
   ...TerminalSessionInput.fields,
   cols: TerminalColsSchema,
@@ -96,7 +114,11 @@ export const TerminalSessionSnapshot = Schema.Struct({
   worktreePath: Schema.NullOr(TrimmedNonEmptyStringSchema),
   status: TerminalSessionStatus,
   pid: Schema.NullOr(Schema.Int.check(Schema.isGreaterThan(0))),
+  /** The newest output; `olderHistory` says the server keeps more before it. */
   history: Schema.String,
+  /** Where `history` starts, for `terminal.history`. Absent from older servers. */
+  historyOffset: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  olderHistory: Schema.optional(Schema.Boolean),
   exitCode: Schema.NullOr(Schema.Int),
   exitSignal: Schema.NullOr(Schema.Int),
   label: Schema.String.check(Schema.isMaxLength(128)),

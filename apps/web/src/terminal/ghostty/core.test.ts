@@ -321,7 +321,8 @@ describe("GhosttyTerminalCore snapshots", () => {
     writeTerminalOutputUpdate(core, initial);
     const reset = vi.spyOn(core, "resetAndWrite");
     const data = "line\r\n".repeat(8192);
-    for (let index = 0; index < 16; index += 1) state = append(state, data);
+    const appends = Math.ceil((1.5 * DEFAULT_MAX_TERMINAL_BUFFER_BYTES) / data.length);
+    for (let index = 0; index < appends; index += 1) state = append(state, data);
 
     const recovery = readTerminalOutputUpdate(state.output, initial.cursor);
     if (recovery.type !== "reset") throw new Error(`Expected reset, received ${recovery.type}`);

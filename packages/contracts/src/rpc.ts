@@ -263,6 +263,8 @@ import {
   TerminalObserveInput,
   TerminalAttachStreamEvent,
   TerminalClearInput,
+  TerminalHistoryInput,
+  TerminalHistoryPage,
   TerminalCloseInput,
   TerminalError,
   TerminalMetadataStreamEvent,
@@ -477,6 +479,7 @@ export const WS_METHODS = {
   terminalOpen: "terminal.open",
   terminalAttach: "terminal.attach",
   terminalObserve: "terminal.observe",
+  terminalHistory: "terminal.history",
   terminalWrite: "terminal.write",
   terminalResize: "terminal.resize",
   terminalClear: "terminal.clear",
@@ -1619,6 +1622,12 @@ const WsTerminalObserveRpc = Rpc.make(WS_METHODS.terminalObserve, {
   stream: true,
 });
 
+const WsTerminalHistoryRpc = Rpc.make(WS_METHODS.terminalHistory, {
+  payload: TerminalHistoryInput,
+  success: TerminalHistoryPage,
+  error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
+});
+
 const WsTerminalWriteRpc = Rpc.make(WS_METHODS.terminalWrite, {
   payload: TerminalWriteInput,
   error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
@@ -2232,6 +2241,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsTerminalWriteRpc,
   WsTerminalResizeRpc,
   WsTerminalClearRpc,
+  WsTerminalHistoryRpc,
   WsTerminalCloseRpc,
   WsSubscribeTerminalMetadataRpc,
   WsPreviewOpenRpc,

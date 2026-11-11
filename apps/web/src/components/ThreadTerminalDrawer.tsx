@@ -161,10 +161,13 @@ function writeSystemMessage(
 }
 
 export function writeTerminalOutputUpdate(
-  terminal: Pick<GhosttyTerminalSurface, "resetAndWrite" | "write">,
+  terminal: Pick<GhosttyTerminalSurface, "resetAndWrite" | "write"> &
+    Partial<Pick<GhosttyTerminalSurface, "prependAndWrite">>,
   update: TerminalOutputUpdate,
 ): void {
-  if (update.type === "reset") {
+  if (update.type === "reset" && update.prepended && terminal.prependAndWrite) {
+    terminal.prependAndWrite(update.data);
+  } else if (update.type === "reset") {
     terminal.resetAndWrite(update.data);
   } else if (update.type === "append") {
     terminal.write(update.data);
@@ -178,7 +181,8 @@ export function synchronizeTerminalOutput(
   terminal: Pick<
     GhosttyTerminalSurface,
     "resetAndWrite" | "write" | "getSelection" | "getSelectionCellCount" | "clearSelection"
-  >,
+  > &
+    Partial<Pick<GhosttyTerminalSurface, "prependAndWrite">>,
   session: Pick<TerminalSessionState, "output" | "version">,
   cursor: TerminalOutputCursor,
 ): TerminalOutputCursor {
@@ -629,6 +633,13 @@ function TerminalSessionViewport({
     (listener: (session: TerminalSessionState) => void) =>
       appAtomRegistry.subscribe(terminalSessionAtom, listener),
   );
+  const loadOlderOutput = useEffectEvent(() => {
+    void terminalEnvironment.loadOlderOutput(
+      appAtomRegistry,
+      { environmentId, threadId, terminalId },
+      readTerminalSession().output,
+    );
+  });
   const writeTerminal = useEffectEvent((data: string) =>
     runTerminalWrite({
       environmentId,
@@ -731,6 +742,7 @@ function TerminalSessionViewport({
         canActivateLink: (text) => canActivateTerminalLink(text),
         validateLink: (text) => validateTerminalLink(text),
         onLinkHover: (text) => setLinkPath(text !== null && !isTerminalUrl(text) ? text : null),
+        onScrollbackStart: () => loadOlderOutput(),
         // Surface listeners start before WASM loading finishes and the terminal handler exists.
         onContextMenu: (event) => {
           if (terminalRef.current) void showTerminalContextMenu(event);

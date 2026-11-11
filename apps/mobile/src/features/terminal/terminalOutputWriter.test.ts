@@ -26,7 +26,9 @@ it("appends across rollover without replay and seeds fresh writers with only bou
   let state = EMPTY_TERMINAL_BUFFER_STATE;
   const chunks: string[] = [];
   await writer.write(state.output);
-  for (let index = 0; index < 128; index += 1) {
+  const retainedChunks = DEFAULT_MAX_TERMINAL_BUFFER_BYTES / (16 * 1024);
+  const total = retainedChunks * 4;
+  for (let index = 0; index < total; index += 1) {
     const chunk = `${index}\r\n`.padEnd(16 * 1024, "x");
     chunks.push(chunk);
     state = append(state, chunk);
@@ -34,10 +36,12 @@ it("appends across rollover without replay and seeds fresh writers with only bou
     expect(write).toHaveBeenLastCalledWith(chunk, false);
   }
   expect(state.output.retainedBytes).toBe(DEFAULT_MAX_TERMINAL_BUFFER_BYTES);
-  const retained = chunks.slice(-32).join("");
+  const retained = chunks.slice(-retainedChunks).join("");
   expect(terminalOutputText(state.output)).toBe(retained);
   expect(write.mock.calls.filter(([, reset]) => reset)).toEqual([["", true]]);
-  expect(write.mock.calls.reduce((total, [data]) => total + data.length, 0)).toBe(2 * 1024 * 1024);
+  expect(write.mock.calls.reduce((total, [data]) => total + data.length, 0)).toBe(
+    total * 16 * 1024,
+  );
 
   const remountedWrite = vi.fn(async () => {});
   await createTerminalOutputWriter(remountedWrite).write(state.output);

@@ -5,6 +5,7 @@ import { EnvironmentId, TerminalSessionSnapshot, ThreadId } from "@t3tools/contr
 import {
   applyTerminalAttachStreamEvent,
   applyTerminalMetadataStreamEvent,
+  canLoadOlderTerminalOutput,
   combineTerminalSessionState,
   EMPTY_TERMINAL_BUFFER_STATE,
   INITIAL_TERMINAL_OUTPUT_CURSOR,
@@ -273,6 +274,66 @@ describe("terminal session reducers", () => {
       data: "hello",
     });
     expect(state.lifecycleVersion).toBe(2);
+  });
+
+  it("prepends older pages contiguously and stops at the buffer or the server's start", () => {
+    const output = (data: string) =>
+      ({ type: "output", threadId: TARGET.threadId, terminalId: TARGET.terminalId, data }) as const;
+    let state = applyTerminalAttachStreamEvent(
+      EMPTY_TERMINAL_BUFFER_STATE,
+      {
+        type: "snapshot",
+        snapshot: { ...BASE_SNAPSHOT, history: "c\nd\n", historyOffset: 4, olderHistory: true },
+      },
+      12,
+    );
+    let cursor = readTerminalOutputUpdate(state.output, INITIAL_TERMINAL_OUTPUT_CURSOR).cursor;
+    state = applyTerminalAttachStreamEvent(state, output("$ "), 12);
+    expect(state.output.historyOffset).toBe(4);
+    cursor = readTerminalOutputUpdate(state.output, cursor).cursor;
+
+    // A page that does not end where the retained history starts is stale.
+    const stale = { type: "olderHistory", page: { data: "x\n", offset: 1, olderHistory: true } };
+    expect(applyTerminalAttachStreamEvent(state, stale as never, 12)).toBe(state);
+
+    state = applyTerminalAttachStreamEvent(
+      state,
+      { type: "olderHistory", page: { data: "b\n", offset: 2, olderHistory: true } },
+      12,
+    );
+    expect(terminalOutputText(state.output)).toBe("b\nc\nd\n$ ");
+    expect(readTerminalOutputUpdate(state.output, cursor)).toMatchObject({
+      type: "reset",
+      data: "b\nc\nd\n$ ",
+      prepended: true,
+    });
+    expect(canLoadOlderTerminalOutput(state.output, 12)).toBe(true);
+
+    state = applyTerminalAttachStreamEvent(
+      state,
+      { type: "olderHistory", page: { data: "a\n", offset: 0, olderHistory: false } },
+      12,
+    );
+    expect(terminalOutputText(state.output)).toBe("a\nb\nc\nd\n$ ");
+    expect(canLoadOlderTerminalOutput(state.output, 12)).toBe(false);
+
+    // Live output that pushes out every server character ends paging: it is not server text.
+    state = applyTerminalAttachStreamEvent(state, output("0123456789X"), 12);
+    expect(state.output.historyOffset).toBeNull();
+    expect(canLoadOlderTerminalOutput(state.output, 12)).toBe(false);
+
+    // Trimming part of the server history moves the anchor and leaves older output loadable.
+    state = applyTerminalAttachStreamEvent(
+      EMPTY_TERMINAL_BUFFER_STATE,
+      {
+        type: "snapshot",
+        snapshot: { ...BASE_SNAPSHOT, history: "abcdefgh", historyOffset: 10, olderHistory: false },
+      },
+      8,
+    );
+    state = applyTerminalAttachStreamEvent(state, output("12"), 8);
+    expect(state.output).toMatchObject({ historyOffset: 12, historyLength: 6, olderHistory: true });
+    expect(canLoadOlderTerminalOutput(state.output, 8)).toBe(false);
   });
 
   it("does not reuse a renderer cursor when a fresh attach has matching counters", () => {

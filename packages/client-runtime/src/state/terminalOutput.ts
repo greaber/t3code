@@ -10,6 +10,23 @@ export interface TerminalOutputState {
   readonly retainedBytes: number;
   readonly resetVersion: number;
   readonly nextOffset: number;
+  /**
+   * The server's offset of the first retained character, for paging in older output.
+   * Null when unknown: an older server, or live output pushed out every server page.
+   */
+  readonly historyOffset: number | null;
+  /** How many leading characters are server history, whose offsets are known. */
+  readonly historyLength: number;
+  /** The server keeps output before `historyOffset`. */
+  readonly olderHistory: boolean;
+  /** The last reset only added older output in front of what was there. */
+  readonly prepended: boolean;
+}
+
+/** Where a server snapshot or page of history starts. */
+export interface TerminalHistoryAnchor {
+  readonly offset: number;
+  readonly older: boolean;
 }
 
 export interface TerminalOutputCursor {
@@ -33,6 +50,8 @@ export type TerminalOutputUpdate =
       readonly type: "reset";
       readonly data: string;
       readonly cursor: TerminalOutputCursor;
+      /** Only older output was added before what the reader had, so it can keep its place. */
+      readonly prepended: boolean;
     }
   | {
       readonly type: "append";
@@ -41,7 +60,8 @@ export type TerminalOutputUpdate =
     };
 
 const DEFAULT_TERMINAL_CHUNK_BYTES = 16 * 1024;
-const MAX_TERMINAL_OUTPUT_CHUNKS = 1_024;
+// Enough 16 KiB chunks for the default buffer; compaction keeps chunks near that size.
+const MAX_TERMINAL_OUTPUT_CHUNKS = 2_048;
 const textEncoder = new TextEncoder();
 // A BOM at a retained chunk boundary is terminal data, not an encoding marker.
 const textDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
@@ -52,6 +72,10 @@ export const EMPTY_TERMINAL_OUTPUT_STATE = Object.freeze<TerminalOutputState>({
   retainedBytes: 0,
   resetVersion: 0,
   nextOffset: 0,
+  historyOffset: null,
+  historyLength: 0,
+  olderHistory: false,
+  prepended: false,
 });
 
 interface Utf8Chunk {
@@ -190,11 +214,15 @@ function appendOutput(
   if (data.length === 0) return current;
   if (maxBufferBytes <= 0) {
     return {
-      generation: current.generation,
+      ...current,
       chunks: [],
       retainedBytes: 0,
       resetVersion: current.resetVersion + 1,
       nextOffset: current.nextOffset + data.length,
+      historyOffset: null,
+      historyLength: 0,
+      olderHistory: false,
+      prepended: false,
     };
   }
   const appended = splitOutputChunks(
@@ -235,12 +263,34 @@ function appendOutput(
     }
   }
 
+  const dropped =
+    (retainedChunks[0]?.startOffset ?? appended.nextOffset) -
+    (current.chunks[0]?.startOffset ?? current.nextOffset);
   return {
-    generation: current.generation,
+    ...current,
     chunks: retainedChunks,
     retainedBytes,
-    resetVersion: current.resetVersion,
     nextOffset: appended.nextOffset,
+    ...dropHistory(current, dropped),
+  };
+}
+
+function dropHistory(
+  current: TerminalOutputState,
+  dropped: number,
+): Pick<TerminalOutputState, "historyOffset" | "historyLength" | "olderHistory"> {
+  if (dropped === 0) {
+    const { historyOffset, historyLength, olderHistory } = current;
+    return { historyOffset, historyLength, olderHistory };
+  }
+  // Live output differs from what the server keeps, so offsets end with its history.
+  if (current.historyOffset === null || dropped > current.historyLength) {
+    return { historyOffset: null, historyLength: 0, olderHistory: false };
+  }
+  return {
+    historyOffset: current.historyOffset + dropped,
+    historyLength: current.historyLength - dropped,
+    olderHistory: true,
   };
 }
 
@@ -248,10 +298,58 @@ function resetOutput(
   current: TerminalOutputState,
   data: string,
   maxBufferBytes: number,
+  history?: TerminalHistoryAnchor,
 ): TerminalOutputState {
   const retained = trimBufferToBytes(data, maxBufferBytes);
   const reset = splitOutputChunks(
     retained,
+    0,
+    Math.min(DEFAULT_TERMINAL_CHUNK_BYTES, Math.max(1, maxBufferBytes)),
+  );
+  const trimmed = data.length - retained.length;
+  return {
+    generation: current.generation,
+    chunks: reset.chunks,
+    retainedBytes: reset.byteLength,
+    resetVersion: current.resetVersion + 1,
+    nextOffset: reset.nextOffset,
+    historyOffset: history === undefined ? null : history.offset + trimmed,
+    historyLength: history === undefined ? 0 : retained.length,
+    olderHistory: history !== undefined && (history.older || trimmed > 0),
+    prepended: false,
+  };
+}
+
+/** Whether the server keeps older output that fits in front of what is retained. */
+export function canLoadOlderTerminalOutput(
+  output: TerminalOutputState,
+  maxBufferBytes: number,
+): boolean {
+  return (
+    output.olderHistory && output.historyOffset !== null && output.retainedBytes < maxBufferBytes
+  );
+}
+
+/**
+ * Puts a page of older server output in front of the retained output, keeping only what
+ * fits. A page that does not end where the retained history starts is stale and ignored.
+ */
+function prependOutput(
+  current: TerminalOutputState,
+  page: { readonly data: string; readonly offset: number; readonly olderHistory: boolean },
+  maxBufferBytes: number,
+): TerminalOutputState {
+  if (current.historyOffset === null || page.offset + page.data.length !== current.historyOffset) {
+    return current;
+  }
+  const fitted = trimBufferToBytes(page.data, maxBufferBytes - current.retainedBytes);
+  const offset = page.offset + page.data.length - fitted.length;
+  const olderHistory = page.olderHistory || offset > page.offset;
+  if (fitted.length === 0) {
+    return olderHistory === current.olderHistory ? current : { ...current, olderHistory };
+  }
+  const reset = splitOutputChunks(
+    fitted + terminalOutputText(current),
     0,
     Math.min(DEFAULT_TERMINAL_CHUNK_BYTES, Math.max(1, maxBufferBytes)),
   );
@@ -261,6 +359,10 @@ function resetOutput(
     retainedBytes: reset.byteLength,
     resetVersion: current.resetVersion + 1,
     nextOffset: reset.nextOffset,
+    historyOffset: offset,
+    historyLength: current.historyLength + fitted.length,
+    olderHistory,
+    prepended: true,
   };
 }
 
@@ -283,7 +385,15 @@ export function readTerminalOutputUpdate(
     cursor.resetVersion !== output.resetVersion ||
     cursor.offset < (firstChunk?.startOffset ?? output.nextOffset)
   ) {
-    return { type: "reset", data: terminalOutputText(output), cursor: nextCursor };
+    return {
+      type: "reset",
+      data: terminalOutputText(output),
+      cursor: nextCursor,
+      prepended:
+        output.prepended &&
+        cursor.generation === output.generation &&
+        cursor.resetVersion === output.resetVersion - 1,
+    };
   }
 
   // Appends and compaction preserve offset order, so unread chunks form a suffix.
@@ -306,4 +416,4 @@ export function readTerminalOutputUpdate(
   };
 }
 
-export { appendOutput, resetOutput };
+export { appendOutput, prependOutput, resetOutput };
