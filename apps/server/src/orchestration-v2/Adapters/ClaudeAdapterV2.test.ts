@@ -15092,109 +15092,118 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
-  it.effect("holds subagent frames that precede task_started and shows its result once", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const TASK_ID = "task-early-subagent";
-        const TOOL_USE_ID = "toolu-early-subagent";
-        const FINAL_REPORT = "Early auditor done.";
-        const EARLY_BURST = Array.from({ length: 300 }, (_, index) => `Early ${index}.`);
-        const harness = yield* makeWakeHarness;
-        const now = yield* DateTime.now;
-        yield* harness.runtime.startTurn(
-          makeClaudeTestTurnInput({
-            threadId: harness.threadId,
-            providerThread: harness.providerThread,
-            now,
-            attemptId: RunAttemptId.make("attempt-claude-early-subagent"),
-            text: "Run an auditor.",
-            attachments: [],
-          }),
-        );
-        const frames = [
-          // Child frames can precede the task_started that registers their subagent.
-          ...makeSubagentAssistantFrames({
-            parentToolUseId: TOOL_USE_ID,
-            uuid: "00000000-0000-4000-8000-000000000321",
-            text: "Starting early.",
-            bashToolUseId: "toolu-early-bash",
-          }),
-          makeSubagentToolResultFrame({
-            parentToolUseId: TOOL_USE_ID,
-            uuid: "00000000-0000-4000-8000-000000000322",
-            toolUseId: "toolu-early-bash",
-          }),
-          // A long early burst still reaches the subagent once it registers.
-          ...EARLY_BURST.flatMap((text, index) =>
-            makeSubagentAssistantFrames({
-              parentToolUseId: TOOL_USE_ID,
-              uuid: `00000000-0000-4000-8001-${String(index).padStart(12, "0")}`,
-              text,
+  it.effect.each([
+    { burst: "300 short messages", count: 300, size: 0, kept: 300 },
+    // The session buffers at most 64 MiB of early frames; the rest are dropped with a warning.
+    { burst: "70 MiB of messages", count: 70, size: 1024 * 1024, kept: 63 },
+  ])(
+    "holds subagent frames that precede task_started and shows its result once: $burst",
+    ({ count, size, kept }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const TASK_ID = "task-early-subagent";
+          const TOOL_USE_ID = "toolu-early-subagent";
+          const FINAL_REPORT = "Early auditor done.";
+          const EARLY_BURST = Array.from(
+            { length: count },
+            (_, index) => `Early ${index}.${"x".repeat(size)}`,
+          );
+          const harness = yield* makeWakeHarness;
+          const now = yield* DateTime.now;
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("attempt-claude-early-subagent"),
+              text: "Run an auditor.",
+              attachments: [],
             }),
-          ),
-          makeSubagentTaskStartedFrame({
-            taskId: TASK_ID,
-            toolUseId: TOOL_USE_ID,
-            uuid: "00000000-0000-4000-8000-000000000323",
-          }),
-          ...makeSubagentAssistantFrames({
-            parentToolUseId: TOOL_USE_ID,
-            uuid: "00000000-0000-4000-8000-000000000324",
-            text: "Still working.",
-          }),
-          claudeSdkFrame({
-            type: "system",
-            subtype: "task_progress",
-            task_id: TASK_ID,
-            description: "Checking the diffs",
-            uuid: "00000000-0000-4000-8000-000000000325",
-            session_id: WAKE_NATIVE_SESSION,
-          }),
-          ...makeSubagentAssistantFrames({
-            parentToolUseId: TOOL_USE_ID,
-            uuid: "00000000-0000-4000-8000-000000000326",
-            text: FINAL_REPORT,
-          }),
-          makeSubagentNotificationFrame({
-            taskId: TASK_ID,
-            toolUseId: TOOL_USE_ID,
-            summary: FINAL_REPORT,
-            uuid: "00000000-0000-4000-8000-000000000327",
-          }),
-          makeResultFrame({
-            uuid: "00000000-0000-4000-8000-000000000328",
-            result: "The auditor finished.",
-          }),
-        ];
-        for (const frame of frames) {
-          yield* Queue.offer(harness.sdkMessages, frame);
-        }
-        yield* harness.awaitTerminal(1);
+          );
+          const frames = [
+            // Child frames can precede the task_started that registers their subagent.
+            ...makeSubagentAssistantFrames({
+              parentToolUseId: TOOL_USE_ID,
+              uuid: "00000000-0000-4000-8000-000000000321",
+              text: "Starting early.",
+              bashToolUseId: "toolu-early-bash",
+            }),
+            makeSubagentToolResultFrame({
+              parentToolUseId: TOOL_USE_ID,
+              uuid: "00000000-0000-4000-8000-000000000322",
+              toolUseId: "toolu-early-bash",
+            }),
+            // A long early burst still reaches the subagent once it registers.
+            ...EARLY_BURST.flatMap((text, index) =>
+              makeSubagentAssistantFrames({
+                parentToolUseId: TOOL_USE_ID,
+                uuid: `00000000-0000-4000-8001-${String(index).padStart(12, "0")}`,
+                text,
+              }),
+            ),
+            makeSubagentTaskStartedFrame({
+              taskId: TASK_ID,
+              toolUseId: TOOL_USE_ID,
+              uuid: "00000000-0000-4000-8000-000000000323",
+            }),
+            ...makeSubagentAssistantFrames({
+              parentToolUseId: TOOL_USE_ID,
+              uuid: "00000000-0000-4000-8000-000000000324",
+              text: "Still working.",
+            }),
+            claudeSdkFrame({
+              type: "system",
+              subtype: "task_progress",
+              task_id: TASK_ID,
+              description: "Checking the diffs",
+              uuid: "00000000-0000-4000-8000-000000000325",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+            ...makeSubagentAssistantFrames({
+              parentToolUseId: TOOL_USE_ID,
+              uuid: "00000000-0000-4000-8000-000000000326",
+              text: FINAL_REPORT,
+            }),
+            makeSubagentNotificationFrame({
+              taskId: TASK_ID,
+              toolUseId: TOOL_USE_ID,
+              summary: FINAL_REPORT,
+              uuid: "00000000-0000-4000-8000-000000000327",
+            }),
+            makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000000328",
+              result: "The auditor finished.",
+            }),
+          ];
+          for (const frame of frames) {
+            yield* Queue.offer(harness.sdkMessages, frame);
+          }
+          yield* harness.awaitTerminal(1);
 
-        const routing = subagentRouting(harness.events, ["toolu-early-bash"]);
-        assert.isDefined(routing.childThreadId);
-        assert.deepEqual(
-          [...(routing.toolThreadIds.get("toolu-early-bash") ?? [])],
-          [routing.childThreadId],
-        );
-        assert.deepEqual(routing.assistantTexts(routing.childThreadId), [
-          "Starting early.",
-          ...EARLY_BURST,
-          "Still working.",
-          FINAL_REPORT,
-        ]);
-        assert.deepEqual(routing.assistantTexts(harness.threadId), ["The auditor finished."]);
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            IdAllocator.layer,
-            McpProviderSessions.layer,
-            NodeServices.layer,
-            NodeCrypto.layer,
+          const routing = subagentRouting(harness.events, ["toolu-early-bash"]);
+          assert.isDefined(routing.childThreadId);
+          assert.deepEqual(
+            [...(routing.toolThreadIds.get("toolu-early-bash") ?? [])],
+            [routing.childThreadId],
+          );
+          assert.deepEqual(routing.assistantTexts(routing.childThreadId), [
+            "Starting early.",
+            ...EARLY_BURST.slice(0, kept),
+            "Still working.",
+            FINAL_REPORT,
+          ]);
+          assert.deepEqual(routing.assistantTexts(harness.threadId), ["The auditor finished."]);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
           ),
         ),
       ),
-    ),
   );
 
   it.effect.each([false, true])(

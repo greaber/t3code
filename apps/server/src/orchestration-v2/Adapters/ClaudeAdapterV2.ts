@@ -4551,6 +4551,52 @@ function claudeSubagentModelSelection(
 // Generous bounds on state for subagents that never register; overflow is logged, not silent.
 const PENDING_CLAUDE_SUBAGENT_CAP = 4096;
 const PENDING_CLAUDE_SUBAGENT_FRAME_CAP = 65_536;
+/** Session-wide budget for early frames, measured as serialized JSON length. */
+const PENDING_CLAUDE_SUBAGENT_FRAME_BYTES = 64 * 1024 * 1024;
+
+interface PendingClaudeSubagentFrames {
+  readonly byToolUseId: Map<string, { readonly frames: SDKMessage[]; bytes: number }>;
+  bytes: number;
+}
+
+/** Buffers a frame for an unregistered subagent; returns the tool use whose frames were dropped. */
+function bufferPendingClaudeSubagentFrame(
+  pending: PendingClaudeSubagentFrames,
+  toolUseId: string,
+  message: SDKMessage,
+): string | null {
+  const bytes = JSON.stringify(message)?.length ?? 0;
+  const entry = pending.byToolUseId.get(toolUseId);
+  if (
+    (entry?.frames.length ?? 0) >= PENDING_CLAUDE_SUBAGENT_FRAME_CAP ||
+    pending.bytes + bytes > PENDING_CLAUDE_SUBAGENT_FRAME_BYTES
+  ) {
+    return toolUseId;
+  }
+  pending.bytes += bytes;
+  if (entry !== undefined) {
+    entry.frames.push(message);
+    entry.bytes += bytes;
+    return null;
+  }
+  pending.byToolUseId.set(toolUseId, { frames: [message], bytes });
+  if (pending.byToolUseId.size <= PENDING_CLAUDE_SUBAGENT_CAP) return null;
+  const [oldestId, oldest] = pending.byToolUseId.entries().next().value!;
+  pending.byToolUseId.delete(oldestId);
+  pending.bytes -= oldest.bytes;
+  return oldestId;
+}
+
+function takePendingClaudeSubagentFrames(
+  pending: PendingClaudeSubagentFrames,
+  toolUseId: string,
+): ReadonlyArray<SDKMessage> {
+  const entry = pending.byToolUseId.get(toolUseId);
+  if (entry === undefined) return [];
+  pending.byToolUseId.delete(toolUseId);
+  pending.bytes -= entry.bytes;
+  return entry.frames;
+}
 
 /** Returns the tool use whose launch details were evicted to stay within the cap. */
 function rememberPendingClaudeSubagentLaunch(
@@ -5281,7 +5327,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         // Buffered idle outcomes must not settle a resumed child again.
         const appliedSubagentOutcomes = new WeakSet<SDKMessage>();
         // Subagent frames can precede the task_started that registers their owner.
-        const pendingSubagentFramesByToolUseId = yield* Ref.make(new Map<string, SDKMessage[]>());
+        // Mutated in place: each session handles its SDK frames one at a time.
+        const pendingSubagentFrames: PendingClaudeSubagentFrames = {
+          byToolUseId: new Map(),
+          bytes: 0,
+        };
         const warnEvictedSubagentLaunch = (
           context: ActiveClaudeTurnContext,
           evictedToolUseId: string | null,
@@ -9520,26 +9570,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             frameParentToolUseId !== null &&
             (yield* resolveSubagentByToolUseId(context, frameParentToolUseId)) === undefined
           ) {
-            const droppedToolUseId = yield* Ref.modify(
-              pendingSubagentFramesByToolUseId,
-              (current) => {
-                const frames = current.get(frameParentToolUseId);
-                if (frames !== undefined) {
-                  if (frames.length >= PENDING_CLAUDE_SUBAGENT_FRAME_CAP) {
-                    return [frameParentToolUseId, current] as const;
-                  }
-                  // Appending in place keeps a long burst linear; the map is local to this session.
-                  frames.push(message);
-                  return [null, current] as const;
-                }
-                const next = new Map(current).set(frameParentToolUseId, [message]);
-                const oldest = next.keys().next();
-                if (next.size > PENDING_CLAUDE_SUBAGENT_CAP && !oldest.done) {
-                  next.delete(oldest.value);
-                  return [oldest.value, next] as const;
-                }
-                return [null, next] as const;
-              },
+            const droppedToolUseId = bufferPendingClaudeSubagentFrame(
+              pendingSubagentFrames,
+              frameParentToolUseId,
+              message,
             );
             if (droppedToolUseId !== null) {
               yield* Effect.logWarning("orchestration-v2.claude-subagent-frames-dropped", {
@@ -10224,15 +10258,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           yield* Ref.update(sessionSubagentTaskIdsByToolUseId, (current) =>
             current.get(toolUseId) === taskId ? current : new Map(current).set(toolUseId, taskId),
           );
-          return yield* Ref.modify(pendingSubagentFramesByToolUseId, (current) => {
-            const frames = current.get(toolUseId);
-            if (frames === undefined) {
-              return [[] as ReadonlyArray<SDKMessage>, current] as const;
-            }
-            const next = new Map(current);
-            next.delete(toolUseId);
-            return [frames, next] as const;
-          });
+          return takePendingClaudeSubagentFrames(pendingSubagentFrames, toolUseId);
         });
 
         const handleRoutedSdkMessage = Effect.fnUntraced(function* (input: {
