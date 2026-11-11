@@ -1,6 +1,13 @@
-import { remapComposerContextAttachments } from "@t3tools/shared/composerContextReferences";
+import {
+  providerInputLengthErrorMessage,
+  remapComposerContextAttachments,
+} from "@t3tools/shared/composerContextReferences";
 import { appendUserInputAttachmentPaths } from "../provider/userInputAttachments.ts";
-import type { ChatAttachment, OrchestrationV2Command } from "@t3tools/contracts";
+import type {
+  ChatAttachment,
+  OrchestrationMessageContext,
+  OrchestrationV2Command,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { resolveAttachmentPath } from "../attachmentStore.ts";
@@ -32,6 +39,25 @@ function dispatchWasNotAccepted(
       return false;
   }
 }
+export class ProviderInputTooLongError extends Schema.TaggedError<ProviderInputTooLongError>()(
+  "ProviderInputTooLongError",
+  { message: Schema.String },
+) {}
+
+/** The provider receives the prompt with its context records rendered in, so measure that. */
+const validateProviderInputLength = Effect.fn("ThreadMessageIntake.validateProviderInputLength")(
+  function* (input: {
+    readonly text: string;
+    readonly context?: OrchestrationMessageContext | undefined;
+  }) {
+    const message = providerInputLengthErrorMessage({
+      text: input.text,
+      records: input.context?.records ?? [],
+    });
+    if (message !== null) return yield* new ProviderInputTooLongError({ message });
+  },
+);
+
 const isOrchestratorError = Schema.is(Orchestrator.OrchestratorV2Error);
 const isThreadManagementError = Schema.is(ThreadManagement.ThreadManagementError);
 
@@ -88,6 +114,9 @@ export const dispatchCommand = Effect.fn("ThreadMessageIntake.dispatchCommand")(
 ) {
   const command =
     incoming.type === "message.dispatch" ? yield* withGuestAttachments(incoming) : incoming;
+  if (command.type === "message.dispatch" || command.type === "queued-run.edit") {
+    yield* validateProviderInputLength(command);
+  }
   const threads = yield* ThreadManagement.ThreadManagementService;
   if (command.type === "runtime-request.respond" && command.attachmentsByQuestionId) {
     const config = yield* ServerConfig.ServerConfig;
@@ -213,6 +242,7 @@ export const launchThread = Effect.fn("ThreadMessageIntake.launchThread")(functi
 ) {
   const launches = yield* ThreadLaunch.ThreadLaunchService;
   yield* AttachmentClaims.validateAttachmentLimits(input.initialMessage?.attachments ?? []);
+  if (input.initialMessage) yield* validateProviderInputLength(input.initialMessage);
   if (!input.initialMessage?.attachments.some(AttachmentClaims.attachmentIsPendingUpload)) {
     return yield* launches.launch(input);
   }

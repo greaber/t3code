@@ -2169,6 +2169,13 @@ export const layerWsRpc = (
                         message: cause.message,
                         cause,
                       }),
+                    ProviderInputTooLongError: (cause) =>
+                      new OrchestrationV2ThreadLaunchError({
+                        commandId: input.commandId,
+                        projectId: input.projectId,
+                        message: cause.message,
+                        cause,
+                      }),
                     ThreadLaunchError: (cause) =>
                       new OrchestrationV2ThreadLaunchError({
                         commandId: input.commandId,
