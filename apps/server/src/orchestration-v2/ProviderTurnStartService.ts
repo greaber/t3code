@@ -819,6 +819,10 @@ export const layer: Layer.Layer<
       }
       const session = sessionResult.success;
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
+      const targetModelWindow = session.getModelContextWindow?.(
+        run.modelSelection,
+        resolvedRuntimePolicy.cwd,
+      );
       const loadFromProvider = Effect.fn("ProviderTurnStartService.loadFromProvider")(function* (
         load: Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapter.ProviderAdapterV2Error>,
       ) {
@@ -1045,6 +1049,7 @@ export const layer: Layer.Layer<
               ? []
               : [
                   yield* contextHandoffService.prepareProviderHandoff({
+                    modelContextWindow: targetModelWindow,
                     threadId: projection.thread.id,
                     targetRunId: run.id,
                     transferId: null,
@@ -1074,6 +1079,7 @@ export const layer: Layer.Layer<
           });
           const createdAt = yield* DateTime.now;
           const handoff = yield* contextHandoffService.prepareProviderHandoff({
+            modelContextWindow: targetModelWindow,
             threadId: projection.thread.id,
             targetRunId: run.id,
             transferId,
@@ -1176,6 +1182,7 @@ export const layer: Layer.Layer<
           );
           const createdAt = yield* DateTime.now;
           const handoff = yield* contextHandoffService.prepareProviderHandoff({
+            modelContextWindow: targetModelWindow,
             threadId: projection.thread.id,
             targetRunId: run.id,
             transferId: nativeForkTransfer.id,

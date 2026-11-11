@@ -332,3 +332,42 @@ it.effect("inherited history stops at a missing fork ancestor", () =>
     assert.deepEqual(items, []);
   }),
 );
+
+it.effect("stores provider handoff history once, bounded by a known target window", () =>
+  Effect.gen(function* () {
+    const service = yield* ContextHandoffService.ContextHandoffServiceV2;
+    const items = Array.from({ length: 40 }, (_, index) =>
+      importedItem({
+        role: index % 2 === 0 ? "user" : "assistant",
+        id: `switch-${index}`,
+        text: `switch-${index} ${"z".repeat(4_000)}`,
+        ordinal: index,
+      }),
+    );
+    const prepare = (modelContextWindow: number | undefined) =>
+      service.prepareProviderHandoff({
+        threadId: ThreadId.make("thread:switch"),
+        targetRunId: RunId.make("run:switch"),
+        transferId: null,
+        fromProviderThreadIds: [ProviderThreadId.make("provider-thread:from")],
+        toProviderThreadId: ProviderThreadId.make("provider-thread:to"),
+        fromProviderInstanceId: ProviderInstanceId.make("codex"),
+        toProviderInstanceId: ProviderInstanceId.make("claudeAgent"),
+        coveredRunOrdinals: { from: 1, to: 2 },
+        strategy: "full_thread_summary",
+        items,
+        createdAt: DateTime.makeUnsafe(0),
+        modelContextWindow,
+      });
+
+    const unknown = yield* prepare(undefined);
+    assert.lengthOf(unknown.history?.messages ?? [], items.length);
+    assert.notInclude(unknown.summaryText, "z".repeat(100));
+    assert.isBelow(unknown.summaryText.length, 2_000);
+
+    const small = yield* prepare(40_000);
+    assert.isBelow(small.history?.messages.length ?? 0, items.length);
+    assert.isAbove(small.history?.omittedItems ?? 0, 0);
+    assert.include(small.history?.messages.at(-1)?.text ?? "", "switch-39");
+  }).pipe(Effect.provide(layerTest)),
+);

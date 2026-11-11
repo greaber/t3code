@@ -23,6 +23,17 @@ export const handoffTokenCapConfig = Config.option(
   ),
 ).pipe(Config.map(Option.getOrUndefined));
 
+/** Preparation bound: the override, else half a known window, else the ceiling for delivery to narrow. */
+export function preparationTokenCap(
+  override: number | undefined,
+  knownWindow: number | undefined,
+): number {
+  if (override !== undefined) return override;
+  return knownWindow === undefined || knownWindow <= 0
+    ? MAX_HANDOFF_TOKEN_CAP
+    : defaultHandoffTokenCap(knownWindow);
+}
+
 /** Half a known window leaves the other half for instructions, tools, and the work itself. */
 function defaultHandoffTokenCap(knownWindow: number | undefined): number {
   return knownWindow === undefined || knownWindow <= 0

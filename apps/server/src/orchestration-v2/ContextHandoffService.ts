@@ -16,11 +16,10 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import {
-  MAX_HANDOFF_TOKEN_CAP,
   handoffTokenCapConfig,
+  preparationTokenCap,
   handoffCoverage,
   historicalMessage,
-  renderHistory,
   selectHistory,
 } from "@t3tools/provider-core/server/handoffBudget";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -53,6 +52,8 @@ export interface ContextHandoffServiceV2Shape {
     readonly toProviderInstanceId: ProviderInstanceId;
     readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
     readonly createdAt: DateTime.Utc;
+    /** The target model's window when known; preparation keeps no more history than it can use. */
+    readonly modelContextWindow?: number | undefined;
   }) => Effect.Effect<OrchestrationV2ContextHandoff, ContextHandoffServiceV2Error>;
   readonly prepareForkDelta: (input: {
     readonly sourceThreadId: ThreadId;
@@ -66,6 +67,8 @@ export interface ContextHandoffServiceV2Shape {
     readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
     readonly deltaItems: ReadonlyArray<OrchestrationV2TurnItem>;
     readonly createdAt: DateTime.Utc;
+    /** The target model's window when known; preparation keeps no more history than it can use. */
+    readonly modelContextWindow?: number | undefined;
   }) => Effect.Effect<OrchestrationV2ContextHandoff, ContextHandoffServiceV2Error>;
   readonly prepareProviderHandoff: (input: {
     readonly threadId: ThreadId;
@@ -83,6 +86,8 @@ export interface ContextHandoffServiceV2Shape {
     >;
     readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
     readonly createdAt: DateTime.Utc;
+    /** The target model's window when known; preparation keeps no more history than it can use. */
+    readonly modelContextWindow?: number | undefined;
   }) => Effect.Effect<OrchestrationV2ContextHandoff, ContextHandoffServiceV2Error>;
   /** Parent activity after the fork point, prepended to a side chat's first provider turn. */
   readonly prepareSideChatContext: (input: {
@@ -286,6 +291,8 @@ export function makeForkDeltaSummary(input: {
   ].join("\n");
 }
 
+/** The full delta travels in history; this summary only labels the handoff. */
+const FORK_DELTA_SUMMARY_BUDGET = 16_000;
 const SIDE_CHAT_CONTEXT_MAX_CHARS = 64_000;
 
 /** Oldest first; raw parent items are summarized only until the context cap is reached. */
@@ -380,10 +387,9 @@ function makeLegacyImportSummary(items: ReadonlyArray<OrchestrationV2TurnItem>):
 const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffService.layer")(
   function* () {
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
-    // Delivery narrows this to the target model's window, which is unknown here.
-    const tokenCap =
-      (yield* handoffTokenCapConfig.pipe(Effect.orElseSucceed(() => undefined))) ??
-      MAX_HANDOFF_TOKEN_CAP;
+    const tokenCapOverride = yield* handoffTokenCapConfig.pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
 
     const prepareLegacyImport = Effect.fn("orchestrationV2.contextHandoff.prepareLegacyImport")(
       function* (input: {
@@ -393,6 +399,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         readonly toProviderInstanceId: ProviderInstanceId;
         readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
         readonly createdAt: DateTime.Utc;
+        readonly modelContextWindow?: number | undefined;
       }) {
         const handoffId = yield* idAllocator.allocate
           .contextHandoff({
@@ -419,7 +426,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
             return message === null ? [] : [message];
           }),
           coverage,
-          budget: tokenCap,
+          budget: preparationTokenCap(tokenCapOverride, input.modelContextWindow),
         });
         return {
           id: handoffId,
@@ -459,6 +466,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
         readonly deltaItems: ReadonlyArray<OrchestrationV2TurnItem>;
         readonly createdAt: DateTime.Utc;
+        readonly modelContextWindow?: number | undefined;
       }) {
         const handoffId = yield* idAllocator.allocate
           .contextHandoff({
@@ -489,7 +497,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
             return message === null ? [] : [message];
           }),
           coverage,
-          budget: tokenCap,
+          budget: preparationTokenCap(tokenCapOverride, input.modelContextWindow),
         });
         return {
           id: handoffId,
@@ -502,7 +510,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           strategy: "fork_delta_summary",
           status: "ready",
           summaryMessageId: null,
-          summaryText: makeForkDeltaSummary({ ...input, budget: tokenCap }),
+          summaryText: makeForkDeltaSummary({ ...input, budget: FORK_DELTA_SUMMARY_BUDGET }),
           history: {
             messages: selected.messages,
             coverage,
@@ -534,6 +542,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
       >;
       readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
       readonly createdAt: DateTime.Utc;
+      readonly modelContextWindow?: number | undefined;
     }) {
       const handoffId = yield* idAllocator.allocate
         .contextHandoff({
@@ -568,7 +577,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
               ];
         }),
         coverage,
-        budget: tokenCap,
+        budget: preparationTokenCap(tokenCapOverride, input.modelContextWindow),
       });
       return {
         id: handoffId,
@@ -581,7 +590,8 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         strategy: input.strategy,
         status: "ready",
         summaryMessageId: null,
-        summaryText: renderHistory(selected.messages, selected.context),
+        // history carries the messages; a second full copy here would also land in the turn item.
+        summaryText: selected.context,
         history: {
           messages: selected.messages,
           coverage,
