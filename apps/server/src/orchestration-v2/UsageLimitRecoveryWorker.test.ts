@@ -93,11 +93,26 @@ const failedThread = (failedAgoMs: number, resetAgoMs: number) => {
 };
 
 describe("limitRecoveryCommand arming", () => {
-  it.each([
-    ["only just passed", 6 * HOUR_MS, HOUR_MS],
-    ["passed days ago, such as while the server was down", 5 * 24 * HOUR_MS, 4 * 24 * HOUR_MS],
-  ])("arms a failure whose reset %s", (_label, failedAgoMs, resetAgoMs) => {
-    const thread = failedThread(failedAgoMs, resetAgoMs);
-    assert.equal(limitRecoveryCommand(thread, true, nowMs)?.type, "thread.metadata.update");
+  it("does not freshly arm a failure whose reset passed days ago", () => {
+    const thread = failedThread(5 * 24 * HOUR_MS, 4 * 24 * HOUR_MS);
+    assert.isNull(limitRecoveryCommand(thread, true, nowMs));
+    assert.isNull(limitRecoveryCommand(thread, true, nowMs, true));
+  });
+
+  it("still arms a failure whose reset only just passed", () => {
+    const thread = failedThread(6 * HOUR_MS, HOUR_MS);
+    const arm = limitRecoveryCommand(thread, true, nowMs);
+    assert.equal(arm?.type, "thread.metadata.update");
+  });
+
+  it("arms a reset that is exactly 24 hours overdue", () => {
+    const thread = failedThread(30 * HOUR_MS, 24 * HOUR_MS);
+    const arm = limitRecoveryCommand(thread, true, nowMs);
+    assert.equal(arm?.type, "thread.metadata.update");
+  });
+
+  it("does not arm a reset that is 24 hours and 1ms overdue", () => {
+    const thread = failedThread(30 * HOUR_MS, 24 * HOUR_MS + 1);
+    assert.isNull(limitRecoveryCommand(thread, true, nowMs));
   });
 });
