@@ -3,8 +3,10 @@
 Give the agent a task in the composer. Add files, quote a previous response, or
 include a skill when the task needs more context.
 
-Messages can contain up to 120,000 characters. Longer drafts stay in the composer
-so you can shorten them or split them into several messages.
+Messages can contain up to 120,000 characters, including attached terminal output
+and review comments. Longer drafts stay in the composer so you can shorten them or
+split them into several messages. A single terminal selection or review comment
+longer than that is cut to fit, and the composer warns you before you send it.
 
 Pasting 32 KiB or more of text adds that fragment as a text-file attachment so
 the agent can inspect it without filling the model context. A smaller paste also
