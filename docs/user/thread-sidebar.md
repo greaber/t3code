@@ -164,10 +164,10 @@ section is off. Each device keeps its own choice.
 Choose **Settle thread** from its menu to move finished work out of the active list
 without deleting the conversation. **Un-settle thread** restores it to active work
 and prevents automatic settlement until new activity resumes the usual rules.
-Manually settling an idle thread dismisses unanswered async questions without
-sending an answer or restarting the agent. Settling also closes the thread's
-terminals that wait at an idle prompt, and keeps their output. A terminal that
-runs a command, such as a dev server, stays open unless its action has **Stop this action
+Settling only changes where the thread is listed. It does not stop the agent,
+answer its questions, or drop background results, pull request watches, or usage-limit
+resumes it is waiting on. When one of those starts a turn, the thread moves back to
+active work. Terminals stay open unless their action has **Stop this action
 when the thread settles** enabled in Settings > Projects > Actions. You can also set
 `"stopOnSettle": true` on a `t3.json` action and import it there. Start the command through
 that action so T3 can stop its terminal and child processes. Commands started through an
@@ -185,9 +185,9 @@ settle every thread in that section between it and the one you release on.
 The **Un-settle** and **Wake** buttons work the same way in their sections.
 Press `Escape` while dragging to cancel.
 
-By default, environments settle inactive threads after seven days and settle
-threads whose pull request merged. A closed pull request can also settle an idle
-thread. An empty thread's inactivity counts from when it was created.
+Automatic settlement is off by default. In **Settings → Threads**, you can settle
+threads after a number of inactive days, or when their pull request merges or closes.
+An empty thread's inactivity counts from when it was created.
 Work in progress, pending questions or approvals, and background work the agent
 is waiting on prevent automatic settlement. An open pull request does not prevent inactivity
 settlement unless you turn on **Keep threads with a PR** in **Settings → Threads**,
@@ -259,7 +259,8 @@ continuation. You can cancel it from the thread. Enable **Resume after
 usage limits** in **Settings → Threads** to schedule limit stops by default.
 The environment must be running when the reset arrives; it resumes overdue
 continuations after a restart. Stopping the thread, sending a new message,
-archiving, or settling it prevents a pending continuation from starting.
+or archiving it prevents a pending continuation from starting. A settled thread still
+resumes and moves back to active work.
 
 Choose **Snooze until reset** to hide the thread until its allowance returns.
 Snooze and auto-resume are independent: snooze alone wakes the thread without

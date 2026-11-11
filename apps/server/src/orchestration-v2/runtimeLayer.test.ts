@@ -1896,7 +1896,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
     }),
   );
 
-  it.effect("dismisses message-capable questions directly and while settling", () =>
+  it.effect("dismisses message-capable questions directly but keeps them while settling", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
@@ -2024,18 +2024,10 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         commandId: CommandId.make("runtime-settle-question-command"),
         threadId: settled.threadId,
       });
+      // Settling only parks the thread, so the agent's question stays open.
       const settledProjection = yield* orchestrator.getThreadProjection(settled.threadId);
       assert.equal(settledProjection.thread.settledOverride, "settled");
-      assert.equal(settledProjection.runtimeRequests[0]?.status, "resolved");
-      assert.equal(settledProjection.runtimeRequests[0]?.decision, "cancel");
-      assert.equal(
-        settledProjection.nodes.find((node) => node.id === settled.nodeId)?.status,
-        "cancelled",
-      );
-      assert.equal(
-        settledProjection.turnItems.find((item) => item.id === settled.itemId)?.status,
-        "cancelled",
-      );
+      assert.equal(settledProjection.runtimeRequests[0]?.status, "pending");
     }),
   );
 
@@ -3120,109 +3112,146 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
-  it.effect.each(["manual", "automatic"])("settling ends every pull request watch: %s", (mode) =>
-    Effect.gen(function* () {
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const maintenance = yield* ProjectionReplay.ProjectionReplay;
-      const threadId = ThreadId.make(`pr-watch-settle-${mode}`);
-      yield* orchestrator.dispatch({
-        type: "thread.create",
-        createdBy: "user",
-        creationSource: "web",
-        commandId: CommandId.make(`pr-watch-settle-create-${mode}`),
-        threadId,
-        projectId: ProjectId.make("pr-watch-settle-project"),
-        title: "Settle watched PRs",
-        modelSelection,
-        runtimeMode: "full-access",
-        interactionMode: "default",
-        branch: null,
-        worktreePath: null,
-      });
-      const key = { host: "github.com", repository: "pingdotgg/t3code" };
-      for (const number of [7, 8]) {
-        yield* orchestrator.dispatch({
-          type: "thread.pull-request.watch",
-          commandId: CommandId.make(`pr-watch-settle-start-${mode}-${number}`),
-          threadId,
-          ...key,
-          number,
-          watching: true,
-          link: { url: `https://github.com/pingdotgg/t3code/pull/${number}`, source: "agent" },
+  it.effect.each(["manual", "automatic"])(
+    "settling keeps the agent session and pull request watches: %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const maintenance = yield* ProjectionReplay.ProjectionReplay;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const threadId = ThreadId.make(`pr-watch-settle-${mode}`);
+        yield* seedProject({
+          projectId: ProjectId.make(`pr-watch-settle-project-${mode}`),
+          title: "Settle watched PRs",
+          workspaceRoot: process.cwd(),
+          defaultModelSelection: modelSelection,
+          createdAt: DateTime.formatIso(yield* DateTime.now),
         });
-      }
-      const before = yield* orchestrator.getThreadShell(threadId);
-      const started = before?.pullRequests?.[0]?.watch;
-      assert.isDefined(started);
-      if (started === undefined || before === null) return;
-      yield* orchestrator.dispatch({
-        ...(mode === "manual"
-          ? { type: "thread.settle" as const }
-          : { type: "thread.auto-settle" as const, snapshotAt: before.updatedAt }),
-        commandId: CommandId.make(`pr-watch-settle-${mode}`),
-        threadId,
-      });
-      const expected = before.pullRequests?.map(({ watch, ...link }) => ({
-        ...link,
-        endedWatch: watch,
-      }));
-      assert.deepEqual((yield* orchestrator.getThreadShell(threadId))?.pullRequests, expected);
-      assert.isTrue((yield* maintenance.rebuild).valid);
-      assert.deepEqual((yield* orchestrator.getThreadShell(threadId))?.pullRequests, expected);
-
-      for (const wake of [
-        undefined,
-        {
-          messageId: MessageId.make(`pr-watch-settle-late-wake-${mode}`),
-          text: "Update",
-          notification: {
-            source: { kind: "monitor" as const },
-            outcome: "updated" as const,
-            summary: "#7",
-          },
-        },
-      ]) {
-        const late = yield* orchestrator
-          .dispatch({
-            type: "thread.pull-request-watch.sync",
-            commandId: CommandId.make(`pr-watch-settle-late-${mode}-${wake !== undefined}`),
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`pr-watch-settle-create-${mode}`),
+          threadId,
+          projectId: ProjectId.make(`pr-watch-settle-project-${mode}`),
+          title: "Settle watched PRs",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        const key = { host: "github.com", repository: "pingdotgg/t3code" };
+        for (const number of [7, 8]) {
+          yield* orchestrator.dispatch({
+            type: "thread.pull-request.watch",
+            commandId: CommandId.make(`pr-watch-settle-start-${mode}-${number}`),
             threadId,
             ...key,
-            number: 7,
-            startedAt: started.startedAt,
-            watch: { ...started, headSha: "late", wakes: 1 },
-            ...(wake === undefined ? {} : { wake }),
+            number,
+            watching: true,
+            link: { url: `https://github.com/pingdotgg/t3code/pull/${number}`, source: "agent" },
+          });
+        }
+        // An agent between turns, such as Claude about to deliver a background task's result.
+        const now = yield* DateTime.now;
+        yield* eventSink.write({
+          commandId: CommandId.make(`pr-watch-settle-attach-${mode}`),
+          events: [
+            {
+              id: EventId.make(`pr-watch-settle-attach-${mode}`),
+              type: "provider-session.attached",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: ProviderSessionId.make(`pr-watch-settle-session-${mode}`),
+                driver,
+                providerInstanceId: modelSelection.instanceId,
+                status: "ready",
+                cwd: process.cwd(),
+                model: modelSelection.model,
+                capabilities: CodexProviderCapabilitiesV2,
+                createdAt: now,
+                updatedAt: now,
+                lastError: null,
+              },
+            },
+          ],
+        });
+        const before = yield* orchestrator.getThreadShell(threadId);
+        const started = before?.pullRequests?.[0]?.watch;
+        assert.isDefined(started);
+        if (started === undefined || before === null) return;
+        const settleCommandId = CommandId.make(`pr-watch-settle-${mode}`);
+        yield* orchestrator.dispatch({
+          ...(mode === "manual"
+            ? { type: "thread.settle" as const }
+            : { type: "thread.auto-settle" as const, snapshotAt: before.updatedAt }),
+          commandId: settleCommandId,
+          threadId,
+        });
+        assert.deepEqual(
+          (yield* outbox.listByCommandId(settleCommandId)).filter(
+            (effect) => effect.request.type === "provider-session.detach",
+          ),
+          [],
+        );
+        const settled = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(settled.thread.settledOverride, "settled");
+        assert.deepEqual(
+          settled.providerSessions.map((session) => session.status),
+          ["ready"],
+        );
+        assert.deepEqual(
+          (yield* orchestrator.getThreadShell(threadId))?.pullRequests,
+          before.pullRequests,
+        );
+        assert.isTrue((yield* maintenance.rebuild).valid);
+        assert.deepEqual(
+          (yield* orchestrator.getThreadShell(threadId))?.pullRequests,
+          before.pullRequests,
+        );
+
+        const blocked = yield* orchestrator
+          .dispatch({
+            type: "thread.pull-request.watch",
+            commandId: CommandId.make(`pr-watch-settle-blocked-${mode}`),
+            threadId,
+            ...key,
+            number: 9,
+            watching: true,
           })
           .pipe(Effect.flip);
-        assert.equal(late._tag, "OrchestratorDispatchError");
-      }
-      const restart = {
-        type: "thread.pull-request.watch" as const,
-        threadId,
-        ...key,
-        number: 7,
-        watching: true,
-      };
-      const blocked = yield* orchestrator
-        .dispatch({
-          ...restart,
-          commandId: CommandId.make(`pr-watch-settle-blocked-${mode}`),
-        })
-        .pipe(Effect.flip);
-      assert.equal(blocked._tag, "OrchestratorDispatchError");
-      assert.deepEqual((yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages, []);
-      yield* orchestrator.dispatch({
-        type: "thread.unsettle",
-        commandId: CommandId.make(`pr-watch-settle-unsettle-${mode}`),
-        threadId,
-        reason: "user",
-      });
-      yield* orchestrator.dispatch({
-        ...restart,
-        commandId: CommandId.make(`pr-watch-settle-restart-${mode}`),
-      });
-      assert.isDefined((yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch);
-    }),
+        assert.equal(blocked._tag, "OrchestratorDispatchError");
+
+        const wakeMessageId = MessageId.make(`pr-watch-settle-wake-${mode}`);
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request-watch.sync",
+          commandId: CommandId.make(`pr-watch-settle-wake-${mode}`),
+          threadId,
+          ...key,
+          number: 7,
+          startedAt: started.startedAt,
+          watch: { ...started, headSha: "late", wakes: 1 },
+          wake: {
+            messageId: wakeMessageId,
+            text: "Update",
+            notification: {
+              source: { kind: "monitor" as const },
+              outcome: "updated" as const,
+              summary: "#7",
+            },
+          },
+        });
+        const woken = yield* orchestrator.getThreadRecords(threadId, ["messages"]);
+        assert.deepEqual(
+          woken.messages.map((message) => message.id),
+          [wakeMessageId],
+        );
+        assert.isNull(woken.thread.settledOverride);
+        assert.isNull(woken.thread.settledAt);
+      }),
   );
 
   it.effect("archiving ends watches, and an archived thread cannot start one", () =>
@@ -4939,7 +4968,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
-  it.effect("settles past held automatic runs but not held user messages", () =>
+  it.effect("settles past held automatic runs, keeping them, but not held user messages", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
@@ -5047,7 +5076,24 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       });
       const settled = yield* orchestrator.getThreadProjection(threadId);
       assert.isNotNull(settled.thread.settledAt);
-      assert.isTrue(settled.runs.every((run) => run.status === "cancelled"));
+      // Settling keeps the background wake; starting it brings the thread back to active.
+      assert.deepEqual(
+        settled.runs.map((run) => run.status),
+        ["cancelled", "queued"],
+      );
+      yield* orchestrator.dispatch({
+        type: "queue.resume",
+        commandId: CommandId.make("settle-automatic-resume"),
+        threadId,
+      });
+      const resumed = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(
+        resumed.runs.map((run) => run.status),
+        ["cancelled", "starting"],
+      );
+      assert.isNull(resumed.thread.settledOverride);
+      assert.isNull(resumed.thread.settledAt);
+      yield* holdQueueAfterRestart("settle-automatic-restart-resumed");
 
       yield* orchestrator.dispatch({
         type: "thread.unsettle",
@@ -8862,6 +8908,7 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     "rearm",
     "snooze-race",
     "archive",
+    "settle",
     "replacement",
     "manual-snooze",
     "invalid-snooze",
@@ -9271,6 +9318,12 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
           commandId: CommandId.make(`recovery:archive:${scenario}`),
           threadId,
         });
+      if (scenario === "settle")
+        yield* orchestrator.dispatch({
+          type: "thread.settle",
+          commandId: CommandId.make(`recovery:settle:${scenario}`),
+          threadId,
+        });
       if (scenario === "stop") {
         yield* orchestrator.dispatch({
           type: "thread.stop",
@@ -9427,6 +9480,7 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
           (scenario === "resume" ||
           scenario === "resume-started" ||
           scenario === "resume-untagged" ||
+          scenario === "settle" ||
           stopBeforeArm ||
           scenario === "queued-resume" ||
           scenario === "independent-patches" ||
@@ -9440,6 +9494,7 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
           (scenario === "resume" ||
           scenario === "resume-started" ||
           scenario === "resume-untagged" ||
+          scenario === "settle" ||
           stopBeforeArm ||
           scenario === "queued-resume" ||
           scenario === "independent-patches" ||
@@ -9447,6 +9502,12 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
             ? 1
             : 0),
       );
+      if (scenario === "settle") {
+        // Settling only parks the thread; the resumed run brings it back to active.
+        assert.equal(after.runs.at(-1)?.status, "starting");
+        assert.isNull(after.thread.settledOverride);
+        assert.isNull(after.thread.settledAt);
+      }
       if (scenario === "stop") {
         assert.deepInclude(after.thread.limitRecovery, { runId: run.id, autoResume: false });
         const projections = yield* ProjectionStore.ProjectionStoreV2;

@@ -1663,6 +1663,7 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const events = yield* EventSink.EventSinkV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
     const threadId = ThreadId.make("thread:settle-snoozed");
     yield* orchestrator.dispatch({
       type: "thread.create",
@@ -1681,6 +1682,25 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
     const now = yield* DateTime.now;
     const settledAt = DateTime.add(now, { seconds: 1 });
     const snoozedUntil = DateTime.add(now, { hours: 1 });
+    // Settling must leave a live agent alone; it may be about to deliver background results.
+    yield* projections.apply({
+      id: EventId.make("attach-settle-snoozed"),
+      type: "provider-session.attached",
+      threadId,
+      occurredAt: now,
+      payload: {
+        id: ProviderSessionId.make("session:settle-snoozed"),
+        driver: adapter.driver,
+        providerInstanceId: instanceId,
+        status: "ready",
+        cwd: "/repo",
+        model: modelSelection.model,
+        capabilities: CodexProviderCapabilitiesV2,
+        createdAt: now,
+        updatedAt: now,
+        lastError: null,
+      },
+    });
     for (const round of [1, 2]) {
       yield* orchestrator.dispatch({
         type: "thread.snooze",
@@ -1705,6 +1725,7 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
       const committed = yield* events.readByCommandId({ commandId }).pipe(Stream.runCollect);
       assert.lengthOf(committed, 1);
       assert.equal(committed[0]?.event.type, "thread.settled");
+      assert.deepEqual(yield* outbox.listByCommandId(commandId), []);
       assert.deepInclude(committed[0]?.event.payload, expected);
       const settled = yield* projections.getThreadShell(threadId);
       assert.deepInclude(settled, expected);

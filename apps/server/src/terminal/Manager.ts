@@ -3476,7 +3476,6 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         );
       }),
     );
-    yield* closeIdle(input);
   });
 
   return TerminalManager.of({

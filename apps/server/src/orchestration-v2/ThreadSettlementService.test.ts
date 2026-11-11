@@ -369,14 +369,15 @@ describe("resolveAutoSettlementAt", () => {
         pullRequest: { state: "merged", mergedAt: DateTime.formatIso(at(-3 * 60 * 60 * 1_000)) },
       }),
     ).toBeNull();
+    const closed = {
+      ...input,
+      thread: shell(),
+      pullRequest: { state: "closed" as const, closedAt: DateTime.formatIso(at(-1)) },
+    };
+    expect(ThreadSettlementService.resolveAutoSettlementAt(closed)).toEqual(shell().createdAt);
     expect(
-      ThreadSettlementService.resolveAutoSettlementAt({
-        ...input,
-        thread: shell(),
-        pullRequest: { state: "closed", closedAt: DateTime.formatIso(at(-1)) },
-        autoSettleOnMerge: false,
-      }),
-    ).toEqual(shell().createdAt);
+      ThreadSettlementService.resolveAutoSettlementAt({ ...closed, autoSettleOnMerge: false }),
+    ).toBeNull();
   });
 
   it("settles on merge after agent-started runs, but not after the user writes again", () => {
@@ -565,13 +566,20 @@ interface HarnessOptions {
   readonly currentThreads?: ReadonlyArray<OrchestrationV2AppThread>;
 }
 
+// Auto-settlement is off by default; these tests exercise the rules with both turned on.
+const ENABLED_SETTINGS: ContractServerSettings = {
+  ...DEFAULT_SERVER_SETTINGS,
+  sidebarAutoSettleOnMerge: true,
+  sidebarAutoSettleAfterDays: 7,
+};
+
 const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options: HarnessOptions) {
   const activation = yield* Deferred.make<void>();
   const snapshots = yield* Ref.make(options.snapshot);
   const snapshotReadCount = yield* Ref.make(0);
   const snapshotReads = yield* Queue.unbounded<number>();
   const candidateReads = yield* Ref.make<ReadonlyArray<string | undefined>>([]);
-  const settings = yield* Ref.make(options.settings ?? DEFAULT_SERVER_SETTINGS);
+  const settings = yield* Ref.make(options.settings ?? ENABLED_SETTINGS);
   const settingsReadCount = yield* Ref.make(0);
   const settingsChanges = yield* PubSub.unbounded<ContractServerSettings>();
   const mergedPullRequests = yield* PubSub.unbounded<PullRequestService.PullRequestMergeEvent>();
@@ -774,7 +782,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
         );
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot(threads),
-          settings: { ...DEFAULT_SERVER_SETTINGS, sidebarAutoSettleAfterDays: 3 },
+          settings: { ...ENABLED_SETTINGS, sidebarAutoSettleAfterDays: 3 },
         });
         yield* Effect.gen(function* () {
           const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
@@ -822,7 +830,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
         });
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([thread]),
-          settings: { ...DEFAULT_SERVER_SETTINGS, sidebarAutoSettleAfterDays: null },
+          settings: { ...ENABLED_SETTINGS, sidebarAutoSettleAfterDays: null },
         });
 
         yield* Effect.gen(function* () {
@@ -898,7 +906,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
         let disable: Effect.Effect<unknown> = Effect.void;
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot(threads),
-          settings: { ...DEFAULT_SERVER_SETTINGS, sidebarAutoSettleAfterDays: 3 },
+          settings: { ...ENABLED_SETTINGS, sidebarAutoSettleAfterDays: 3 },
           onDispatch: () => disable,
         });
         disable = fixture.updateSettings({ sidebarAutoSettleAfterDays: null });
