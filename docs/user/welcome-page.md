@@ -97,7 +97,7 @@ in the imported conversation so T3 Code does not remove user text. It reads one
 conversation at a time and ignores malformed records.
 
 Some conversations are skipped: files larger than 4 GiB, conversations whose
-message text and metadata need more than 256 MiB of memory (tool output does not
+message text and metadata need more than 128 MiB of memory (tool output does not
 count), conversations with more than 10 million records, unreadable files, and
 sessions with no user messages. Each import attempt reads up to 4 GiB per
 project; open the Welcome page again and pick the project in **Review all** to

@@ -84,8 +84,8 @@ const MAX_METADATA_RECORDS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 20;
 const MAX_METADATA_RECORDS_PER_TRANSCRIPT = 1_000;
 // Screenshot-heavy transcripts can reach GiB; select fields while streaming to avoid allocating payloads.
 const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
-// A thread is parsed and committed whole; peak heap runs at several times the kept text.
-const MAX_IMPORT_HISTORY_BYTES = 256 * 1024 * 1024;
+// A thread is parsed and committed whole; peak heap runs at a few times the kept text.
+const MAX_IMPORT_HISTORY_BYTES = 128 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORT_RECORDS = 10_000_000;
 /** Records read per transcript; tests lower it to keep fixtures small. */
@@ -1068,7 +1068,7 @@ export const make = Effect.gen(function* () {
               recordBytes += bytes;
               if (historyBytes + recordBytes > MAX_IMPORT_HISTORY_BYTES) {
                 throw new TranscriptJsonLimitError({
-                  message: "Transcript selected history exceeds the 256 MiB memory budget",
+                  message: "Transcript selected history exceeds the 128 MiB memory budget",
                 });
               }
             };
