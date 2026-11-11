@@ -49,7 +49,11 @@ sends supported videos to Gemini models as video.
 
 Uploads begin when you add an attachment. All uploads must finish before the
 message can send. Retry or remove a failed upload. On web and desktop, reloading
-before an upload finishes requires you to attach that file again.
+before an upload finishes requires you to attach that file again. Files uploaded
+to an unsent draft stay on the environment for 30 days from when the draft was last
+opened. On web and desktop, the app also refreshes them about once a day while it is
+connected to that environment, so an unopened draft keeps its files while you use
+the app.
 
 You can drag or paste images into the web or desktop composer. HEIC and HEIF
 photos are converted to JPEG there and when selected from the mobile photo
@@ -193,8 +197,8 @@ With an empty composer, the same shortcut restores a single stash or opens the
 stash menu when there are several.
 
 Stashes containing uploaded files must be restored in their original environment.
-Those files are kept until 30 days pass without the stash or a draft using them. After an upload
-expires, restore the prompt and use **Attach again** or remove the missing file before sending.
+Those files are kept like draft uploads above. After an upload expires, restore the prompt and use
+**Attach again** or remove the missing file before sending.
 
 ## Voice input on web and desktop
 

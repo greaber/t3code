@@ -41,6 +41,7 @@ import {
 import { syncBrowserChromeTheme } from "./hooks/useTheme";
 import { startThreadVisitedMigration } from "./hooks/useThreadVisitedMigration";
 import { installDesktopPasteAsText } from "./lib/desktopPasteAsText";
+import { startDraftUploadKeepAlive } from "./lib/draftUploadKeepAlive";
 import {
   syncDocumentElectronPlatformClasses,
   syncDocumentWindowControlsOverlayClass,
@@ -182,6 +183,7 @@ export function startAppServices(): AppRouter {
   startClientAppearance();
   startDocumentTitle();
   startHostEnvironmentLookup();
+  startDraftUploadKeepAlive();
   startEnvironmentThemeRepaint();
   startBrowserChromeThemeSync(router);
   startDefaultThemeAdoption();
