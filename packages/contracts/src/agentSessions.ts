@@ -72,9 +72,32 @@ export class AgentSessionImportProjectChangedError extends Schema.TaggedError<Ag
   }
 }
 
+export const AgentSessionImportSkipReason = Schema.Literals([
+  /** Over the per-file size, the kept-history memory budget, or the record count. */
+  "too_large",
+  /** This import reached its total read budget; importing again continues. */
+  "import_limit",
+  "changed_while_reading",
+  "unreadable",
+  "outside_project",
+  "no_conversation",
+  "unresumable",
+  "import_failed",
+]);
+export type AgentSessionImportSkipReason = typeof AgentSessionImportSkipReason.Type;
+
+export const AgentSessionImportSkipped = Schema.Struct({
+  provider: AgentSessionSource,
+  filePath: TrimmedNonEmptyString,
+  reason: AgentSessionImportSkipReason,
+});
+export type AgentSessionImportSkipped = typeof AgentSessionImportSkipped.Type;
+
 export const AgentSessionImportResult = Schema.Struct({
   importedCount: NonNegativeInt,
   skippedCount: NonNegativeInt,
+  /** One entry per skipped transcript; older servers omit it. */
+  skipped: Schema.optional(Schema.Array(AgentSessionImportSkipped)),
 });
 export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
 

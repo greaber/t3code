@@ -2,7 +2,13 @@ import {
   findProjectByPath,
   normalizeProjectPathForComparison,
 } from "@t3tools/client-runtime/state/projects";
-import type { AgentSessionProjectCandidate, EnvironmentId, ProjectId } from "@t3tools/contracts";
+import type {
+  AgentSessionImportSkipReason,
+  AgentSessionImportSkipped,
+  AgentSessionProjectCandidate,
+  EnvironmentId,
+  ProjectId,
+} from "@t3tools/contracts";
 
 const RECENT_PROJECT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_SELECTION_MIN_THREADS = 3;
@@ -162,4 +168,30 @@ export function splitOnboardingProjectPath(path: string): {
 
 export function onboardingProjectKey(environmentId: EnvironmentId, path: string): string {
   return JSON.stringify([environmentId, path]);
+}
+
+const SKIP_REASON_LABELS: Record<AgentSessionImportSkipReason, string> = {
+  too_large: "Too large to import",
+  import_limit: "Over this import's 4 GiB read limit. Import again to continue",
+  changed_while_reading: "Changed while being read. Import again to retry",
+  unreadable: "Could not be read",
+  outside_project: "Belongs to a different folder",
+  no_conversation: "Has no user messages",
+  unresumable: "Has a session ID the agent cannot resume",
+  import_failed: "Could not be saved",
+};
+
+/** Skipped transcripts grouped by reason, in first-seen order. */
+export function groupSkippedImports(skipped: ReadonlyArray<AgentSessionImportSkipped>) {
+  const groups = new Map<AgentSessionImportSkipReason, Array<string>>();
+  for (const entry of skipped) {
+    const filePaths = groups.get(entry.reason) ?? [];
+    filePaths.push(entry.filePath);
+    groups.set(entry.reason, filePaths);
+  }
+  return Array.from(groups, ([reason, filePaths]) => ({
+    reason,
+    label: SKIP_REASON_LABELS[reason],
+    filePaths,
+  }));
 }

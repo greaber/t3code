@@ -17,6 +17,8 @@ import {
   TurnItemId,
   type AgentSessionImportInput,
   type AgentSessionImportResult,
+  type AgentSessionImportSkipReason,
+  type AgentSessionImportSkipped,
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
@@ -264,12 +266,12 @@ const make = Effect.gen(function* () {
     const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
     const importedThreadIds = new Set<ThreadId>();
     let importedCount = 0;
-    let skippedCount = 0;
+    const skipped: Array<AgentSessionImportSkipped> = [];
 
     yield* Stream.runForEach(outcomes, (outcome) =>
       Effect.gen(function* () {
         if (outcome._tag === "Skipped") {
-          skippedCount += 1;
+          skipped.push(outcome.skipped);
           return;
         }
         const source = outcome.source;
@@ -415,34 +417,6 @@ const make = Effect.gen(function* () {
                 occurredAt: createdAt,
                 payload: appThread,
               },
-              ...(thread.omittedMessageCount > 0
-                ? [
-                    {
-                      id: EventId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
-                      type: "turn-item.updated" as const,
-                      threadId,
-                      occurredAt: createdAt,
-                      payload: {
-                        id: TurnItemId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
-                        threadId,
-                        runId: null,
-                        nodeId: null,
-                        providerThreadId: null,
-                        providerTurnId: null,
-                        nativeItemRef: null,
-                        parentItemId: null,
-                        ordinal: 0,
-                        status: "completed" as const,
-                        title: null,
-                        startedAt: createdAt,
-                        completedAt: createdAt,
-                        updatedAt: createdAt,
-                        type: "system_notice" as const,
-                        message: `${thread.omittedMessageCount} earlier ${thread.omittedMessageCount === 1 ? "message was" : "messages were"} not imported. This thread keeps the first user message and the most recent history. The original session transcript is unchanged.`,
-                      },
-                    },
-                  ]
-                : []),
               ...thread.messages.flatMap((message, index) =>
                 messageEvents({ threadId, index, message }),
               ),
@@ -467,19 +441,29 @@ const make = Effect.gen(function* () {
               provider: outcome.thread.source,
               sessionId: outcome.thread.providerSessionId,
               cause,
-            }).pipe(Effect.as(false)),
+            }).pipe(
+              Effect.as<AgentSessionImportSkipReason>(
+                cause._tag === "AgentSessionUnresumableSessionError"
+                  ? "unresumable"
+                  : "import_failed",
+              ),
+            ),
           ),
         );
         if (imported === true) {
           importedThreadIds.add(threadId);
           importedCount += 1;
-        } else if (imported === false) {
-          skippedCount += 1;
+        } else if (typeof imported === "string") {
+          skipped.push({ provider: source.provider, filePath: source.filePath, reason: imported });
         }
       }),
     );
 
-    return { importedCount, skippedCount } satisfies AgentSessionImportResult;
+    return {
+      importedCount,
+      skippedCount: skipped.length,
+      skipped,
+    } satisfies AgentSessionImportResult;
   });
 
   /**

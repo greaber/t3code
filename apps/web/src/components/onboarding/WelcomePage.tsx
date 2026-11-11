@@ -1,6 +1,7 @@
 import { useAuth } from "@clerk/react";
 import { useAtomValue } from "@effect/atom-react";
 import type {
+  AgentSessionImportSkipped,
   AgentSessionProjectCandidate,
   EnvironmentId,
   ProjectId,
@@ -52,6 +53,7 @@ import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
 import { completeOnboarding } from "../../onboarding/firstRun";
 import {
   groupOnboardingProjects,
+  groupSkippedImports,
   partitionOnboardingProjects,
   onboardingProjectKey,
   resolveOnboardingLandingProject,
@@ -179,7 +181,7 @@ export function WelcomePage({
   const completionErrorToastIdRef = useRef<ReturnType<typeof toastManager.add> | null>(null);
   const finish = (
     projectRef?: ScopedProjectRef,
-    importWarning?: string,
+    importWarning?: ImportWarning,
     importedThreadCount = 0,
   ) => {
     if (finishingPromiseRef.current !== null) return finishingPromiseRef.current;
@@ -203,8 +205,17 @@ export function WelcomePage({
           toastManager.add({
             type: "warning",
             title: "Some history was not imported",
-            description: importWarning,
+            description: importWarning.description,
             timeout: 0,
+            ...(importWarning.skipped.length === 0
+              ? {}
+              : {
+                  data: {
+                    expandableContent: <SkippedImportList skipped={importWarning.skipped} />,
+                    expandableDescriptionTrigger: true,
+                    expandableLabels: { expand: "Show skipped", collapse: "Hide skipped" },
+                  },
+                }),
           });
         } else if (importedThreadCount > 0) {
           toastManager.add({
@@ -1374,14 +1385,14 @@ function useProjectImport({
   readonly holdPageRef: { current: boolean };
   readonly onDone: (
     projectRef?: ScopedProjectRef,
-    importWarning?: string,
+    importWarning?: ImportWarning,
     importedThreadCount?: number,
   ) => Promise<boolean>;
 }) {
   const writableEnvironments = useEnvironmentsWithScope(scans, AuthOrchestrationOperateScope);
   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
   const importThreads = useAtomCommand(agentSessionImport, { reportFailure: false });
-  const importWarningRef = useRef("");
+  const importWarningRef = useRef<ImportWarning | undefined>(undefined);
   // Per project, so a retry that skips finished projects still counts their threads.
   const importedThreadsRef = useRef(new Map<string, number>());
   const importedProjectsRef = useRef(new Map<string, ScopedProjectRef>());
@@ -1491,7 +1502,7 @@ function useProjectImport({
       return;
     }
     setIsImporting(true);
-    importWarningRef.current = "";
+    importWarningRef.current = undefined;
     lastImportSelectionRef.current = selection.map((candidate) => candidate.key);
     const importGeneration = importGenerationRef.current;
     const importedThreads = importedThreadsRef.current;
@@ -1502,6 +1513,7 @@ function useProjectImport({
         ? selection.filter((candidate) => importedProjects.has(candidate.key)).length
         : 0;
     let skippedThreadCount = 0;
+    const skippedThreads: Array<AgentSessionImportSkipped> = [];
     const refreshEnvironments = new Set<EnvironmentId>();
     // Resolves false when the run stopped early: a newer run, an unmount, or lost access.
     const importEach = async () => {
@@ -1561,6 +1573,7 @@ function useProjectImport({
             (importedThreads.get(candidate.key) ?? 0) + threadImportResult.value.importedCount,
           );
           skippedThreadCount += threadImportResult.value.skippedCount;
+          skippedThreads.push(...(threadImportResult.value.skipped ?? []));
           if (threadImportResult.value.importedCount > 0) {
             projectsWithImportedHistoryRef.current.set(
               candidate.key,
@@ -1589,14 +1602,22 @@ function useProjectImport({
     setIsImporting(false);
     const importedThreadCount = importedThreadTotal();
     if (importedProjectsCount < selection.length) {
+      const warn = (description: string) => {
+        importWarningRef.current = { description, skipped: skippedThreads };
+      };
+      const skippedText = `${skippedThreadCount} ${skippedThreadCount === 1 ? "conversation was" : "conversations were"} skipped.`;
       if (importedThreadCount > 0 && skippedThreadCount > 0) {
-        importWarningRef.current = `Imported ${importedThreadCount} ${importedThreadCount === 1 ? "thread" : "threads"}. ${skippedThreadCount} ${skippedThreadCount === 1 ? "thread" : "threads"} could not be imported.`;
+        warn(
+          `Imported ${importedThreadCount} ${importedThreadCount === 1 ? "thread" : "threads"}. ${skippedText}`,
+        );
       } else if (skippedThreadCount > 0) {
-        importWarningRef.current = `${skippedThreadCount} ${skippedThreadCount === 1 ? "thread could" : "threads could"} not be imported.`;
+        warn(skippedText);
       } else if (importedThreadCount > 0) {
-        importWarningRef.current = `Imported ${importedThreadCount} ${importedThreadCount === 1 ? "thread" : "threads"}. Some thread history could not be imported.`;
+        warn(
+          `Imported ${importedThreadCount} ${importedThreadCount === 1 ? "thread" : "threads"}. Some thread history could not be imported.`,
+        );
       } else {
-        importWarningRef.current = "Could not import thread history.";
+        warn("Could not import thread history.");
       }
     }
     finishAfterImport();
@@ -1614,6 +1635,36 @@ function useProjectImport({
     runImport,
     finishAfterImport,
   };
+}
+
+interface ImportWarning {
+  readonly description: string;
+  readonly skipped: ReadonlyArray<AgentSessionImportSkipped>;
+}
+
+function SkippedImportList({
+  skipped,
+}: {
+  readonly skipped: ReadonlyArray<AgentSessionImportSkipped>;
+}) {
+  return (
+    <div className="flex flex-col gap-2 text-xs">
+      {groupSkippedImports(skipped).map((group) => (
+        <div key={group.reason}>
+          <div className="font-medium text-foreground">
+            {group.label} ({group.filePaths.length})
+          </div>
+          <ul className="flex flex-col gap-0.5 text-muted-foreground">
+            {group.filePaths.map((filePath) => (
+              <li key={filePath} className="break-all font-mono">
+                {filePath}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 type ImportCandidate = AgentSessionProjectCandidate & {
