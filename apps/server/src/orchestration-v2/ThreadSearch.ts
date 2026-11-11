@@ -76,6 +76,9 @@ const SearchRequest = Schema.Struct({
   projectId: Schema.NullOr(ProjectId),
   /** Threads the caller already lists, left out before the hit limit. */
   excludedThreadIds: TokenList,
+  /** The page reads messages with rowids in [lower, before), newest first. */
+  before: Schema.Number,
+  lower: Schema.Number,
 });
 const SearchRow = Schema.Struct({
   messageRowid: Schema.Number,
@@ -97,14 +100,14 @@ const decodeThreadOpens = Schema.decodeUnknownOption(
 );
 
 const SNIPPET_LENGTH = 240;
-// The newest hits read per query. A common word stops here instead of reading
-// every message, so time stays flat as history grows.
+// Each page reads at most this many hits, newest first, and ranks their threads, so a
+// common word's page stays flat as history grows. Later pages continue older.
 const MESSAGE_HIT_LIMIT = 2000;
-// How many of the newest index hits the filters may pass over to fill that
-// limit: a rare short word or hidden threads would otherwise read every hit.
-const MESSAGE_CANDIDATE_LIMIT = 10_000;
-// Without the index, how many of the newest messages a search scans.
-const MESSAGE_SCAN_LIMIT = 20_000;
+// How many index hits one page's filters may pass over: a rare short word or hidden
+// threads would otherwise read every hit before the page answers.
+const MESSAGE_CANDIDATE_PAGE = 10_000;
+// Without the index, how many messages one page scans.
+const MESSAGE_SCAN_PAGE = 50_000;
 const NON_ASCII = /[\u0080-\uffff]/;
 
 /** SQLite's lower() folds ASCII only, so a short word is checked as each spelling it can match. */
@@ -129,7 +132,7 @@ function shortTokenSpellings(token: string): ReadonlyArray<string> {
 function buildMessageSearch(
   query: string,
   hasIndex: boolean,
-): Omit<typeof SearchRequest.Type, "projectId" | "excludedThreadIds"> | null {
+): Pick<typeof SearchRequest.Type, "match" | "substrings" | "shortSpellings"> | null {
   const { long, short } = messageSearchTokens(query);
   if (long.length === 0) return null;
   // Two-character CJK words are too short for trigrams.
@@ -182,7 +185,15 @@ export function buildSearchSnippet(text: string, matchStart: number): string {
 // The scan folds ASCII case only, so accent variants and non-ASCII case variants may not match.
 export const messageHitsQuery = (
   sql: SqlClient.SqlClient,
-  { match, substrings, shortSpellings, projectId, excludedThreadIds }: typeof SearchRequest.Encoded,
+  {
+    match,
+    substrings,
+    shortSpellings,
+    projectId,
+    excludedThreadIds,
+    before,
+    lower,
+  }: typeof SearchRequest.Encoded,
 ) => sql`
     WITH eligible AS MATERIALIZED (
       SELECT threads.thread_id, threads.project_id
@@ -211,11 +222,9 @@ export const messageHitsQuery = (
             messages.created_at AS "messageCreatedAt"
           FROM orchestration_v2_projection_messages AS messages
           INNER JOIN eligible ON eligible.thread_id = messages.thread_id
-          WHERE ${indexedMessageCondition(sql)}
-            -- A scan reads every message it passes, so it stops at the newest ones.
-            AND messages.rowid > (
-              SELECT coalesce(max(rowid), 0) FROM orchestration_v2_projection_messages
-            ) - ${MESSAGE_SCAN_LIMIT}
+          WHERE messages.rowid < ${before}
+            AND messages.rowid >= ${lower}
+            AND ${indexedMessageCondition(sql)}
         `
         : sql`
           SELECT
@@ -231,12 +240,8 @@ export const messageHitsQuery = (
             ON messages.rowid = orchestration_v2_message_search.rowid
           INNER JOIN eligible ON eligible.thread_id = messages.thread_id
           WHERE orchestration_v2_message_search MATCH ${match}
-            AND orchestration_v2_message_search.rowid >= coalesce((
-              SELECT orchestration_v2_message_search.rowid FROM orchestration_v2_message_search
-              WHERE orchestration_v2_message_search MATCH ${match}
-              ORDER BY orchestration_v2_message_search.rowid DESC
-              LIMIT 1 OFFSET ${MESSAGE_CANDIDATE_LIMIT - 1}
-            ), 0)
+            AND orchestration_v2_message_search.rowid < ${before}
+            AND orchestration_v2_message_search.rowid >= ${lower}
             AND ${nonPlaceholderMessageCondition(sql)}
         `
     }
@@ -265,6 +270,8 @@ const TitleCandidateRow = Schema.Struct({
   projectTitle: Schema.String,
   latestUserMessageAt: Schema.NullOr(IsoDateTime),
 });
+
+export type ThreadSearchCursor = NonNullable<OrchestrationSearchThreadsResult["cursor"]>;
 
 export interface ThreadSearchHit {
   readonly threadId: ThreadId;
@@ -331,6 +338,28 @@ export const make = Effect.gen(function* () {
     Request: SearchRequest,
     Result: SearchRow,
     execute: (request) => messageHitsQuery(sql, request),
+  });
+
+  const newestRowid = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({ next: Schema.Number }),
+    execute: () => sql`
+      SELECT coalesce(max(rowid), 0) + 1 AS next FROM orchestration_v2_projection_messages
+    `,
+  });
+
+  // The oldest index hit one page may read, or none when fewer than a page remain.
+  const candidateFloor = SqlSchema.findAll({
+    Request: Schema.Struct({ match: Schema.String, before: Schema.Number }),
+    Result: Schema.Struct({ rowid: Schema.Number }),
+    execute: ({ match, before }) => sql`
+      SELECT orchestration_v2_message_search.rowid AS rowid
+      FROM orchestration_v2_message_search
+      WHERE orchestration_v2_message_search MATCH ${match}
+        AND orchestration_v2_message_search.rowid < ${before}
+      ORDER BY orchestration_v2_message_search.rowid DESC
+      LIMIT 1 OFFSET ${MESSAGE_CANDIDATE_PAGE - 1}
+    `,
   });
 
   const threadOpens = SqlSchema.findAll({
@@ -442,7 +471,7 @@ export const make = Effect.gen(function* () {
     input: OrchestrationSearchThreadsInput & {
       readonly projectId: ProjectId | null;
       /** Threads the caller already lists, which must not use up the limit. */
-      readonly excludedThreadIds?: ReadonlySet<ThreadId>;
+      readonly shownThreadIds?: ReadonlySet<ThreadId>;
       /** Off for an agent's search, which has no use for the user's picks. */
       readonly picks?: boolean;
     },
@@ -464,21 +493,29 @@ export const make = Effect.gen(function* () {
       right.quality - left.quality ||
       Number(left.row.source !== "user") - Number(right.row.source !== "user") ||
       newer(left, right);
-    const rows = yield* read(
+    const page = yield* read(
       Effect.gen(function* () {
         const index = yield* sql`
           SELECT 1 FROM sqlite_master WHERE name = 'orchestration_v2_message_search'
         `;
         const messageSearch = buildMessageSearch(input.query, index.length > 0);
-        return messageSearch === null
-          ? []
-          : yield* searchRows({
-              ...messageSearch,
-              projectId: input.projectId,
-              excludedThreadIds: [...(input.excludedThreadIds ?? [])],
-            });
+        if (messageSearch === null) return { rows: [], before: 0, lower: 0 };
+        const before = input.cursor?.before ?? (yield* newestRowid())[0]?.next ?? 0;
+        const lower =
+          messageSearch.match === null
+            ? Math.max(0, before - MESSAGE_SCAN_PAGE)
+            : ((yield* candidateFloor({ match: messageSearch.match, before }))[0]?.rowid ?? 0);
+        const rows = yield* searchRows({
+          ...messageSearch,
+          projectId: input.projectId,
+          excludedThreadIds: [...(input.shownThreadIds ?? []), ...(input.excludedThreadIds ?? [])],
+          before,
+          lower,
+        });
+        return { rows, before, lower };
       }),
     );
+    const rows = page.rows;
     const best = new Map<ThreadId, Hit>();
     // Matching messages per thread at its best quality: a thread that keeps
     // using the word ranks above a passing mention, and weaker hits ("Trust"
@@ -525,8 +562,18 @@ export const make = Effect.gen(function* () {
       now,
       { picks: input.picks ?? true },
     );
+    const limit = input.limit ?? 50;
+    // Every matching thread in [next, before) is in this page or was excluded as shown,
+    // so a later page from `next` with this page's threads excluded misses none.
+    const next =
+      ranked.length > limit
+        ? page.before
+        : rows.length === MESSAGE_HIT_LIMIT
+          ? rows.at(-1)!.messageRowid
+          : page.lower;
     return {
-      matches: ranked.slice(0, input.limit ?? 50).map(({ row, text, quality, offset }) => ({
+      ...(next > 0 ? { cursor: { before: next } } : {}),
+      matches: ranked.slice(0, limit).map(({ row, text, quality, offset }) => ({
         hits: hitCount(row.threadId),
         threadId: row.threadId,
         messageId: row.messageId,
@@ -587,7 +634,7 @@ export const make = Effect.gen(function* () {
       query: input.query,
       limit: 50,
       projectId: input.projectId ?? null,
-      excludedThreadIds: shown,
+      shownThreadIds: shown,
       picks: false,
     });
     const messageHits = matches

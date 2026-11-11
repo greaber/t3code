@@ -53,6 +53,7 @@ const EMPTY_THREAD_SEARCH_MATCHES: ReadonlyArray<EnvironmentThreadSearchMatch> =
 const EMPTY_THREAD_SEARCH_ATOM = Atom.make<ThreadSearchResultsState>({
   matches: EMPTY_THREAD_SEARCH_MATCHES,
   isLoading: false,
+  hasMore: false,
   rows: [],
 }).pipe(Atom.withLabel("web:thread-search:empty"));
 
@@ -105,6 +106,9 @@ export function useThreadSearch(
   scope: ThreadSearchScope = {},
 ): {
   readonly matches: ReadonlyArray<EnvironmentThreadSearchMatch>;
+  /** Older messages may hold more matches for the shown query. */
+  readonly hasMore: boolean;
+  readonly loadMore: () => void;
   readonly query: string;
   readonly isPending: boolean;
 } {
@@ -160,6 +164,10 @@ export function useThreadSearch(
     matches: visible.matches,
     query: visible.query,
     isPending,
+    hasMore: searchKey !== null && visible.query === settledQuery && result.hasMore,
+    loadMore: () => {
+      if (searchKey !== null) threadSearch.loadMore(appAtomRegistry, searchKey);
+    },
   };
 }
 

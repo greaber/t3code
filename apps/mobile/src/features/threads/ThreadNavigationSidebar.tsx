@@ -58,6 +58,7 @@ import {
   ThreadListV2Row,
   ThreadListV2SettledShelfHeader,
   ThreadListV2ShowMoreRow,
+  ThreadSearchMoreRow,
   ThreadListV2SnoozedShelfHeader,
   ThreadListV2WorkingShelfHeader,
 } from "./thread-list-v2-items";
@@ -556,6 +557,14 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
       }}
     />
   );
+  const searchMoreRow =
+    props.searchQuery.trim().length > 0 && threadSearch.hasMore ? (
+      <ThreadSearchMoreRow
+        pane="sidebar"
+        loading={threadSearch.isPending}
+        onPress={threadSearch.loadMore}
+      />
+    ) : null;
   const listEmpty = (
     <Text
       className={
@@ -614,6 +623,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
                 showsVerticalScrollIndicator={false}
                 style={styles.threadList}
                 ListEmptyComponent={listEmpty}
+                ListFooterComponent={searchMoreRow}
               />
             </GestureDetector>
           </SwipeableScrollGateProvider>
@@ -667,6 +677,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
                 showsVerticalScrollIndicator={false}
                 style={styles.threadList}
                 ListEmptyComponent={listEmpty}
+                ListFooterComponent={searchMoreRow}
               />
             </GestureDetector>
           </SwipeableScrollGateProvider>

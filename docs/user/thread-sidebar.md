@@ -231,7 +231,9 @@ messages**, and open at the matching message. Message search needs at least
 one word of three or more letters, or two for Chinese, Japanese, and Korean.
 On mobile, the thread list search also lists message matches and opens them at
 the matching message; on an iPad with a keyboard, `Cmd+K` opens the same
-palette.
+palette. The palette shows the best few message matches. The sidebar search on
+web and desktop and the thread list search on mobile list every match: when a
+long history holds more, **Search older messages** below the results loads them.
 
 Use **Settings → Keybindings** to find or customize shortcuts for searching files
 and copying a thread reference. A copied reference uses the thread's pull request

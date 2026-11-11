@@ -360,6 +360,35 @@ export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(pro
   );
 });
 
+/** Reads the next page of message matches for a search that has more. */
+export const ThreadSearchMoreRow = memo(function ThreadSearchMoreRow(props: {
+  readonly pane?: "screen" | "sidebar";
+  readonly loading: boolean;
+  readonly onPress: () => void;
+}) {
+  const label = props.loading ? "Searching older messages…" : "Search older messages";
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      disabled={props.loading}
+      onPress={props.onPress}
+      className="mx-4 mt-2 items-center rounded-lg border border-dashed border-border py-2.5"
+      style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
+    >
+      <Text
+        className={
+          props.pane === "sidebar"
+            ? "text-xs font-t3-medium text-drawer-foreground-muted"
+            : "text-xs font-t3-medium text-foreground-muted"
+        }
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+});
+
 const PENDING_TASK_MENU_ACTIONS: MenuAction[] = [
   { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
 ];

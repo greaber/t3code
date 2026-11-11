@@ -3270,6 +3270,19 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                       );
                     })}
                   </ul>
+                  {threadSearch.hasMore ? (
+                    <Button
+                      size="xs"
+                      variant="ghost-muted"
+                      className="mx-2 mt-1"
+                      disabled={threadSearch.isPending}
+                      onClick={threadSearch.loadMore}
+                    >
+                      {threadSearch.isPending
+                        ? "Searching older messages…"
+                        : "Search older messages"}
+                    </Button>
+                  ) : null}
                 </DndContext>
               </TooltipProvider>
             ) : (
