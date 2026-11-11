@@ -240,6 +240,9 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
       environmentId: profile.environmentId,
       label: profile.label,
       target: prepared.bootstrap.target,
+      ...(prepared.bootstrap.remoteServerKind === undefined
+        ? {}
+        : { remoteServerKind: prepared.bootstrap.remoteServerKind }),
     });
     if (
       pullRequestRoutingConnectionKey(entry) !==

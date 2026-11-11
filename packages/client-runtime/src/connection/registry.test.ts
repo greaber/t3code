@@ -136,6 +136,23 @@ const SSH_PROFILE = new SshConnectionProfile({
   target: SSH_TARGET,
 });
 
+const saveSshServerKind = (
+  harness: { readonly storedProfiles: Ref.Ref<Map<string, ConnectionProfile>> },
+  remoteServerKind: "external" | "managed",
+) =>
+  Ref.update(harness.storedProfiles, (current) =>
+    new Map(current).set(
+      SSH_CONNECTION.connectionId,
+      new SshConnectionProfile({
+        connectionId: SSH_PROFILE.connectionId,
+        environmentId: SSH_PROFILE.environmentId,
+        label: SSH_PROFILE.label,
+        target: SSH_PROFILE.target,
+        remoteServerKind,
+      }),
+    ),
+  );
+
 const CACHED_SNAPSHOT: OrchestrationV2ShellSnapshot = {
   ...v2ShellSnapshot,
   snapshotSequence: 1,
@@ -1217,7 +1234,7 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
-  it.effect("restarting an SSH server stops only that backend and keeps the environment on", () =>
+  it.effect("restarts only an SSH server this app started and keeps the environment on", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness([SSH_CONNECTION, RELAY_TARGET], [SSH_PROFILE]);
 
@@ -1230,6 +1247,15 @@ describe("EnvironmentRegistry", () => {
           (state) => state.phase === "connected",
         );
 
+        // Each connect saves the kind of server it reached.
+        yield* saveSshServerKind(harness, "external");
+        const external = yield* Effect.flip(
+          registry.restartSshServer(SSH_CONNECTION.environmentId),
+        );
+        expect(external._tag).toBe("ConnectionBlockedError");
+        expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([]);
+
+        yield* saveSshServerKind(harness, "managed");
         yield* registry.restartSshServer(SSH_CONNECTION.environmentId);
         expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([SSH_TARGET]);
         const entry = (yield* SubscriptionRef.get(registry.entries)).get(
@@ -1240,6 +1266,35 @@ describe("EnvironmentRegistry", () => {
         const relay = yield* Effect.flip(registry.restartSshServer(RELAY_TARGET.environmentId));
         expect(relay._tag).toBe("ConnectionBlockedError");
         expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([SSH_TARGET]);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
+  it.effect("shows the SSH server kind a connect saved", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([SSH_CONNECTION], [SSH_PROFILE]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          SSH_CONNECTION.environmentId,
+          (state) => state.phase === "connected",
+        );
+        yield* saveSshServerKind(harness, "managed");
+        yield* registry.setEnabled(SSH_CONNECTION.environmentId, false);
+        yield* registry.setEnabled(SSH_CONNECTION.environmentId, true);
+
+        const shown = yield* SubscriptionRef.changes(registry.entries).pipe(
+          Stream.map((entries) => {
+            const profile = Option.getOrNull(entries.get(SSH_CONNECTION.environmentId)!.profile);
+            return profile?._tag === "SshConnectionProfile" ? profile.remoteServerKind : undefined;
+          }),
+          Stream.filter((kind) => kind !== undefined),
+          Stream.runHead,
+        );
+        expect(Option.getOrNull(shown)).toBe("managed");
       }).pipe(Effect.provide(harness.layer));
     }),
   );

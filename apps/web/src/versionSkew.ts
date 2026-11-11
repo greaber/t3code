@@ -92,14 +92,21 @@ export function resolveServerSelfUpdateCapability(
   return serverConfig?.environment.capabilities.serverSelfUpdate ?? null;
 }
 
-/** The version a restart starts on a server this desktop app runs over SSH, which reports no
- * self-update of its own. A server the app did not start keeps its version. */
+/** Whether this desktop app started the environment's server over SSH and can restart it. */
+export function isAppStartedSshServer(entry: Pick<EnvironmentPresentation["entry"], "profile">) {
+  const profile = Option.getOrNull(entry.profile);
+  return (
+    isElectron && profile?._tag === "SshConnectionProfile" && profile.remoteServerKind === "managed"
+  );
+}
+
+/** The version a restart starts on a server this desktop app started over SSH, which reports no
+ * self-update of its own. Other servers keep their own update guidance. */
 export function sshRestartVersion(
   environment: Pick<EnvironmentPresentation, "entry" | "serverConfig">,
 ): string | null {
-  return isElectron &&
-    resolveServerSelfUpdateCapability(environment.serverConfig) === null &&
-    Option.getOrNull(environment.entry.profile)?._tag === "SshConnectionProfile"
+  return resolveServerSelfUpdateCapability(environment.serverConfig) === null &&
+    isAppStartedSshServer(environment.entry)
     ? APP_VERSION
     : null;
 }

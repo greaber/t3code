@@ -31,7 +31,7 @@ import { useServerConfigs } from "~/state/entities";
 import { useManagedPolicy } from "~/state/managedPolicy";
 import { environmentPresentations } from "~/state/presentation";
 import { ManagedControl } from "./ManagedPolicy";
-import { manualServerUpdateCommand, sshRestartVersion } from "~/versionSkew";
+import { isAppStartedSshServer, manualServerUpdateCommand, sshRestartVersion } from "~/versionSkew";
 import { crossesReleaseTrack } from "@t3tools/shared/cliRelease";
 import { Button } from "./ui/button";
 import { toastManager } from "./ui/toast";
@@ -440,8 +440,17 @@ export function OutdatedServerUpdateAction({
   readonly label?: string;
 }) {
   const update = useAtomCommand(updateOutdatedServer, { reportFailure: false });
+  const presentation = useAtomValue(environmentPresentations.presentationAtom(environmentId));
+  const restartsSshServer = presentation !== null && isAppStartedSshServer(presentation.entry);
   const handleUpdate = async () => {
     if (pendingUpdateEnvironmentIds.has(environmentId)) return;
+    if (restartsSshServer) {
+      const confirmed =
+        (await requestConfirmDialog(sshRestartConfirmation([{ serverLabel }]), {
+          initialFocus: "confirm",
+        })) ?? true;
+      if (!confirmed || pendingUpdateEnvironmentIds.has(environmentId)) return;
+    }
     pendingUpdateEnvironmentIds.add(environmentId);
     const result = await update({
       environmentId,

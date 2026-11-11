@@ -391,21 +391,29 @@ describe("SSH server restart update", () => {
     { restartedVersion: "0.0.30", updated: false },
   ] as const)("restarts and reports $restartedVersion", ({ restartedVersion, updated }) =>
     Effect.gen(function* () {
+      const ready = (serverVersion: string) =>
+        ({
+          version: 1,
+          sequence: 1,
+          type: "ready",
+          payload: { at: "2026-09-01T00:00:00.000Z", environment: { serverVersion } },
+        }) as Parameters<typeof matchesServerUpdateReadyEvent>[1];
+      // Each session replays its server's ready snapshot, as the lifecycle stream does.
+      const sessionOn = (serverVersion: string) =>
+        session({
+          [WS_METHODS.subscribeServerConfig]: () => Stream.never,
+          [WS_METHODS.subscribeServerLifecycle]: () =>
+            Stream.make(ready(serverVersion)).pipe(Stream.concat(Stream.never)),
+        } as unknown as WsRpcProtocolClient);
       const restarts = yield* Ref.make(0);
-      const readyEvents =
-        yield* Queue.unbounded<Parameters<typeof matchesServerUpdateReadyEvent>[1]>();
       const config = {
         ...CONFIG,
         environment: { ...CONFIG.environment, serverVersion: "0.0.30", capabilities: {} },
       } as ServerConfig;
-      const client = {
-        [WS_METHODS.subscribeServerConfig]: () => Stream.never,
-        [WS_METHODS.subscribeServerLifecycle]: () => Stream.fromQueue(readyEvents),
-      } as unknown as WsRpcProtocolClient;
       const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
         target: TARGET,
         state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
-        session: yield* SubscriptionRef.make(Option.some(session(client))),
+        session: yield* SubscriptionRef.make(Option.some(sessionOn("0.0.30"))),
         prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
         connect: Effect.void,
         disconnect: Effect.void,
@@ -419,18 +427,11 @@ describe("SSH server restart update", () => {
         followStream: runStream,
         stateChanges: () => Stream.never,
         retryNow: () => Effect.void,
+        // The old server is gone once this returns; the reconnect reaches the restarted one.
         restartSshServer: () =>
           Ref.update(restarts, (count) => count + 1).pipe(
             Effect.andThen(
-              Queue.offer(readyEvents, {
-                version: 1,
-                sequence: 1,
-                type: "ready",
-                payload: {
-                  at: "2026-09-01T00:00:00.000Z",
-                  environment: { serverVersion: restartedVersion },
-                },
-              } as Parameters<typeof matchesServerUpdateReadyEvent>[1]),
+              SubscriptionRef.set(supervisor.session, Option.some(sessionOn(restartedVersion))),
             ),
           ),
       } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
