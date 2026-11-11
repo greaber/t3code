@@ -57,7 +57,7 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as DueHint from "../scheduling/DueHint.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
-import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
+import { isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
 import {
   redactHeaders,
   redactQuery,
@@ -1111,29 +1111,6 @@ export const layer = Layer.effect(
       );
     });
 
-    const rescheduleMissedRun = Effect.fn("ScheduledTaskService.rescheduleMissedRun")(function* (
-      task: ScheduledTask,
-      now: DateTime.DateTime,
-    ) {
-      const next = nextRunAt(task, now);
-      yield* Effect.logInfo("Skipping missed schedule task run", {
-        taskId: task.id,
-        missedRunAt: task.nextRunAt,
-        rescheduledTo: next,
-      });
-      yield* sql`
-        UPDATE scheduled_tasks
-        SET next_run_at = ${next},
-            updated_at = ${iso(now)}
-        WHERE task_id = ${task.id}
-      `.pipe(
-        Effect.mapError((cause) =>
-          taskError("Could not reschedule missed schedule task run.", { taskId: task.id, cause }),
-        ),
-      );
-      yield* notifyChanged;
-    });
-
     const runDueTasks = Effect.fn("ScheduledTaskService.runDueTasks")(function* () {
       const now = yield* localNow;
       const nowMs = DateTime.toEpochMillis(now);
@@ -1161,17 +1138,11 @@ export const layer = Layer.effect(
       const tasks = yield* listDueTasks(now).pipe(
         Effect.mapError((cause) => taskError("Could not list schedule tasks.", { cause })),
       );
-      const due = tasks.flatMap((task) =>
-        task.nextRunAt === null ? [] : [{ task, dueAt: DateTime.makeUnsafe(task.nextRunAt) }],
-      );
+      // A run missed while the server was down runs once; completion schedules the next future one.
       yield* Effect.forEach(
-        due,
-        ({ task, dueAt }) =>
-          Effect.suspend(() =>
-            isMissedFixedTimeRun(task.schedule, dueAt, now)
-              ? rescheduleMissedRun(task, now)
-              : runTask(task, "scheduled"),
-          ).pipe(
+        tasks,
+        (task) =>
+          runTask(task, "scheduled").pipe(
             Effect.catch((cause) =>
               Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
             ),
