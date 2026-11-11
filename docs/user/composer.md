@@ -193,8 +193,8 @@ With an empty composer, the same shortcut restores a single stash or opens the
 stash menu when there are several.
 
 Stashes containing uploaded files must be restored in their original environment.
-Those files are retained for 24 hours. After an upload expires, restore the prompt
-and use **Attach again** or remove the missing file before sending.
+Those files are kept until 30 days pass without the stash or a draft using them. After an upload
+expires, restore the prompt and use **Attach again** or remove the missing file before sending.
 
 ## Voice input on web and desktop
 

@@ -123,22 +123,32 @@ describe("attachmentStore", () => {
     }
   });
 
-  it("removes expired pending and partial files without touching thread attachments", () => {
+  it("removes pending files untouched for 30 days and stale partials, keeping recent drafts", () => {
     const attachmentsDir = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3code-attachment-sweep-"),
     );
     try {
       const now = 1_800_000_000_000;
-      const oldTimeSeconds = (now - 2 * 24 * 60 * 60 * 1000) / 1000;
+      const daysAgoSeconds = (days: number) => (now - days * 24 * 60 * 60 * 1000) / 1000;
       const uuid = "00000000-0000-4000-8000-000000000002";
+      const draftUuid = "00000000-0000-4000-8000-000000000003";
       const pendingPath = NodePath.join(attachmentsDir, `pending-${uuid}.png`);
       const pendingFilePath = NodePath.join(attachmentsDir, `pending-${uuid}-pdf.pdf`);
       const sidecarPath = `${pendingFilePath}.txt`;
       const threadPath = NodePath.join(attachmentsDir, `thread-1-${uuid}.png`);
       const partialPath = NodePath.join(attachmentsDir, `${uuid}.part`);
-      for (const filePath of [pendingPath, pendingFilePath, sidecarPath, threadPath, partialPath]) {
+      // A draft's upload a few days old must survive; drafts live only on clients.
+      const draftPath = NodePath.join(attachmentsDir, `pending-${draftUuid}-pdf.pdf`);
+      for (const [filePath, days] of [
+        [pendingPath, 31],
+        [pendingFilePath, 31],
+        [sidecarPath, 31],
+        [threadPath, 31],
+        [partialPath, 2],
+        [draftPath, 2],
+      ] as const) {
         NodeFS.writeFileSync(filePath, Buffer.from("pixels"));
-        NodeFS.utimesSync(filePath, oldTimeSeconds, oldTimeSeconds);
+        NodeFS.utimesSync(filePath, daysAgoSeconds(days), daysAgoSeconds(days));
       }
 
       expect(sweepStalePendingAttachments({ attachmentsDir, nowMs: now })).toEqual({ deleted: 4 });
@@ -147,6 +157,7 @@ describe("attachmentStore", () => {
       expect(NodeFS.existsSync(sidecarPath)).toBe(false);
       expect(NodeFS.existsSync(partialPath)).toBe(false);
       expect(NodeFS.existsSync(threadPath)).toBe(true);
+      expect(NodeFS.existsSync(draftPath)).toBe(true);
     } finally {
       NodeFS.rmSync(attachmentsDir, { recursive: true, force: true });
     }

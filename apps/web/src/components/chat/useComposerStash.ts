@@ -399,7 +399,7 @@ export function useComposerStash(input: {
     }
     if (expiredFileNames.length > 0) {
       missingImageReasons.push(
-        `${expiredFileNames.join(", ")}: stashed files are kept for 24 hours and this upload expired. Attach the file again.`,
+        `${expiredFileNames.join(", ")}: stashed files are kept for 30 days and this upload expired. Attach the file again.`,
       );
     }
     if (missingImageReasons.length > 0) {
