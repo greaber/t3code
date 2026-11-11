@@ -285,6 +285,34 @@ describe("GhosttyTerminalSurface visibility", () => {
     expect(surface.hasSelection()).toBe(false);
   });
 
+  it("keeps the rows being read in place across older output, asking once per edge", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux x86_64" });
+    const harness = createHarness();
+    const onScrollbackStart = vi.fn();
+    const surface = await harness.create({ beforeKey: () => true, onScrollbackStart });
+    const scrollbar = () =>
+      (surface as unknown as { core: GhosttyTerminalCore }).core.scrollbarState()!;
+    const lines = (from: number, count: number) =>
+      Array.from({ length: count }, (_, index) => `line ${from + index}\r\n`).join("");
+    surface.resetAndWrite(lines(100, 60));
+    const jumpToStart = () => key(surface, "Home", "Home", { ctrlKey: true, shiftKey: true });
+
+    jumpToStart();
+    jumpToStart();
+    expect(onScrollbackStart).toHaveBeenCalledTimes(1);
+    // A page that adds no rows leaves the view at the top without asking again.
+    surface.resetAndWriteAnchored(lines(100, 60), { split: 0, keep: "start" });
+    jumpToStart();
+    expect(onScrollbackStart).toHaveBeenCalledTimes(1);
+
+    const older = lines(50, 50);
+    surface.resetAndWriteAnchored(older + lines(100, 60), { split: older.length, keep: "start" });
+    // The first row shown is still the one the user was reading.
+    expect(scrollbar().offset).toBe(50);
+    jumpToStart();
+    expect(onScrollbackStart).toHaveBeenCalledTimes(2);
+  });
+
   it("leaves modified history keys with alternate-screen applications", async () => {
     vi.stubGlobal("navigator", { platform: "Linux x86_64" });
     const harness = createHarness();

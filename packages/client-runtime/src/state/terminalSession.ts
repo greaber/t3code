@@ -9,14 +9,17 @@ import type {
 } from "@t3tools/contracts";
 import { DEFAULT_MAX_TERMINAL_BUFFER_BYTES } from "@t3tools/contracts";
 import {
+  appendNewerOutput,
   appendOutput,
   EMPTY_TERMINAL_OUTPUT_STATE,
   prependOutput,
   resetOutput,
+  showLatestOutput,
   type TerminalOutputState,
 } from "./terminalOutput.ts";
 
 export {
+  canLoadNewerTerminalOutput,
   canLoadOlderTerminalOutput,
   INITIAL_TERMINAL_OUTPUT_CURSOR,
   readTerminalOutputUpdate,
@@ -120,9 +123,13 @@ function terminalBufferStateFromSnapshot(
       current.output,
       snapshot.history,
       maxBufferBytes,
-      snapshot.historyOffset === undefined
+      snapshot.historyOffset === undefined || snapshot.historyEnd === undefined
         ? undefined
-        : { offset: snapshot.historyOffset, older: snapshot.olderHistory ?? false },
+        : {
+            offset: snapshot.historyOffset,
+            end: snapshot.historyEnd,
+            older: snapshot.olderHistory ?? false,
+          },
     ),
     grid: nextGrid(current.grid, snapshot),
     status: snapshot.status,
@@ -166,20 +173,29 @@ export function combineTerminalSessionState(
   };
 }
 
-/** A page of older output the client asked for, applied in order with the stream's events. */
-export interface TerminalOlderHistoryEvent {
-  readonly type: "olderHistory";
+/** A page of output the client asked for, applied in order with the stream's events. */
+export interface TerminalHistoryPageEvent {
+  /** Older output before what is held, newer output after it, or the newest output. */
+  readonly type: "olderHistory" | "newerHistory" | "latestHistory";
   readonly page: TerminalHistoryPage;
 }
 
 export function applyTerminalAttachStreamEvent(
   current: TerminalBufferState,
-  event: TerminalAttachStreamEvent | TerminalOlderHistoryEvent,
+  event: TerminalAttachStreamEvent | TerminalHistoryPageEvent,
   maxBufferBytes = DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
 ): TerminalBufferState {
   switch (event.type) {
-    case "olderHistory": {
-      const output = prependOutput(current.output, event.page, maxBufferBytes);
+    case "olderHistory":
+    case "newerHistory":
+    case "latestHistory": {
+      const apply =
+        event.type === "olderHistory"
+          ? prependOutput
+          : event.type === "newerHistory"
+            ? appendNewerOutput
+            : showLatestOutput;
+      const output = apply(current.output, event.page, maxBufferBytes);
       return output === current.output
         ? current
         : { ...current, output, version: current.version + 1 };
@@ -207,7 +223,7 @@ export function applyTerminalAttachStreamEvent(
     case "output":
       return {
         ...current,
-        output: appendOutput(current.output, event.data, maxBufferBytes),
+        output: appendOutput(current.output, event.data, maxBufferBytes, event.historyEnd),
         status: current.status === "closed" ? "running" : current.status,
         error: null,
         version: current.version + 1,

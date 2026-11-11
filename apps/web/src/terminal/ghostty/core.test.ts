@@ -320,7 +320,8 @@ describe("GhosttyTerminalCore snapshots", () => {
     const initial = readTerminalOutputUpdate(state.output, INITIAL_TERMINAL_OUTPUT_CURSOR);
     writeTerminalOutputUpdate(core, initial);
     const reset = vi.spyOn(core, "resetAndWrite");
-    const data = "line\r\n".repeat(8192);
+    // Long lines, so the byte budget binds before the line budget.
+    const data = `${"line".repeat(100)}\r\n`.repeat(128);
     const appends = Math.ceil((1.5 * DEFAULT_MAX_TERMINAL_BUFFER_BYTES) / data.length);
     for (let index = 0; index < appends; index += 1) state = append(state, data);
 

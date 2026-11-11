@@ -4,7 +4,7 @@ import Foundation
 final class TerminalOutputBuffer {
   private var storage = Data()
   private var retainedStart = 0
-  private let limit = 8 * 1024 * 1024
+  private let limit = 4 * 1024 * 1024
 
   var data: Data { storage.subdata(in: retainedStart..<storage.count) }
 

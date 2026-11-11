@@ -33,7 +33,7 @@ import {
 } from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
 import * as Schema from "effect/Schema";
-import { AsyncResult } from "effect/reactivity";
+import { AsyncResult, Atom } from "effect/reactivity";
 import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -162,11 +162,11 @@ function writeSystemMessage(
 
 export function writeTerminalOutputUpdate(
   terminal: Pick<GhosttyTerminalSurface, "resetAndWrite" | "write"> &
-    Partial<Pick<GhosttyTerminalSurface, "prependAndWrite">>,
+    Partial<Pick<GhosttyTerminalSurface, "resetAndWriteAnchored">>,
   update: TerminalOutputUpdate,
 ): void {
-  if (update.type === "reset" && update.prepended && terminal.prependAndWrite) {
-    terminal.prependAndWrite(update.data);
+  if (update.type === "reset" && update.anchor !== null && terminal.resetAndWriteAnchored) {
+    terminal.resetAndWriteAnchored(update.data, update.anchor);
   } else if (update.type === "reset") {
     terminal.resetAndWrite(update.data);
   } else if (update.type === "append") {
@@ -182,7 +182,7 @@ export function synchronizeTerminalOutput(
     GhosttyTerminalSurface,
     "resetAndWrite" | "write" | "getSelection" | "getSelectionCellCount" | "clearSelection"
   > &
-    Partial<Pick<GhosttyTerminalSurface, "prependAndWrite">>,
+    Partial<Pick<GhosttyTerminalSurface, "resetAndWriteAnchored">>,
   session: Pick<TerminalSessionState, "output" | "version">,
   cursor: TerminalOutputCursor,
 ): TerminalOutputCursor {
@@ -628,6 +628,11 @@ function TerminalSessionViewport({
   // Attaching starts with the viewport, while the WASM surface is still loading;
   // the surface reads the session itself, so output chunks never re-render here.
   useAtomMount(terminalSessionAtom);
+  // Only whether the view shows older output re-renders; output chunks never do.
+  const detachedAtom = Atom.make((get) => get(terminalSessionAtom).output.detached !== null).pipe(
+    Atom.withLabel("web-terminal-session:detached"),
+  );
+  const viewingOlderOutput = useAtomValue(detachedAtom);
   const readTerminalSession = useEffectEvent(() => appAtomRegistry.get(terminalSessionAtom));
   const subscribeTerminalSession = useEffectEvent(
     (listener: (session: TerminalSessionState) => void) =>
@@ -635,6 +640,20 @@ function TerminalSessionViewport({
   );
   const loadOlderOutput = useEffectEvent(() => {
     void terminalEnvironment.loadOlderOutput(
+      appAtomRegistry,
+      { environmentId, threadId, terminalId },
+      readTerminalSession().output,
+    );
+  });
+  const loadNewerOutput = useEffectEvent(() => {
+    void terminalEnvironment.loadNewerOutput(
+      appAtomRegistry,
+      { environmentId, threadId, terminalId },
+      readTerminalSession().output,
+    );
+  });
+  const showLatestOutput = useEffectEvent(() => {
+    void terminalEnvironment.showLatestOutput(
       appAtomRegistry,
       { environmentId, threadId, terminalId },
       readTerminalSession().output,
@@ -743,6 +762,7 @@ function TerminalSessionViewport({
         validateLink: (text) => validateTerminalLink(text),
         onLinkHover: (text) => setLinkPath(text !== null && !isTerminalUrl(text) ? text : null),
         onScrollbackStart: () => loadOlderOutput(),
+        onScrollbackEnd: () => loadNewerOutput(),
         // Surface listeners start before WASM loading finishes and the terminal handler exists.
         onContextMenu: (event) => {
           if (terminalRef.current) void showTerminalContextMenu(event);
@@ -953,7 +973,8 @@ function TerminalSessionViewport({
             focusIfCurrent(requestId);
             return;
           case "scroll-to-bottom":
-            terminalRef.current?.scrollToBottom();
+            if (readTerminalSession().output.detached !== null) showLatestOutput();
+            else terminalRef.current?.scrollToBottom();
             focusIfCurrent(requestId);
             return;
         }
@@ -1226,11 +1247,20 @@ function TerminalSessionViewport({
     };
   };
   return (
-    <div
-      ref={attachContainer}
-      tabIndex={-1}
-      className="relative h-full w-full overflow-hidden bg-(--terminal-background)"
-    />
+    <div className="relative h-full w-full">
+      <div
+        ref={attachContainer}
+        tabIndex={-1}
+        className="relative h-full w-full overflow-hidden bg-(--terminal-background)"
+      />
+      {viewingOlderOutput ? (
+        <div className="absolute right-4 bottom-2 z-10">
+          <Button size="xs" variant="outline" onClick={showLatestOutput}>
+            Showing earlier output · Jump to latest
+          </Button>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

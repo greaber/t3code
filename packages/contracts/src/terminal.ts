@@ -3,9 +3,13 @@ import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const DEFAULT_TERMINAL_ID = "term-1";
-/** How much output a client keeps per terminal, including older pages it loaded. */
-export const DEFAULT_MAX_TERMINAL_BUFFER_BYTES = 8 * 1024 * 1024;
-/** The newest output an attach sends, and the size of each older page after it. */
+/** How much output a client holds per terminal; older or newer output is paged in. */
+export const DEFAULT_MAX_TERMINAL_BUFFER_BYTES = 4 * 1024 * 1024;
+/** Line breaks a client holds per terminal, so its rows stay within the view's scrollback. */
+export const MAX_TERMINAL_BUFFER_LINES = 25_000;
+/** Rows a terminal view keeps, above what the buffer's lines need for wrapped lines. */
+export const TERMINAL_VIEW_SCROLLBACK_ROWS = 60_000;
+/** The newest output an attach sends, and the size of each page after it. */
 export const TERMINAL_HISTORY_PAGE_BYTES = 512 * 1024;
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
@@ -72,18 +76,28 @@ export const TerminalWriteInput = Schema.Struct({
 });
 export type TerminalWriteInput = Schema.Codec.Encoded<typeof TerminalWriteInput>;
 
-/** Output the server keeps from before `before`, an offset from a snapshot or earlier page. */
+const HistoryOffsetSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+
+/**
+ * A page of the output the server keeps. Offsets count UTF-8 bytes of the terminal's
+ * history. `before` reads the page ending there, `after` the one starting there, and
+ * neither the newest page.
+ */
 export const TerminalHistoryInput = Schema.Struct({
   ...TerminalSessionInput.fields,
-  before: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  before: Schema.optional(HistoryOffsetSchema),
+  after: Schema.optional(HistoryOffsetSchema),
 });
 export type TerminalHistoryInput = Schema.Codec.Encoded<typeof TerminalHistoryInput>;
 
 export const TerminalHistoryPage = Schema.Struct({
   data: Schema.String,
-  /** Where `data` starts; pass it as `before` for the page before this one. */
-  offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** Where `data` starts and ends. */
+  offset: HistoryOffsetSchema,
+  end: HistoryOffsetSchema,
   olderHistory: Schema.Boolean,
+  /** The server held more output after `end` when it read the page. */
+  newerHistory: Schema.Boolean,
 });
 export type TerminalHistoryPage = typeof TerminalHistoryPage.Type;
 
@@ -116,8 +130,9 @@ export const TerminalSessionSnapshot = Schema.Struct({
   pid: Schema.NullOr(Schema.Int.check(Schema.isGreaterThan(0))),
   /** The newest output; `olderHistory` says the server keeps more before it. */
   history: Schema.String,
-  /** Where `history` starts, for `terminal.history`. Absent from older servers. */
-  historyOffset: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  /** Where `history` starts and ends, for `terminal.history`. Absent from older servers. */
+  historyOffset: Schema.optional(HistoryOffsetSchema),
+  historyEnd: Schema.optional(HistoryOffsetSchema),
   olderHistory: Schema.optional(Schema.Boolean),
   exitCode: Schema.NullOr(Schema.Int),
   exitSignal: Schema.NullOr(Schema.Int),
@@ -184,6 +199,8 @@ const TerminalOutputEvent = Schema.Struct({
   ...TerminalEventBaseSchema.fields,
   type: Schema.Literal("output"),
   data: Schema.String,
+  /** Where the server's history ends after this output. Absent from older servers. */
+  historyEnd: Schema.optional(HistoryOffsetSchema),
 });
 
 const TerminalExitedEvent = Schema.Struct({

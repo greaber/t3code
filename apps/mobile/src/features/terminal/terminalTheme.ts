@@ -120,8 +120,8 @@ export function buildGhosttyThemeConfig(theme: TerminalTheme): string {
     `foreground = ${theme.foreground}`,
     `cursor-color = ${theme.cursorForeground}`,
     `cursor-text = ${theme.cursorBackground}`,
-    // Bytes of scrollback, about 100,000 rows as on web and Android; the default holds 10 MB.
-    "scrollback-limit = 100000000",
+    // Bytes of scrollback, about TERMINAL_VIEW_SCROLLBACK_ROWS rows; the default holds 10 MB.
+    "scrollback-limit = 60000000",
   ];
 
   for (const [index, color] of theme.palette.entries()) {

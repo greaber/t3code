@@ -237,6 +237,8 @@ interface CreateManagerOptions {
   >[0]["registerTerminalProcesses"];
   maxRetainedInactiveSessions?: number;
   historyByteLimit?: number;
+  historyMemoryBytes?: number;
+  historyCompactionBytes?: number;
   ptyAdapter?: FakePtyAdapter;
   resolveProviderInstanceEnvironment?: Parameters<
     typeof TerminalManager.makeWithOptions
@@ -274,6 +276,12 @@ const createManager = (
         ptyAdapter,
         ...(options.historyByteLimit !== undefined
           ? { historyByteLimit: options.historyByteLimit }
+          : {}),
+        ...(options.historyMemoryBytes !== undefined
+          ? { historyMemoryBytes: options.historyMemoryBytes }
+          : {}),
+        ...(options.historyCompactionBytes !== undefined
+          ? { historyCompactionBytes: options.historyCompactionBytes }
           : {}),
         ...(options.shellResolver !== undefined ? { shellResolver: options.shellResolver } : {}),
         ...(options.env !== undefined ? { env: options.env } : {}),
@@ -383,8 +391,8 @@ it("preserves line and byte limits across arbitrary chunks, Unicode, ANSI sequen
         history.append(chunk);
         expected = retainedHistory(expected + chunk, maxLines, maxBytes);
         expect(history.value()).toBe(expected);
-        expect(history.textFrom(history.startOffset)).toBe(expected);
-        expect(history.endOffset - history.startOffset).toBe(expected.length);
+        expect(history.memoryText(history.startOffset)).toBe(expected);
+        expect(history.endOffset - history.startOffset).toBe(Buffer.byteLength(expected));
       }
     }
   }
@@ -406,82 +414,6 @@ it("bounds long partial lines and joins surrogate pairs across chunk boundaries"
     expect(history.value()).toBe(expected);
     expect(Buffer.byteLength(history.value())).toBeLessThanOrEqual(maxBytes);
   }
-});
-
-it("pages retained output back to its start without gaps or oversized pages", () => {
-  const history = new TerminalManager.BoundedTerminalHistory(40, "", 2_000);
-  for (let line = 0; line < 100; line += 1)
-    history.append(`line ${line} 名🚀 ${"x".repeat(line % 70)}\n`);
-  const latest = history.endOffset;
-  history.append("prompt$ ");
-
-  const pages: string[] = [];
-  let before = latest;
-  for (;;) {
-    const page = history.pageBefore(before, 300);
-    expect(Buffer.byteLength(page.data)).toBeLessThanOrEqual(300);
-    expect(page.offset + page.data.length).toBe(before);
-    // Pages after the first start at a line.
-    if (page.older) expect(history.textFrom(page.offset - 1)?.[0]).toBe("\n");
-    pages.unshift(page.data);
-    before = page.offset;
-    if (!page.older) break;
-  }
-  expect(before).toBe(history.startOffset);
-  expect(pages.join("") + "prompt$ ").toBe(history.value());
-
-  // Offsets keep naming the same text after newer output trims older lines.
-  const kept = history.textFrom(latest);
-  history.append("more\n".repeat(30));
-  expect(history.textFrom(latest)).toBe(kept + "more\n".repeat(30));
-  expect(history.pageBefore(history.startOffset - 1, 300)).toEqual({
-    data: "",
-    offset: history.startOffset,
-    older: false,
-  });
-  history.clear();
-  expect(history.pageBefore(latest, 300).older).toBe(false);
-});
-
-it("appends history files and rewrites them only when cleared or mostly trimmed", () => {
-  const history = new TerminalManager.BoundedTerminalHistory(3, "", 1_000);
-  let file = "";
-  const persist = () => {
-    const write = TerminalManager.planHistoryFileWrite(history, 64);
-    file = write.append ? file + write.text : write.text;
-    history.persisted = write.persisted;
-    expect(Buffer.byteLength(file)).toBe(write.persisted.fileBytes);
-    // Loading keeps the file's newest lines, which are exactly the history.
-    if (!history.endsInHighSurrogate) {
-      expect(new TerminalManager.BoundedTerminalHistory(3, file, 1_000).value()).toBe(
-        history.value(),
-      );
-    }
-    return write.append;
-  };
-
-  history.append("one\ntwo\n");
-  expect(persist()).toBe(false);
-  history.append("three\nfour\n");
-  expect(persist()).toBe(true);
-  expect(file).toBe("one\ntwo\nthree\nfour\n");
-  history.append("x".repeat(80) + "\n");
-  expect(persist()).toBe(true);
-  history.append("a\nb\nc\n");
-  // The trimmed prefix outgrew both the retained text and the minimum.
-  expect(persist()).toBe(false);
-  expect(file).toBe(history.value());
-
-  // A split surrogate waits for its pair instead of being written as U+FFFD.
-  history.append("\ud83d");
-  expect(persist()).toBe(true);
-  history.append("\ude80\n");
-  expect(persist()).toBe(true);
-  expect(file.endsWith("🚀\n")).toBe(true);
-
-  history.clear();
-  expect(persist()).toBe(false);
-  expect(file).toBe("");
 });
 
 it.layer(
@@ -1095,33 +1027,71 @@ it.layer(
     }),
   );
 
-  it.effect("attaches with the newest output and pages older output contiguously", () =>
+  it.effect("pages any part of history, from memory or its file, in both directions", () =>
     Effect.gen(function* () {
+      // Memory keeps about 1 MiB; the rest is read back from the file after a reopen.
       const { manager, ptyAdapter } = yield* createManager(1_000_000, {
         historyByteLimit: 64 * 1024 * 1024,
+        historyMemoryBytes: 1,
       });
       yield* manager.open(openInput());
-      const lines = Array.from({ length: 40_000 }, (_, index) => `output line ${index}\n`);
+      const lines = Array.from({ length: 120_000 }, (_, index) => `output line ${index} ✓\n`);
       for (let index = 0; index < lines.length; index += 1_000) {
         ptyAdapter.processes[0]!.emitData(lines.slice(index, index + 1_000).join(""));
       }
+      yield* manager.close({ threadId: "thread-1" });
       const attached = yield* manager.open(openInput());
       expect(attached.olderHistory).toBe(true);
-      expect(attached.history.endsWith(lines.at(-1)!)).toBe(true);
+      const all = lines.join("");
+      const target = { threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID };
 
       let text = attached.history;
       let before = attached.historyOffset!;
       for (let older = true; older;) {
-        const page = yield* manager.historyPage({
-          threadId: "thread-1",
-          terminalId: DEFAULT_TERMINAL_ID,
-          before,
-        });
+        const page = yield* manager.historyPage({ ...target, before });
+        expect(page.end).toBe(before);
+        expect(Buffer.byteLength(page.data)).toBeLessThanOrEqual(512 * 1024);
         text = page.data + text;
         before = page.offset;
         older = page.olderHistory;
       }
-      expect(text).toBe(lines.join(""));
+      expect(before).toBe(0);
+      expect(text.startsWith(all)).toBe(true);
+
+      let forward = "";
+      let after = 0;
+      for (let newer = true; newer;) {
+        const page = yield* manager.historyPage({ ...target, after });
+        expect(page.offset).toBe(after);
+        forward += page.data;
+        after = page.end;
+        newer = page.newerHistory;
+      }
+      expect(forward).toBe(text);
+    }),
+  );
+
+  it.effect("replaces a mostly trimmed history file by renaming a complete copy", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { manager, ptyAdapter, logsDir } = yield* createManager(1_000, {
+        historyByteLimit: 100,
+        historyCompactionBytes: 1,
+      });
+      yield* manager.open(openInput());
+      ptyAdapter.processes[0]!.emitData("first\n");
+      yield* manager.close({ threadId: "thread-1" });
+      const filePath = yield* historyLogPath(logsDir);
+      const before = yield* fs.stat(filePath);
+      yield* manager.open(openInput());
+      ptyAdapter.processes[1]!.emitData("x".repeat(60) + "\n" + "y".repeat(60) + "\n");
+      yield* manager.close({ threadId: "thread-1" });
+      // A rewrite in place would keep the file and could leave it half written.
+      expect((yield* fs.stat(filePath)).ino).not.toBe(before.ino);
+      expect(yield* readFileString(filePath)).toBe(
+        ("x".repeat(60) + "\n" + "y".repeat(60) + "\n").slice(-100),
+      );
+      expect(yield* fs.readDirectory(logsDir)).toHaveLength(1);
     }),
   );
 
@@ -1596,23 +1566,19 @@ it.layer(
   it.effect("retains encoded history if migration cannot write the bounded file", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
-      let failNextWrite = true;
+      let failNextRename = true;
       const limited = FileSystem.FileSystem.of({
         ...fs,
-        writeFileString: (filePath, data, options) => {
-          if (!failNextWrite) return fs.writeFileString(filePath, data, options);
-          failNextWrite = false;
-          return fs.writeFileString(filePath, "partial").pipe(
-            Effect.andThen(
-              Effect.fail(
-                PlatformError.systemError({
-                  _tag: "Unknown",
-                  module: "FileSystem",
-                  method: "writeFileString",
-                  cause: { code: "ENOSPC" },
-                }),
-              ),
-            ),
+        rename: (from, to) => {
+          if (!failNextRename) return fs.rename(from, to);
+          failNextRename = false;
+          return Effect.fail(
+            PlatformError.systemError({
+              _tag: "Unknown",
+              module: "FileSystem",
+              method: "rename",
+              cause: { code: "ENOSPC" },
+            }),
           );
         },
       });

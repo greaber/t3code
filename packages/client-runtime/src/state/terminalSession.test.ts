@@ -5,6 +5,7 @@ import { EnvironmentId, TerminalSessionSnapshot, ThreadId } from "@t3tools/contr
 import {
   applyTerminalAttachStreamEvent,
   applyTerminalMetadataStreamEvent,
+  canLoadNewerTerminalOutput,
   canLoadOlderTerminalOutput,
   combineTerminalSessionState,
   EMPTY_TERMINAL_BUFFER_STATE,
@@ -276,64 +277,77 @@ describe("terminal session reducers", () => {
     expect(state.lifecycleVersion).toBe(2);
   });
 
-  it("prepends older pages contiguously and stops at the buffer or the server's start", () => {
-    const output = (data: string) =>
-      ({ type: "output", threadId: TARGET.threadId, terminalId: TARGET.terminalId, data }) as const;
-    let state = applyTerminalAttachStreamEvent(
-      EMPTY_TERMINAL_BUFFER_STATE,
-      {
-        type: "snapshot",
-        snapshot: { ...BASE_SNAPSHOT, history: "c\nd\n", historyOffset: 4, olderHistory: true },
+  it("slides its window through server history and back to the live output", () => {
+    const output = (data: string, historyEnd: number) =>
+      ({
+        type: "output",
+        threadId: TARGET.threadId,
+        terminalId: TARGET.terminalId,
+        data,
+        historyEnd,
+      }) as const;
+    const page = (data: string, offset: number, end: number, more = true) => ({
+      data,
+      offset,
+      end,
+      olderHistory: offset > 0,
+      newerHistory: more,
+    });
+    const budget = 8;
+    const apply = (
+      state: typeof EMPTY_TERMINAL_BUFFER_STATE,
+      event: Parameters<typeof applyTerminalAttachStreamEvent>[1],
+    ) => applyTerminalAttachStreamEvent(state, event, budget);
+    let state = apply(EMPTY_TERMINAL_BUFFER_STATE, {
+      type: "snapshot",
+      snapshot: {
+        ...BASE_SNAPSHOT,
+        history: "c\nd\n",
+        historyOffset: 4,
+        historyEnd: 8,
+        olderHistory: true,
       },
-      12,
-    );
+    });
+    state = apply(state, output("$ ", 10));
     let cursor = readTerminalOutputUpdate(state.output, INITIAL_TERMINAL_OUTPUT_CURSOR).cursor;
-    state = applyTerminalAttachStreamEvent(state, output("$ "), 12);
-    expect(state.output.historyOffset).toBe(4);
-    cursor = readTerminalOutputUpdate(state.output, cursor).cursor;
+    expect(canLoadOlderTerminalOutput(state.output)).toBe(true);
 
-    // A page that does not end where the retained history starts is stale.
-    const stale = { type: "olderHistory", page: { data: "x\n", offset: 1, olderHistory: true } };
-    expect(applyTerminalAttachStreamEvent(state, stale as never, 12)).toBe(state);
+    // A page that does not end where the held output starts is stale.
+    expect(apply(state, { type: "olderHistory", page: page("x\n", 1, 3) })).toBe(state);
 
-    state = applyTerminalAttachStreamEvent(
-      state,
-      { type: "olderHistory", page: { data: "b\n", offset: 2, olderHistory: true } },
-      12,
-    );
-    expect(terminalOutputText(state.output)).toBe("b\nc\nd\n$ ");
+    // Older output past the budget pushes out the newest, and the window detaches.
+    state = apply(state, { type: "olderHistory", page: page("a\nb\n", 0, 4) });
+    expect(terminalOutputText(state.output)).toBe("a\nb\nc\nd\n");
+    expect(state.output.detached).toMatchObject({ end: 8, bufferedFrom: 10 });
+    expect(canLoadOlderTerminalOutput(state.output)).toBe(false);
+    expect(canLoadNewerTerminalOutput(state.output)).toBe(true);
+    const prepended = readTerminalOutputUpdate(state.output, cursor);
+    expect(prepended).toMatchObject({ type: "reset", anchor: { split: 4, keep: "start" } });
+    cursor = prepended.cursor;
+
+    // Live output waits aside while the window shows older output.
+    state = apply(state, output("x\n", 12));
+    expect(readTerminalOutputUpdate(state.output, cursor).type).toBe("none");
+
+    // A newer page reaching the server's end drops the oldest output and follows live again.
+    state = apply(state, { type: "newerHistory", page: page("$ x\n", 8, 12, false) });
+    expect(terminalOutputText(state.output)).toBe("c\nd\n$ x\n");
+    expect(state.output).toMatchObject({ detached: null, historyOffset: 4, olderHistory: true });
     expect(readTerminalOutputUpdate(state.output, cursor)).toMatchObject({
       type: "reset",
-      data: "b\nc\nd\n$ ",
-      prepended: true,
+      anchor: { split: 4, keep: "end" },
     });
-    expect(canLoadOlderTerminalOutput(state.output, 12)).toBe(true);
+    state = apply(state, output("y\n", 14));
+    expect(terminalOutputText(state.output)).toBe("d\n$ x\ny\n");
+    expect(state.output.historyOffset).toBe(6);
 
-    state = applyTerminalAttachStreamEvent(
-      state,
-      { type: "olderHistory", page: { data: "a\n", offset: 0, olderHistory: false } },
-      12,
-    );
-    expect(terminalOutputText(state.output)).toBe("a\nb\nc\nd\n$ ");
-    expect(canLoadOlderTerminalOutput(state.output, 12)).toBe(false);
-
-    // Live output that pushes out every server character ends paging: it is not server text.
-    state = applyTerminalAttachStreamEvent(state, output("0123456789X"), 12);
-    expect(state.output.historyOffset).toBeNull();
-    expect(canLoadOlderTerminalOutput(state.output, 12)).toBe(false);
-
-    // Trimming part of the server history moves the anchor and leaves older output loadable.
-    state = applyTerminalAttachStreamEvent(
-      EMPTY_TERMINAL_BUFFER_STATE,
-      {
-        type: "snapshot",
-        snapshot: { ...BASE_SNAPSHOT, history: "abcdefgh", historyOffset: 10, olderHistory: false },
-      },
-      8,
-    );
-    state = applyTerminalAttachStreamEvent(state, output("12"), 8);
-    expect(state.output).toMatchObject({ historyOffset: 12, historyLength: 6, olderHistory: true });
-    expect(canLoadOlderTerminalOutput(state.output, 8)).toBe(false);
+    // Jumping to the latest output replaces a detached window and replays what came after.
+    state = apply(state, { type: "olderHistory", page: page("b\nc\n", 2, 6) });
+    expect(state.output.detached).not.toBeNull();
+    state = apply(state, output("z\n", 16));
+    state = apply(state, { type: "latestHistory", page: page("$ x\ny\n", 8, 14, false) });
+    expect(terminalOutputText(state.output)).toBe("$ x\ny\nz\n");
+    expect(state.output.detached).toBeNull();
   });
 
   it("does not reuse a renderer cursor when a fresh attach has matching counters", () => {
