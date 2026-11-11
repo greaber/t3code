@@ -3351,7 +3351,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
               detail: "host read failed",
             }),
           });
-        const reactor = yield* PullRequestWatchReactor.make.pipe(
+        const makeReactor = PullRequestWatchReactor.make.pipe(
           Effect.provide(
             Layer.mergeAll(
               NodeServices.layer,
@@ -3405,7 +3405,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           ),
         );
         const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
-        const sweep = reactor.sweep.pipe(Effect.andThen(worker.drain()));
+        let reactor = yield* makeReactor;
+        const sweep = Effect.suspend(() => reactor.sweep).pipe(Effect.andThen(worker.drain()));
         // Notices from one pass carry random ids, so compare them in sorted order.
         const summaries = Effect.map(
           orchestrator.getThreadRecords(threadId, ["messages"]),
@@ -3416,19 +3417,38 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         assert.deepEqual(yield* summaries, []);
         disconnected = true;
         passesRead.clear();
-        for (let pass = 0; pass < 15; pass += 1) {
+        for (let pass = 0; pass < 37; pass += 1) {
           currentPass = pass;
           genericFailure = reason === "failed" && (pass === 0 || (pass >= 2 && pass <= 8));
           yield* TestClock.adjust("2 minutes");
           yield* sweep;
         }
 
-        const thread = yield* orchestrator.getThreadShell(threadId);
-        assert.isDefined(thread?.pullRequests?.[0]?.watch);
+        const watchOf = Effect.map(
+          orchestrator.getThreadShell(threadId),
+          (thread) => thread?.pullRequests?.[0]?.watch,
+        );
+        assert.isDefined(yield* watchOf);
         const unreadable = reason === "failed" ? [] : ["#8: cannot read it, still watching"];
         assert.deepEqual(yield* summaries, unreadable);
-        // After 8 failures in a row, reads back off: 4 then 8 minutes later, then 16.
-        assert.equal(passesRead.size, reason === "failed" ? 15 : 10);
+        // After 8 failures in a row, reads wait 4, 8, 16, then at most 30 minutes.
+        assert.equal(passesRead.size, reason === "failed" ? 37 : 12);
+
+        // A restart neither repeats the notice nor forgets it is owed a recovery notice.
+        reactor = yield* makeReactor;
+        yield* TestClock.adjust("2 minutes");
+        yield* sweep;
+        assert.deepEqual(yield* summaries, unreadable);
+        if (reason === "not-found") {
+          yield* TestClock.adjust("7 days");
+          yield* sweep;
+          assert.isUndefined(yield* watchOf);
+          assert.deepEqual(
+            yield* summaries,
+            [...unreadable, "#8: stopped watching, not found"].toSorted(),
+          );
+          return;
+        }
         disconnected = false;
         genericFailure = false;
         passed = true;

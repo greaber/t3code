@@ -18,6 +18,7 @@ import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FiberMap from "effect/FiberMap";
@@ -48,6 +49,8 @@ const SWEEP_MINUTES = 2;
 /** Failed reads in a row before the agent is told; later reads back off up to the cap. */
 const READ_FAILURE_LIMIT = 8;
 const READ_BACKOFF_CAP_MS = 30 * 60_000;
+/** A pull request the host keeps reporting missing this long is gone, not briefly hidden. */
+const NOT_FOUND_LIMIT_MS = 7 * 24 * 60 * 60_000;
 /** Group reads in flight at once, inside the host's own request limit. */
 const GROUP_READS = 4;
 /** Without fingerprints, reread quiet PRs on snapshot changes or this interval to catch edits. */
@@ -95,12 +98,11 @@ interface LastRead {
   readonly remarks: string | null;
 }
 
+/** In memory only: a restart reads again at once; what the agent was told lives on the watch. */
 interface ReadFailures {
   readonly count: number;
   /** Sweeps skip the group until then; host change feeds still read it. */
   readonly retryAt: number;
-  /** The agent was told reads are failing, so it is told when they recover. */
-  readonly noticed: boolean;
 }
 
 interface ReadPlan {
@@ -110,7 +112,21 @@ interface ReadPlan {
 
 const watchKey = ({ thread, watch }: WatchTarget) => `${thread.id} ${watch.startedAt}`;
 
-type WatchEndReason = "merged" | "closed" | "comment-limit" | "settled" | "subagent" | "stopped";
+type WatchEndReason =
+  | "merged"
+  | "closed"
+  | "not-found"
+  | "comment-limit"
+  | "settled"
+  | "subagent"
+  | "stopped";
+
+/** The watch without its failed-read state, as a successful read leaves it. */
+const withoutReadFailures = ({
+  unreadableNotified: _notified,
+  notFoundSince: _since,
+  ...watch
+}: ThreadPullRequestWatch): ThreadPullRequestWatch => watch;
 
 interface WatchLife {
   readonly threadId: string;
@@ -305,9 +321,9 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const reportUnreadable = (target: WatchTarget) =>
-    record(target, target.watch, {
-      text: `T3 Code failed to read pull request #${target.link.number} (${target.link.url}) from the host ${READ_FAILURE_LIMIT} times in a row. It is still watching and retries less often, at least every 30 minutes, and will say when it can read it again. Check it yourself if you need it sooner, or call unwatch_pull_request to stop.`,
+  const reportUnreadable = (target: WatchTarget, next: ThreadPullRequestWatch) =>
+    record(target, next, {
+      text: `T3 Code failed to read pull request #${target.link.number} (${target.link.url}) from the host ${READ_FAILURE_LIMIT} times in a row. It keeps watching and retries less often, at most every 30 minutes. Check it yourself if you need it sooner, or call unwatch_pull_request to stop.`,
       notification: {
         source: { kind: "monitor" },
         outcome: "failed",
@@ -315,8 +331,8 @@ export const make = Effect.gen(function* () {
       },
     }).pipe(Effect.tap(() => woke(target)));
 
-  const reportReadable = (target: WatchTarget) =>
-    record(target, target.watch, {
+  const reportReadable = (target: WatchTarget, next: ThreadPullRequestWatch) =>
+    record(target, next, {
       text: `T3 Code can read pull request #${target.link.number} (${target.link.url}) from the host again and is still watching it.`,
       notification: {
         source: { kind: "monitor" },
@@ -324,6 +340,63 @@ export const make = Effect.gen(function* () {
         summary: `#${target.link.number}: readable again`,
       },
     }).pipe(Effect.tap(() => woke(target)));
+
+  const endNotFound = (target: WatchTarget) =>
+    record(target, null, {
+      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because the host has reported it as not found for 7 days. Check it yourself, and call watch_pull_request to watch it again.`,
+      notification: {
+        source: { kind: "monitor" },
+        outcome: "failed",
+        summary: `#${target.link.number}: stopped watching, not found`,
+      },
+    }).pipe(
+      Effect.tap(() => woke(target)),
+      Effect.tap(() => ended(target, "not-found")),
+    );
+
+  const recordFailedRead = Effect.fn("PullRequestWatchReactor.recordFailedRead")(function* (
+    target: WatchTarget,
+    input: { readonly count: number; readonly notFound: boolean; readonly now: number },
+  ) {
+    const { watch } = target;
+    const notFoundSince = input.notFound
+      ? (watch.notFoundSince ?? DateTime.formatIso(DateTime.makeUnsafe(input.now)))
+      : undefined;
+    if (
+      notFoundSince !== undefined &&
+      input.now - Date.parse(notFoundSince) >= NOT_FOUND_LIMIT_MS
+    ) {
+      return yield* endNotFound(target);
+    }
+    const notify = input.count >= READ_FAILURE_LIMIT && watch.unreadableNotified !== true;
+    const next: ThreadPullRequestWatch = {
+      ...withoutReadFailures(watch),
+      ...(notify || watch.unreadableNotified === true ? { unreadableNotified: true } : {}),
+      ...(notFoundSince === undefined ? {} : { notFoundSince }),
+    };
+    if (notify) return yield* reportUnreadable(target, next);
+    if (next.notFoundSince !== watch.notFoundSince) yield* record(target, next);
+  });
+
+  /** Clears failed-read state after a successful read, returning the watch to evaluate. */
+  const recordReadableAgain = (target: WatchTarget) => {
+    const { watch } = target;
+    if (watch.unreadableNotified !== true && watch.notFoundSince === undefined) {
+      return Effect.succeed(target);
+    }
+    const next = withoutReadFailures(watch);
+    return (
+      watch.unreadableNotified === true ? reportReadable(target, next) : record(target, next)
+    ).pipe(
+      Effect.as({ ...target, watch: next }),
+      Effect.catchCause((cause) =>
+        logFailure("pull request watch update failed", {
+          threadId: target.thread.id,
+          pullRequest: threadPullRequestKeyOf(target.link),
+        })(cause).pipe(Effect.as(target)),
+      ),
+    );
+  };
 
   const readRemarks = Effect.fn("PullRequestWatchReactor.readRemarks")(
     function* (
@@ -476,9 +549,10 @@ export const make = Effect.gen(function* () {
     );
 
   const readGroup = Effect.fn("PullRequestWatchReactor.readGroup")(function* (
-    group: WatchGroup,
+    input: WatchGroup,
     fingerprint: ProviderChangeRequestWatchFingerprint | null,
   ) {
+    let group = input;
     const now = yield* Clock.currentTimeMillis;
     const last = lastReads.get(group.key);
     const plan = planRead(group, last, fingerprint, now);
@@ -516,13 +590,12 @@ export const make = Effect.gen(function* () {
       lastReads.delete(group.key);
       const reason = providerFailureReason(read.cause);
       if (reason === "rate-limited") return;
-      const previous = readFailures.get(group.key);
       // Transport and host failures can outlast an outage; they do not count toward the notice.
       if (reason === "failed") {
-        if (previous?.noticed !== true) readFailures.delete(group.key);
+        readFailures.delete(group.key);
         return yield* Effect.failCause(read.cause);
       }
-      const count = (previous?.count ?? 0) + 1;
+      const count = (readFailures.get(group.key)?.count ?? 0) + 1;
       const backoffMs =
         count < READ_FAILURE_LIMIT
           ? 0
@@ -530,18 +603,15 @@ export const make = Effect.gen(function* () {
               READ_BACKOFF_CAP_MS,
               SWEEP_MINUTES * 60_000 * 2 ** (count - READ_FAILURE_LIMIT + 1),
             );
-      const noticed =
-        previous?.noticed === true ||
-        (count >= READ_FAILURE_LIMIT && (yield* eachTarget(group, reportUnreadable)));
-      readFailures.set(group.key, { count, retryAt: now + backoffMs, noticed });
+      readFailures.set(group.key, { count, retryAt: now + backoffMs });
+      yield* eachTarget(group, (target) =>
+        recordFailedRead(target, { count, notFound: reason === "not-found", now }),
+      );
       return yield* Effect.failCause(read.cause);
     }
-    if (readFailures.get(group.key)?.noticed === true) {
-      // Keep the notice owed if telling the agent fails, so a later read retries it.
-      if (yield* eachTarget(group, reportReadable)) readFailures.delete(group.key);
-    } else {
-      readFailures.delete(group.key);
-    }
+    readFailures.delete(group.key);
+    // A failed recovery record keeps the old watch, so a later read retries the notice.
+    group = { ...group, targets: yield* Effect.forEach(group.targets, recordReadableAgain) };
     const [detail, activity] = read.value;
     for (const target of group.targets) {
       const life = lifeOf(target);

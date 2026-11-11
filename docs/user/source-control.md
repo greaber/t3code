@@ -330,9 +330,10 @@ conflict. Threads in a project that watch the same pull request share one check.
 first asks whether anything changed and reads the pull request only when it did, which keeps
 watching inside GitHub's rate limit. Comments from your own account do not wake it. Watching ends
 when the pull request merges or closes, after 10 wakes in a row that bring only comments, or when
-you press Stop on the thread. A rate limit only pauses watching. After 8 failed reads in a row, the
-agent is told and the server keeps trying less often, at least every 30 minutes, and tells the agent
-once it can read the pull request again.
+you press Stop on the thread, or when the host has reported the pull request as not found for 7
+days. A rate limit only pauses watching. After 8 failed reads in a row, the agent is told and the
+server keeps trying less often, at most 30 minutes apart, and tells the agent when a read succeeds
+again.
 Settling or archiving a thread also ends all its watches. Unsettle the thread before starting a new
 watch. Watching a pull request again does not repeat check or conflict news its last
 watch already reported; unlinking the pull request clears that. Subagents cannot watch pull requests; the thread that delegated to them does. To start or stop
