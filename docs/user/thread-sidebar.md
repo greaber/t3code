@@ -177,7 +177,9 @@ To reclaim disk space from settled work, turn on **Run in the thread's worktree 
 thread settles** for one of the project's actions, or set `"runOnSettle": true` on a
 `t3.json` script, for example `cargo clean`. It runs each time a thread in its own
 worktree settles, manually or automatically, even if a terminal there still runs a
-command such as a dev server. Threads in the project's main checkout skip it. Its terminal
+command such as a dev server. Settle actions, including **Stop this action when the thread
+settles**, run only while the thread is settled and idle: if the agent is already starting a
+turn when the thread settles, they are skipped for that settlement. Threads in the project's main checkout skip it. Its terminal
 closes when the command succeeds and stays open when it fails.
 
 On web and desktop, press a thread's **Settle** button and drag up or down to
@@ -185,8 +187,10 @@ settle every thread in that section between it and the one you release on.
 The **Un-settle** and **Wake** buttons work the same way in their sections.
 Press `Escape` while dragging to cancel.
 
-Automatic settlement is off by default. In **Settings → Threads**, you can settle
-threads after a number of inactive days, or when their pull request merges or closes.
+Automatic settlement is off by default, including on environments where you never changed
+these settings; earlier versions settled inactive threads after seven days and threads whose
+pull request merged or closed. In **Settings → Threads**, you can turn on settling threads
+after a number of inactive days, or when their pull request merges or closes.
 An empty thread's inactivity counts from when it was created.
 Work in progress, pending questions or approvals, and background work the agent
 is waiting on prevent automatic settlement. An open pull request does not prevent inactivity

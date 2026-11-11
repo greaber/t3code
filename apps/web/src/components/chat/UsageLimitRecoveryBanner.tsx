@@ -26,7 +26,6 @@ type RecoveryProps = {
   errorCode: string | null;
   resetAt: string | null;
   stoppedAt: string;
-  settled: boolean;
   requestPending: boolean;
   snoozedUntil: string | null;
   recovery: OrchestrationV2LimitRecovery | null;
@@ -40,7 +39,6 @@ export function usageLimitRecoveryBannerItem(props: RecoveryProps): ComposerBann
     errorCode,
     resetAt,
     stoppedAt,
-    settled,
     requestPending,
     recovery,
     snoozedUntil,
@@ -48,7 +46,7 @@ export function usageLimitRecoveryBannerItem(props: RecoveryProps): ComposerBann
   } = props;
   // The server refuses recovery changes while a request is pending.
   const canSchedule =
-    !settled && !requestPending && resetAt !== null && Date.parse(resetAt) > Date.parse(stoppedAt);
+    !requestPending && resetAt !== null && Date.parse(resetAt) > Date.parse(stoppedAt);
   const resumes =
     canSchedule && recovery?.runId === runId && recovery.resetAt === resetAt && recovery.autoResume;
   const workspaceLimit = errorCode === CHATGPT_WORKSPACE_USAGE_LIMIT_CODE;

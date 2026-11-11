@@ -221,10 +221,11 @@ export class TerminalManager extends Context.Service<
 
     readonly closeOnSettle: (input: { readonly threadId: string }) => Effect.Effect<void>;
 
+    /** Succeeds with whether every matching running terminal was idle and closed. */
     readonly closeIdle: (input: {
       readonly threadId: string;
       readonly terminalId?: string;
-    }) => Effect.Effect<void>;
+    }) => Effect.Effect<boolean>;
 
     readonly subscribe: (
       listener: (event: TerminalEvent) => Effect.Effect<void>,
@@ -3430,7 +3431,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             Number.isInteger(session.pid) &&
             (input.terminalId === undefined || session.terminalId === input.terminalId),
         );
-        if (running.length === 0) return;
+        if (running.length === 0) return true;
         const marks = new Map(
           running.map((session) => [session.terminalId, terminalActivityMark(session)]),
         );
@@ -3439,26 +3440,24 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           platform === "win32" ? CLOSE_IDLE_QUERY_TIMEOUT.win32 : CLOSE_IDLE_QUERY_TIMEOUT.posix,
         );
         const inspector = yield* Effect.fromResult(inspectorResult);
-        yield* Effect.forEach(
-          running,
-          (session) =>
-            inspector(session.pid).pipe(
-              Effect.flatMap((result) =>
-                result.hasRunningSubprocess ||
-                terminalActivityMark(session) !== marks.get(session.terminalId)
-                  ? Effect.void
-                  : closeSession(input.threadId, session.terminalId, false),
-              ),
+        const closed = yield* Effect.forEach(running, (session) =>
+          inspector(session.pid).pipe(
+            Effect.flatMap((result) =>
+              result.hasRunningSubprocess ||
+              terminalActivityMark(session) !== marks.get(session.terminalId)
+                ? Effect.succeed(false)
+                : closeSession(input.threadId, session.terminalId, false).pipe(Effect.as(true)),
             ),
-          { discard: true },
+          ),
         );
+        return closed.every(Boolean);
       }),
     ).pipe(
       Effect.catch((error) =>
         Effect.logWarning("failed to close idle terminals", {
           threadId: input.threadId,
           error: error.message,
-        }),
+        }).pipe(Effect.as(false)),
       ),
     );
 

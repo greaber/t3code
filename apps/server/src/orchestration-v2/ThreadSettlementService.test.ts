@@ -563,7 +563,9 @@ interface HarnessOptions {
     input: ProjectSetupScriptRunner.ProjectSetupScriptRunnerInput,
   ) => Effect.Effect<void>;
   readonly onCloseIdle?: () => Effect.Effect<void>;
-  readonly currentThreads?: ReadonlyArray<OrchestrationV2AppThread>;
+  readonly currentThreads?: ReadonlyArray<
+    OrchestrationV2AppThread & Partial<Pick<OrchestrationV2ThreadShell, "status" | "activeRunId">>
+  >;
 }
 
 // Auto-settlement is off by default; these tests exercise the rules with both turned on.
@@ -678,10 +680,16 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
               : snapshot.threads.filter((thread) => thread.id === threadId),
           ),
         ),
-      getThread: (threadId) => {
+      getThreadShell: (threadId) => {
         const thread = options.currentThreads?.find((candidate) => candidate.id === threadId);
         return thread
-          ? Effect.succeed(thread)
+          ? Effect.succeed({
+              status: "idle",
+              activeRunId: null,
+              activityRunStatus: null,
+              pendingBackgroundTasks: [],
+              ...thread,
+            } as unknown as OrchestrationV2ThreadShell)
           : Effect.die(new Error(`Unexpected thread read: ${threadId}`));
       },
     }),
@@ -1464,21 +1472,28 @@ describe("ThreadSettlementServiceV2 terminals", () => {
     payload: thread,
   });
 
-  it.effect("keeps the terminals of a thread re-engaged before the event ran", () =>
+  it.effect("keeps the terminals of a thread re-engaged or busy before the event ran", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const settled = appThread("reengaged-thread", "settled");
         const reengaged = appThread("reengaged-thread", "active");
+        // Still settled, but its agent already started a turn, e.g. for a background result.
+        const busy = appThread("busy-thread", "settled");
         const marker = appThread("marker-thread", "settled");
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([]),
-          currentThreads: [reengaged, marker],
+          currentThreads: [
+            reengaged,
+            { ...busy, status: "running", activeRunId: RunId.make("busy-run") },
+            marker,
+          ],
         });
 
         yield* Effect.gen(function* () {
           const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
           yield* startHarness(service, fixture.activation, fixture.snapshotReads);
           yield* fixture.publishEvent(settledEvent(settled));
+          yield* fixture.publishEvent(settledEvent(busy));
           yield* fixture.publishEvent(settledEvent(marker));
           assert.deepStrictEqual(yield* Queue.take(fixture.closedIdle), { threadId: marker.id });
         }).pipe(Effect.provide(fixture.layer));
