@@ -1217,6 +1217,33 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect("restarting an SSH server stops only that backend and keeps the environment on", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([SSH_CONNECTION, RELAY_TARGET], [SSH_PROFILE]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          SSH_CONNECTION.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        yield* registry.restartSshServer(SSH_CONNECTION.environmentId);
+        expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([SSH_TARGET]);
+        const entry = (yield* SubscriptionRef.get(registry.entries)).get(
+          SSH_CONNECTION.environmentId,
+        );
+        expect(entry?.enabled).toBe(true);
+
+        const relay = yield* Effect.flip(registry.restartSshServer(RELAY_TARGET.environmentId));
+        expect(relay._tag).toBe("ConnectionBlockedError");
+        expect(yield* Ref.get(harness.disconnectedSshTargets)).toEqual([SSH_TARGET]);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
   it.effect("moves durable streams to a replacement supervisor", () =>
     Effect.gen(function* () {
       const replacement = new RelayConnectionTarget({

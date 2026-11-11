@@ -8,6 +8,7 @@ import { useEnvironments } from "~/state/environments";
 import { environmentIdsKey } from "~/state/environmentAtomList";
 import { environmentUpdateStatesAtom } from "~/state/server";
 import { environmentSessionStatesAtom } from "~/state/session";
+import { sshRestartVersion } from "~/versionSkew";
 import { getProviderUpdateRunOutcome } from "../ProviderUpdateLaunchNotification.logic";
 import { useProviderUpdates } from "../ProviderUpdatesAction";
 import { canUpdateServer, type ServerUpdateOutcome, useServerUpdate } from "../ServerUpdateAction";
@@ -63,6 +64,7 @@ export function useUpdateEverything(
     serverConfig: environment.serverConfig,
     connected: environment.connection.phase === "connected",
     hostedByThisApp: isHostedByThisApp(environment),
+    sshRestartVersion: sshRestartVersion(environment),
     canMaintain: canUpdateServer(sessionStates[index]!),
     updateState: updateStates[index]!,
   }));

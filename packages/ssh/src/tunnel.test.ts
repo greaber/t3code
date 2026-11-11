@@ -133,6 +133,22 @@ const serve = (tries) => {
 serve(40);
 `;
 
+// Emulates `t3 serve` that binds and publishes server-runtime.json at once.
+const fakeT3ServeImmediately = `const fs = require("node:fs");
+const http = require("node:http");
+const path = require("node:path");
+const args = process.argv.slice(2);
+const port = Number(args[args.indexOf("--port") + 1]);
+const userdata = path.join(args[args.indexOf("--base-dir") + 1], "userdata");
+fs.mkdirSync(userdata, { recursive: true });
+fs.appendFileSync(path.join(process.env.HOME, "servers"), process.pid + "\\n");
+setTimeout(() => process.exit(0), 60_000);
+http.createServer((_, response) => response.end()).listen(port, "127.0.0.1", () => {
+  const origin = "http://127.0.0.1:" + port;
+  fs.writeFileSync(path.join(userdata, "server-runtime.json"), JSON.stringify({ pid: process.pid, port, origin }));
+});
+`;
+
 // Runs the remote half of an SSH command (`sh -l -s -- <key>`) as a local shell
 // whose HOME is the given directory. Every launch after the first starts once
 // a server is running (or after 10s), which lines up the race deterministically.
@@ -169,15 +185,18 @@ describe("ssh tunnel scripts", () => {
     Effect.gen(function* () {
       let tunnels = 0;
       let kills = 0;
+      let remoteStops = 0;
       const spawner = ChildProcessSpawner.make((command) =>
         Effect.sync(() => {
-          if (commandArgs(command).includes("-N")) {
+          const args = commandArgs(command);
+          if (args.includes("-N")) {
             tunnels += 1;
             return makeRunningProcess(() => {
               kills += 1;
             });
           }
-          return makeSuccessfulProcess('{"remotePort":3773}\n');
+          if (args.at(-1) === "-s") remoteStops += 1;
+          return makeSuccessfulProcess('{"remotePort":3773,"serverKind":"managed"}\n');
         }),
       );
       const requests = yield* Queue.unbounded<void>();
@@ -211,6 +230,9 @@ describe("ssh tunnel scripts", () => {
         assert.equal(tunnels, 1);
         assert.equal(kills, 0);
       }).pipe(Effect.provide(layer), Effect.scoped);
+      // Quitting the app closes the manager: it drops the tunnel but leaves agent work running.
+      assert.equal(kills, 1);
+      assert.equal(remoteStops, 0);
     }),
   );
 
@@ -254,7 +276,7 @@ describe("ssh tunnel scripts", () => {
         );
         NodeFS.writeFileSync(
           NodePath.join(bin, "curl"),
-          "#!/bin/sh\necho 'download attempt' >&2\nexit 22\n",
+          '#!/bin/sh\necho "download attempt $*" >&2\nexit 22\n',
           { mode: 0o755 },
         );
         const runner = NodePath.join(root, "run-t3.sh");
@@ -266,6 +288,9 @@ describe("ssh tunnel scripts", () => {
         assert.notEqual(result.status, 0);
         if (downloads) {
           assert.include(result.stderr, "download attempt");
+          // Slow links get no total deadline; only a stalled transfer fails.
+          assert.include(result.stderr, "--speed-limit 1024 --speed-time 60");
+          assert.notInclude(result.stderr, "--max-time");
         } else {
           assert.notInclude(result.stderr, "download attempt");
           assert.include(result.stderr, "has no t3 release archive.");
@@ -276,7 +301,7 @@ describe("ssh tunnel scripts", () => {
     },
   );
 
-  it.effect("accepts launch JSON after remote shell startup noise", () => {
+  it.effect("accepts launch JSON after a slow archive launch and remote shell noise", () => {
     const target = {
       alias: "devbox",
       hostname: "devbox.example.com",
@@ -287,7 +312,13 @@ describe("ssh tunnel scripts", () => {
     const spawner = ChildProcessSpawner.make((command) =>
       Effect.sync(() => {
         spawnedCommands.push(commandArgs(command));
-        return makeSuccessfulProcess('loaded nvm default\n{"remotePort":3774}\n');
+        // A cold archive download on a slow link outlasts any fixed launch deadline.
+        return {
+          ...makeSuccessfulProcess('loaded nvm default\n{"remotePort":3774}\n'),
+          exitCode: Effect.sleep(Duration.minutes(20)).pipe(
+            Effect.as(ChildProcessSpawner.ExitCode(0)),
+          ),
+        };
       }),
     );
     const layerSpawner = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner);
@@ -297,7 +328,11 @@ describe("ssh tunnel scripts", () => {
     );
 
     return Effect.gen(function* () {
-      const result = yield* SshTunnel.launchOrReuseRemoteServer(target, undefined, ARCHIVE);
+      const launch = yield* Effect.forkChild(
+        SshTunnel.launchOrReuseRemoteServer(target, undefined, ARCHIVE),
+      );
+      yield* TestClock.adjust(Duration.minutes(20));
+      const result = yield* Fiber.join(launch);
       assert.equal(result.remotePort, 3774);
       assert.deepEqual(spawnedCommands[0]?.slice(-5, -1), ["sh", "-l", "-s", "--"]);
     }).pipe(Effect.provide(layerProcess));
@@ -750,6 +785,82 @@ describe("ssh tunnel scripts", () => {
           Effect.scoped,
         );
       }),
+  );
+
+  it.live("a changed runner reuses the running server until disconnect stops it", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-ssh-update-" });
+      const serversFile = path.join(home, "servers");
+      const servers = () =>
+        fs
+          .readFileString(serversFile)
+          .pipe(Effect.map((pids) => pids.trim().split("\n").filter(Boolean).map(Number)));
+      yield* Effect.addFinalizer(() =>
+        servers().pipe(
+          Effect.map((pids) => {
+            for (const pid of pids) {
+              try {
+                process.kill(pid, "SIGKILL");
+              } catch {}
+            }
+          }),
+          Effect.ignore,
+        ),
+      );
+      const serverScript = path.join(home, "fake-t3.cjs");
+      const updatedServerScript = path.join(home, "fake-t3-updated.cjs");
+      yield* fs.writeFileString(serverScript, fakeT3ServeImmediately);
+      yield* fs.writeFileString(updatedServerScript, fakeT3ServeImmediately);
+      const target = { alias: "devbox", hostname: "devbox", username: null, port: null };
+      const current = { nodeScriptPath: serverScript };
+      // The runner bakes in the client's version, so a desktop update changes it.
+      const updated = { nodeScriptPath: updatedServerScript };
+      const isAlive = (pid: number) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      yield* Effect.gen(function* () {
+        const first = yield* SshTunnel.launchOrReuseRemoteServer(target, undefined, current);
+        const [runningPid] = yield* servers();
+        const reconnect = yield* SshTunnel.launchOrReuseRemoteServer(target, undefined, updated);
+        assert.deepEqual(reconnect, first);
+        assert.deepEqual(yield* servers(), [runningPid]);
+        assert.isTrue(isAlive(runningPid!), "Reconnecting must not stop the running server.");
+
+        // Updating stops the server explicitly; the next connect starts the new runner.
+        const manager = yield* SshTunnel.SshEnvironmentManager;
+        yield* manager.disconnectEnvironment(target);
+        assert.isFalse(isAlive(runningPid!));
+        const relaunched = yield* SshTunnel.launchOrReuseRemoteServer(target, undefined, updated);
+        assert.equal(relaunched.remoteServerKind, "managed");
+        assert.lengthOf(yield* servers(), 2);
+        const stateKey = yield* remoteStateKey(target);
+        assert.include(
+          yield* fs.readFileString(path.join(home, ".t3", "ssh-launch", stateKey, "run-t3.sh")),
+          updatedServerScript,
+        );
+      }).pipe(
+        Effect.provide(
+          SshTunnel.SshEnvironmentManager.layer().pipe(
+            Layer.provideMerge(
+              Layer.mergeAll(
+                localRemoteShellLayer(home),
+                Layer.succeed(HttpClient.HttpClient, testHttpClient),
+                Layer.succeed(NetService.NetService, testNetService),
+                SshAuth.SshPasswordPrompt.disabledLayer,
+              ),
+            ),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
   it.live("concurrent launches on one remote home record the server that owns it", () =>

@@ -158,6 +158,13 @@ export class EnvironmentRegistry extends Context.Service<
       | PlatformEnvironmentRemovalError
     >;
     readonly retryNow: (environmentId: EnvironmentId) => Effect.Effect<void>;
+    /**
+     * Stops the server a desktop app started over SSH, then reconnects, which
+     * starts this client's version. Agent turns running there stop.
+     */
+    readonly restartSshServer: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<void, EnvironmentNotRegisteredError | ConnectionAttemptError>;
     readonly setEnabled: (
       environmentId: EnvironmentId,
       enabled: boolean,
@@ -1053,6 +1060,24 @@ export const make = Effect.gen(function* () {
       Effect.catchTags({ EnvironmentNotRegisteredError: () => Effect.void }),
       Effect.withSpan("EnvironmentRegistry.retryNow"),
     );
+  const restartSshServer = Effect.fn("EnvironmentRegistry.restartSshServer")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    yield* withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        const profile = Option.getOrNull((yield* getEntry(environmentId)).profile);
+        if (profile === null || !isSshConnectionProfile(profile)) {
+          return yield* new ConnectionBlockedError({
+            reason: "unsupported",
+            detail: "This environment is not connected over SSH.",
+          });
+        }
+        yield* ssh.disconnect(profile.target);
+      }),
+    );
+    yield* retryNow(environmentId);
+  });
   const setEnabled = Effect.fn("EnvironmentRegistry.setEnabled")(function* (
     environmentId: EnvironmentId,
     enabled: boolean,
@@ -1195,6 +1220,7 @@ export const make = Effect.gen(function* () {
     reorderRoutes,
     removeRelayEnvironments,
     retryNow,
+    restartSshServer,
     setEnabled,
     setCompatibility,
     state,

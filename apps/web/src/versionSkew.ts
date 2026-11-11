@@ -4,11 +4,14 @@ import type {
   ServerInstallation,
   ServerSelfUpdateCapability,
 } from "@t3tools/contracts";
+import type { EnvironmentPresentation } from "@t3tools/client-runtime/connection";
 import type { ServerUpdateState } from "@t3tools/client-runtime/state/server";
 import { compareSemverVersions, parseSemver } from "@t3tools/shared/semver";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import { APP_VERSION } from "./branding";
+import { isElectron } from "./env";
 import { getLocalStorageItem, setLocalStorageItem } from "./hooks/useLocalStorage";
 
 export interface VersionMismatch {
@@ -87,6 +90,18 @@ export function resolveServerSelfUpdateCapability(
   serverConfig: Pick<ServerConfig, "environment"> | null | undefined,
 ): ServerSelfUpdateCapability | null {
   return serverConfig?.environment.capabilities.serverSelfUpdate ?? null;
+}
+
+/** The version a restart starts on a server this desktop app runs over SSH, which reports no
+ * self-update of its own. A server the app did not start keeps its version. */
+export function sshRestartVersion(
+  environment: Pick<EnvironmentPresentation, "entry" | "serverConfig">,
+): string | null {
+  return isElectron &&
+    resolveServerSelfUpdateCapability(environment.serverConfig) === null &&
+    Option.getOrNull(environment.entry.profile)?._tag === "SshConnectionProfile"
+    ? APP_VERSION
+    : null;
 }
 
 export function supportsDesktopAppUpdate(

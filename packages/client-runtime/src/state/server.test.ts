@@ -384,6 +384,90 @@ describe("accepted server update recovery", () => {
   );
 });
 
+describe("SSH server restart update", () => {
+  it.effect.each([
+    { restartedVersion: "0.0.31", updated: true },
+    // A server the desktop app did not start keeps running its own version.
+    { restartedVersion: "0.0.30", updated: false },
+  ] as const)("restarts and reports $restartedVersion", ({ restartedVersion, updated }) =>
+    Effect.gen(function* () {
+      const restarts = yield* Ref.make(0);
+      const readyEvents =
+        yield* Queue.unbounded<Parameters<typeof matchesServerUpdateReadyEvent>[1]>();
+      const config = {
+        ...CONFIG,
+        environment: { ...CONFIG.environment, serverVersion: "0.0.30", capabilities: {} },
+      } as ServerConfig;
+      const client = {
+        [WS_METHODS.subscribeServerConfig]: () => Stream.never,
+        [WS_METHODS.subscribeServerLifecycle]: () => Stream.fromQueue(readyEvents),
+      } as unknown as WsRpcProtocolClient;
+      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        target: TARGET,
+        state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+        session: yield* SubscriptionRef.make(Option.some(session(client))),
+        prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+        connect: Effect.void,
+        disconnect: Effect.void,
+        retryNow: Effect.void,
+      });
+      const runStream: EnvironmentRegistry.EnvironmentRegistry["Service"]["runStream"] = (
+        _id,
+        stream,
+      ) => Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+      const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+        followStream: runStream,
+        stateChanges: () => Stream.never,
+        retryNow: () => Effect.void,
+        restartSshServer: () =>
+          Ref.update(restarts, (count) => count + 1).pipe(
+            Effect.andThen(
+              Queue.offer(readyEvents, {
+                version: 1,
+                sequence: 1,
+                type: "ready",
+                payload: {
+                  at: "2026-09-01T00:00:00.000Z",
+                  environment: { serverVersion: restartedVersion },
+                },
+              } as Parameters<typeof matchesServerUpdateReadyEvent>[1]),
+            ),
+          ),
+      } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+      const runtime = Atom.runtime(
+        Layer.mergeAll(
+          Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+          Layer.succeed(RpcPermissionGuard, { authorize: () => Effect.void }),
+          Layer.succeed(Persistence.EnvironmentCacheStore, {
+            loadServerConfig: () => Effect.succeedNone,
+          } as unknown as Persistence.EnvironmentCacheStore["Service"]),
+        ),
+      );
+      const atoms = createServerEnvironmentAtoms(runtime, {
+        initialConfigValueAtom: () => Atom.make(config),
+      });
+      const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
+        Effect.sync(() => value.dispose()),
+      );
+      const result = yield* Effect.promise(() =>
+        atoms.updateServer.run(registry, {
+          environmentId: TARGET.environmentId,
+          input: { targetVersion: "0.0.31" },
+          restartSshServer: true,
+        }),
+      );
+
+      expect(yield* Ref.get(restarts)).toBe(1);
+      expect(AsyncResult.isSuccess(result)).toBe(updated);
+      expect(registry.get(serverUpdateStateAtom(TARGET.environmentId))).toMatchObject(
+        updated
+          ? { status: "idle" }
+          : { status: "failed", message: expect.stringContaining("still on t3@0.0.30") },
+      );
+    }).pipe(Effect.scoped),
+  );
+});
+
 const makeConfigPersistenceHarness = Effect.fn("test.makeConfigPersistenceHarness")(function* (
   saveServerConfig: Persistence.EnvironmentCacheStore["Service"]["saveServerConfig"],
 ) {

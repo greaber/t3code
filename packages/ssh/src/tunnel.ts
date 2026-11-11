@@ -60,13 +60,13 @@ const REMOTE_LAUNCH_BASE_TIMEOUT_MS = 90_000;
 // Matches the node-script launch command's ssh run without the launch lock wait.
 const SSH_TUNNEL_CONNECT_TIMEOUT_MS = REMOTE_LAUNCH_BASE_TIMEOUT_MS;
 const SSH_TUNNEL_FORWARD_PROBE_INTERVAL_MS = 100;
-// Cold archive launches download and extract ~70 MB and may wait on an install lock.
-// Lock waits must outlast both downloads and extraction; SSH must outlast install or wait plus readiness.
-// Leave slack for verification and extraction, which have no timeout.
-const REMOTE_ARCHIVE_CHECKSUMS_SECONDS = 30;
-const REMOTE_ARCHIVE_DOWNLOAD_SECONDS = 240;
+// Cold archive launches download ~70 MB, which takes hours on a slow link. Downloads fail only
+// when they stall, so archive launches have no overall deadline; ssh keepalives still end
+// one whose connection dies. Another launch waits this long for a concurrent install.
+const REMOTE_ARCHIVE_STALL_BYTES_PER_SECOND = 1024;
+const REMOTE_ARCHIVE_STALL_SECONDS = 60;
 const REMOTE_ARCHIVE_LOCK_WAIT_SECONDS = 360;
-const REMOTE_ARCHIVE_LAUNCH_TIMEOUT_MS = 900_000;
+const REMOTE_ARCHIVE_PAIRING_TIMEOUT_MS = 900_000;
 const REMOTE_REUSE_READY_TIMEOUT_MS = 2_000;
 const REMOTE_PID_EXIT_WAIT_MS = 2_000;
 // The server answers HTTP before it writes server-runtime.json, which is how
@@ -511,13 +511,13 @@ if ! t3_runtime_ready; then
   T3_STAGING="$(mktemp -d "$HOME/.t3/runtime/versions/.staging-XXXXXX")"
   trap 'rm -rf "$T3_STAGING" "$T3_LOCK"' EXIT
   t3_fetch() {
-    if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 30 --max-time "$3" "$1" -o "$2"
-    elif command -v wget >/dev/null 2>&1; then wget -q --timeout=30 --tries=1 "$1" -O "$2"
+    if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 30 --speed-limit @@T3_ARCHIVE_STALL_BYTES_PER_SECOND@@ --speed-time @@T3_ARCHIVE_STALL_SECONDS@@ "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then wget -q --timeout=@@T3_ARCHIVE_STALL_SECONDS@@ --tries=1 "$1" -O "$2"
     else printf 'Remote host needs curl or wget to download %s.\\n' "$T3_ARCHIVE" >&2; exit 1
     fi
   }
-  t3_fetch "$T3_RELEASE_BASE_URL/v$T3_ARCHIVE_VERSION/SHA256SUMS" "$T3_STAGING/SHA256SUMS" @@T3_ARCHIVE_CHECKSUMS_SECONDS@@
-  t3_fetch "$T3_RELEASE_BASE_URL/v$T3_ARCHIVE_VERSION/$T3_ARCHIVE" "$T3_STAGING/$T3_ARCHIVE" @@T3_ARCHIVE_DOWNLOAD_SECONDS@@
+  t3_fetch "$T3_RELEASE_BASE_URL/v$T3_ARCHIVE_VERSION/SHA256SUMS" "$T3_STAGING/SHA256SUMS"
+  t3_fetch "$T3_RELEASE_BASE_URL/v$T3_ARCHIVE_VERSION/$T3_ARCHIVE" "$T3_STAGING/$T3_ARCHIVE"
   T3_EXPECTED="$(grep " \\*\\{0,1\\}$T3_ARCHIVE$" "$T3_STAGING/SHA256SUMS" | cut -d' ' -f1)"
   if command -v sha256sum >/dev/null 2>&1; then
     T3_ACTUAL="$(sha256sum "$T3_STAGING/$T3_ARCHIVE" | cut -d' ' -f1)"
@@ -628,14 +628,12 @@ while ! (set -C; printf '%s\\n' "$$" >"$LAUNCH_LOCK") 2>/dev/null; do
   sleep 1
   LAUNCH_LOCK_WAITED=$((LAUNCH_LOCK_WAITED + 1))
 done
-RUNNER_CHANGED=0
-if [ ! -f "$RUNNER_FILE" ] || ! cmp -s "$RUNNER_NEXT" "$RUNNER_FILE"; then
-  RUNNER_CHANGED=1
-fi
-mv "$RUNNER_NEXT" "$RUNNER_FILE"
+# RUNNER_FILE stays the runner of the server it started; this launch's runner
+# replaces it only when it starts one.
+RUNNER="$RUNNER_NEXT"
 pick_port() {
   if [ "$T3_ARCHIVE_MODE" = "1" ]; then
-    "$RUNNER_FILE" __ssh-helper pick-port "$PORT_FILE" "@@T3_DEFAULT_REMOTE_PORT@@" "@@T3_REMOTE_PORT_SCAN_WINDOW@@"
+    "$RUNNER" __ssh-helper pick-port "$PORT_FILE" "@@T3_DEFAULT_REMOTE_PORT@@" "@@T3_REMOTE_PORT_SCAN_WINDOW@@"
     return
   fi
   node - "$PORT_FILE" "@@T3_DEFAULT_REMOTE_PORT@@" "@@T3_REMOTE_PORT_SCAN_WINDOW@@" <<'NODE'
@@ -644,7 +642,7 @@ NODE
 }
 wait_ready() {
   if [ "$T3_ARCHIVE_MODE" = "1" ]; then
-    "$RUNNER_FILE" __ssh-helper wait-ready "$REMOTE_PORT" "$1" "@@T3_READY_PROBE_TIMEOUT_MS@@"
+    "$RUNNER" __ssh-helper wait-ready "$REMOTE_PORT" "$1" "@@T3_READY_PROBE_TIMEOUT_MS@@"
     return
   fi
   node - "$REMOTE_PORT" "$1" "@@T3_READY_PROBE_TIMEOUT_MS@@" <<'NODE'
@@ -669,7 +667,7 @@ server_running() {
 }
 resolve_default_runtime_port() {
   if [ "$T3_ARCHIVE_MODE" = "1" ]; then
-    "$RUNNER_FILE" __ssh-helper runtime-port "$DEFAULT_RUNTIME_FILE"
+    "$RUNNER" __ssh-helper runtime-port "$DEFAULT_RUNTIME_FILE"
     return
   fi
   node - "$DEFAULT_RUNTIME_FILE" <<'NODE'
@@ -749,14 +747,9 @@ if [ "$REMOTE_MANAGED" = "external" ]; then
   fi
 elif [ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && server_running "$REMOTE_PID"; then
   # Reconnect owns the local tunnel, not the lifetime of an already running
-  # server. A changed runner is the update path and still replaces it.
-  if [ "$RUNNER_CHANGED" -eq 1 ]; then
-    kill "$REMOTE_PID" 2>/dev/null || true
-    wait_for_pid_exit "$REMOTE_PID"
-    REMOTE_PID=""
-    REMOTE_PORT=""
-    REMOTE_MANAGED=""
-  elif ! wait_ready "@@T3_READY_TIMEOUT_MS@@"; then
+  # server, even an older version: agent turns may be running there. Updating
+  # stops it explicitly first.
+  if ! wait_ready "@@T3_READY_TIMEOUT_MS@@"; then
     printf 'Remote T3 server is still running but did not become ready. Retry the connection; the server was left running.\\n' >&2
     exit 1
   fi
@@ -794,6 +787,8 @@ if [ -z "$REMOTE_PORT" ]; then
     fi
     exit 1
   fi
+  mv "$RUNNER_NEXT" "$RUNNER_FILE"
+  RUNNER="$RUNNER_FILE"
   nohup env T3CODE_NO_BROWSER=1 "$RUNNER_FILE" serve --host 127.0.0.1 --port "$REMOTE_PORT" --base-dir "$DEFAULT_SERVER_HOME" >>"$LOG_FILE" 2>&1 < /dev/null &
   REMOTE_PID="$!"
   printf '%s\\n' "$REMOTE_PID" >"$PID_FILE"
@@ -827,11 +822,16 @@ const REMOTE_PAIRING_SCRIPT = `set -eu
 STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
 DEFAULT_SERVER_HOME="$HOME/.t3"
 RUNNER_FILE="$STATE_DIR/run-t3.sh"
+REMOTE_PID="$(cat "$STATE_DIR/pid" 2>/dev/null || true)"
 mkdir -p "$STATE_DIR"
-cat >"$RUNNER_FILE" <<'SH'
+# A running managed server issues the token with its own version; a newer one
+# would migrate the database under it.
+if [ "$(cat "$STATE_DIR/managed" 2>/dev/null || true)" != "managed" ] || [ -z "$REMOTE_PID" ] || ! kill -0 "$REMOTE_PID" 2>/dev/null || [ ! -x "$RUNNER_FILE" ]; then
+  cat >"$RUNNER_FILE" <<'SH'
 @@T3_RUNNER_SCRIPT@@
 SH
-chmod 700 "$RUNNER_FILE"
+  chmod 700 "$RUNNER_FILE"
+fi
 PAIRING_BASE_DIR="$DEFAULT_SERVER_HOME"
 "$RUNNER_FILE" auth pairing create --base-dir "$PAIRING_BASE_DIR" --json
 `;
@@ -910,8 +910,8 @@ export function buildRemoteT3RunnerScript(input?: RemoteT3RunnerOptions): string
       T3_ARCHIVE_VERSION: shellSingleQuote(archiveVersion),
       T3_RELEASE_BASE_URL: shellSingleQuote(releaseBaseUrl),
       T3_ARCHIVE_LOCK_WAIT_SECONDS: String(REMOTE_ARCHIVE_LOCK_WAIT_SECONDS),
-      T3_ARCHIVE_DOWNLOAD_SECONDS: String(REMOTE_ARCHIVE_DOWNLOAD_SECONDS),
-      T3_ARCHIVE_CHECKSUMS_SECONDS: String(REMOTE_ARCHIVE_CHECKSUMS_SECONDS),
+      T3_ARCHIVE_STALL_BYTES_PER_SECOND: String(REMOTE_ARCHIVE_STALL_BYTES_PER_SECOND),
+      T3_ARCHIVE_STALL_SECONDS: String(REMOTE_ARCHIVE_STALL_SECONDS),
       T3_NODE_ENV_SCRIPT: buildRemoteNodeEnvScript(input),
     }),
   );
@@ -982,9 +982,7 @@ export const launchOrReuseRemoteServer = Effect.fn("ssh/tunnel.launchOrReuseRemo
     const result = yield* runSshCommand(target, {
       remoteCommandArgs: ["sh", "-l", "-s", "--", stateKey],
       stdin: buildRemoteLaunchScript(runner),
-      timeoutMs: isNodeScriptRunner(runner)
-        ? REMOTE_LAUNCH_TIMEOUT_MS
-        : REMOTE_ARCHIVE_LAUNCH_TIMEOUT_MS,
+      timeoutMs: isNodeScriptRunner(runner) ? REMOTE_LAUNCH_TIMEOUT_MS : null,
       ...(input?.authSecret === undefined ? {} : { authSecret: input.authSecret }),
       ...(input?.batchMode === undefined ? {} : { batchMode: input.batchMode }),
       ...(input?.interactiveAuth === undefined ? {} : { interactiveAuth: input.interactiveAuth }),
@@ -1043,7 +1041,7 @@ export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingT
   const result = yield* runSshCommand(target, {
     remoteCommandArgs: ["sh", "-s"],
     stdin: buildRemotePairingScript(stateKey, runner),
-    ...(isNodeScriptRunner(runner) ? {} : { timeoutMs: REMOTE_ARCHIVE_LAUNCH_TIMEOUT_MS }),
+    ...(isNodeScriptRunner(runner) ? {} : { timeoutMs: REMOTE_ARCHIVE_PAIRING_TIMEOUT_MS }),
     ...(input?.authSecret === undefined ? {} : { authSecret: input.authSecret }),
     ...(input?.batchMode === undefined ? {} : { batchMode: input.batchMode }),
     ...(input?.interactiveAuth === undefined ? {} : { interactiveAuth: input.interactiveAuth }),
@@ -1686,56 +1684,17 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
       ),
     );
     tunnels.set(input.key, tunnelEntry);
-    const spawnerService = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const digestService = yield* Digest.Digest;
-    const fileSystemService = yield* FileSystem.FileSystem;
-    const pathService = yield* Path.Path;
+    // Closing a tunnel, including when the app quits, leaves the remote server
+    // running: agent turns may be working there. Only disconnect stops it.
     yield* Scope.addFinalizer(
       entryScope,
-      Effect.gen(function* () {
-        const stopRemote = tunnels.get(tunnelEntry.key) === tunnelEntry;
-        if (stopRemote) {
+      Effect.suspend(() => {
+        if (tunnels.get(tunnelEntry.key) === tunnelEntry) {
           tunnels.delete(tunnelEntry.key);
         }
-        yield* tunnelEntry.process
-          .kill({
-            killSignal: "SIGTERM",
-            forceKillAfter: TUNNEL_SHUTDOWN_TIMEOUT_MS,
-          })
-          .pipe(Effect.ignore);
-        if (!stopRemote) {
-          return;
-        }
-        yield* Effect.logDebug("ssh.environment.tunnel.finalizer.start", {
-          ...sshTargetLogFields(tunnelEntry.target),
-          key: tunnelEntry.key,
-          localPort: tunnelEntry.localPort,
-          remotePort: tunnelEntry.remotePort,
-        });
-        const authSecret = authSecrets.get(tunnelEntry.key) ?? null;
-        yield* stopRemoteServer(
-          tunnelEntry.target,
-          authSecret === null
-            ? {
-                batchMode: "yes",
-                interactiveAuth: false,
-              }
-            : {
-                authSecret,
-                batchMode: "no",
-                interactiveAuth: true,
-              },
-        ).pipe(
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawnerService),
-          Effect.provideService(Digest.Digest, digestService),
-          Effect.provideService(FileSystem.FileSystem, fileSystemService),
-          Effect.provideService(Path.Path, pathService),
-        );
-        yield* Effect.logDebug("ssh.environment.tunnel.finalizer.succeeded", {
-          ...sshTargetLogFields(tunnelEntry.target),
-          key: tunnelEntry.key,
-          localPort: tunnelEntry.localPort,
-          remotePort: tunnelEntry.remotePort,
+        return tunnelEntry.process.kill({
+          killSignal: "SIGTERM",
+          forceKillAfter: TUNNEL_SHUTDOWN_TIMEOUT_MS,
         });
       }).pipe(Effect.ignore),
     );
@@ -1785,7 +1744,6 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
         remotePort: entry.remotePort,
         cause: readinessExit.cause,
       });
-      // Closing a stale forward must not run the manager-owned remote stop.
       tunnels.delete(key);
       yield* closeTunnelEntry(entry);
     }
@@ -1891,7 +1849,6 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
           hasTunnel: entry !== null,
         });
         if (entry !== null) {
-          // Explicit disconnect owns the remote stop so its failure reaches the caller.
           yield* Effect.gen(function* () {
             tunnels.delete(key);
             yield* closeTunnelEntry(entry);
