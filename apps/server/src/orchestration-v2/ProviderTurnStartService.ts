@@ -47,6 +47,7 @@ import {
 import {
   deliverContextHandoffs,
   omittedHistoryNotice,
+  textBesideHistory,
   withInlineContext,
 } from "./ContextHandoffDelivery.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -1018,7 +1019,12 @@ export const layer: Layer.Layer<
             return handoffBudget({
               tokenCap,
               modelContextWindow,
-              userText: restartNote === "" ? userText : `${restartNote}\n\n${userText}`,
+              userText: textBesideHistory({
+                userText,
+                restartNote,
+                // Counted even on turns that defer it; over-reserving only shrinks history.
+                sideChatContext: sideChatHandoff?.summaryText ?? "",
+              }),
               attachments: message.attachments,
               providerThread: budgetProviderThread,
               nativeContextEstimate:

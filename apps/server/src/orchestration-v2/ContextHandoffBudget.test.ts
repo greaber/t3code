@@ -26,7 +26,7 @@ import {
   historicalMessage,
 } from "@t3tools/provider-core/server/handoffBudget";
 import { projectContextHandoffForWire } from "./WireProjection.ts";
-import { deliverContextHandoffs } from "./ContextHandoffDelivery.ts";
+import { deliverContextHandoffs, textBesideHistory } from "./ContextHandoffDelivery.ts";
 
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeHandoff = Schema.decodeUnknownSync(OrchestrationV2ContextHandoff);
@@ -261,6 +261,20 @@ describe("handoff budget", () => {
       );
     }
     assert.equal(handoffBudget({ ...base, tokenCap: 2_000 }), 2_000);
+
+    // A side chat's parent digest is sent beside history, so it shares the room.
+    const sideChat = { ...base, tokenCap: undefined, modelContextWindow: 128_000 };
+    const withoutSideChat = handoffBudget(sideChat);
+    const withSideChat = handoffBudget({
+      ...sideChat,
+      userText: textBesideHistory({
+        userText: base.userText,
+        restartNote: "",
+        sideChatContext: "s".repeat(64_000),
+      }),
+    });
+    assert.isBelow(withSideChat, withoutSideChat);
+    assert.isAtMost(withSideChat, 128_000 - 32_000 - 64_000);
 
     const uncapped = { ...base, tokenCap: undefined };
     assert.equal(

@@ -16,6 +16,16 @@ import {
 export const withInlineContext = (context: string, userText: string): string =>
   context === "" ? userText : `${context}\n\nUser message:\n${userText}`;
 
+/** Everything a turn sends beside handoff history; the history budget must leave room for it. */
+export const textBesideHistory = (input: {
+  readonly userText: string;
+  readonly sideChatContext: string;
+  readonly restartNote: string;
+}): string =>
+  [input.sideChatContext, input.restartNote, input.userText]
+    .filter((part) => part !== "")
+    .join("\n\n");
+
 /** The user-visible counterpart of the coverage note that tells the agent how to recover history. */
 export const omittedHistoryNotice = (omittedItems: number): string =>
   `${omittedItems} earlier ${omittedItems === 1 ? "item" : "items"} of this thread did not fit in the model's context and ${omittedItems === 1 ? "was" : "were"} not passed along. The agent can read ${omittedItems === 1 ? "it" : "them"} from the thread when needed.`;
