@@ -1,0 +1,269 @@
+name: Fork Release
+
+# Publishes this fork's server as the self-contained CLI archives that the
+# desktop app's SSH launcher, `t3 service` self-update, `t3 update` and
+# scripts/install.sh download (see packages/shared/src/cliRelease.ts). It runs
+# the same build scripts as release.yml's cli_archive jobs on GitHub-hosted
+# runners, without signing, npm, relay, web, or desktop installers.
+# See docs/operations/fork-release.md.
+
+on:
+  push:
+    tags:
+      - "v*-grant.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Preflight
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      clerk_publishable_key: ${{ steps.meta.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ steps.meta.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ steps.meta.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ steps.meta.outputs.relay_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      # The version comes from the committed package.json files, so a desktop app
+      # built locally from this commit asks remote hosts for exactly this release.
+      - id: meta
+        name: Resolve version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version apps/server/package.json)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-grant\.[0-9]+$ ]]; then
+            echo "::error::apps/server/package.json version '$version' is not <x.y.z>-grant.<n>." >&2
+            exit 1
+          fi
+          for file in apps/desktop/package.json apps/web/package.json packages/contracts/package.json; do
+            if [[ "$(jq -r .version "$file")" != "$version" ]]; then
+              echo "::error::$file does not have version $version." >&2
+              exit 1
+            fi
+          done
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package version $version." >&2
+            exit 1
+          fi
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release v$version already exists; bump the version." >&2
+            exit 1
+          fi
+          # The same public T3 Connect identifiers release.yml's preview builds use.
+          env_example() { sed -n "s|^T3CODE_$1=||p" .env.example; }
+          {
+            echo "version=$version"
+            echo "clerk_publishable_key=$(env_example CLERK_PUBLISHABLE_KEY)"
+            echo "clerk_jwt_template=$(env_example CLERK_JWT_TEMPLATE)"
+            echo "clerk_cli_oauth_client_id=$(env_example CLERK_CLI_OAUTH_CLIENT_ID)"
+            echo "relay_url=$(env_example RELAY_URL)"
+          } >> "$GITHUB_OUTPUT"
+
+  # Mirrors release.yml's build_bundle: the server bundle and web client, built once.
+  build_bundle:
+    name: Build JS bundle
+    needs: [preflight]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ needs.preflight.outputs.clerk_publishable_key }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ needs.preflight.outputs.clerk_jwt_template }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ needs.preflight.outputs.clerk_cli_oauth_client_id }}
+      T3CODE_RELAY_URL: ${{ needs.preflight.outputs.relay_url }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+
+      - name: Build JS bundle
+        run: vp run build:desktop:bundle
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  # The cli_archive steps of release-desktop.yml, without signing or the desktop app.
+  cli_archive:
+    name: CLI ${{ matrix.resource_key }}
+    needs: [preflight, build_bundle]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+            rust_target: x86_64-unknown-linux-gnu
+            resource_key: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+            resource_key: linux-arm64
+          - runner: macos-15
+            platform: mac
+            arch: arm64
+            rust_target: aarch64-apple-darwin
+            resource_key: darwin-arm64
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ needs.preflight.outputs.clerk_publishable_key }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ needs.preflight.outputs.clerk_jwt_template }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ needs.preflight.outputs.clerk_cli_oauth_client_id }}
+      T3CODE_RELAY_URL: ${{ needs.preflight.outputs.relay_url }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - name: Download JS bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: js-bundle
+          path: apps
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build resource monitor
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target "${{ matrix.rust_target }}"
+
+      - name: Apply web client branding
+        run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
+
+      - name: Build CLI single-executable
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Stage resource monitor for the CLI archive
+        run: |
+          set -euo pipefail
+          target_dir="$RUNNER_TEMP/cli-resource-monitor/${{ matrix.resource_key }}"
+          mkdir -p "$target_dir"
+          cp "native/resource-monitor/target/${{ matrix.rust_target }}/release/t3-resource-monitor" "$target_dir/"
+
+      # The Linux archive ships libatomic.so.1 and points t3's RUNPATH at it.
+      - name: Install patchelf
+        if: matrix.platform == 'linux'
+        run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
+
+      # Without a signing identity the macOS executable is signed ad hoc.
+      - name: Build CLI archive
+        run: |
+          node scripts/build-cli-archive.ts \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --version "$VERSION" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$VERSION"
+
+      - name: Upload CLI archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.resource_key }}
+          path: release-cli/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    needs: [preflight, cli_archive]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download CLI archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: release-assets
+
+      # The format scripts/install.sh, pinnedRuntime.ts and the SSH runner verify against.
+      - name: Write SHA256SUMS
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(t3-"$VERSION"-*.tar.gz)
+          if (( ${#archives[@]} != 3 )); then
+            echo "::error::Expected 3 CLI archives, found ${#archives[@]}." >&2
+            ls -la
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      # Marked latest and not a prerelease: scripts/install.sh resolves the
+      # stable track through /releases/latest.
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "T3 Code v$VERSION" \
+            --notes "Server build of the greaber/t3code fork at ${GITHUB_SHA::10}. Install the desktop app from a local build of the same commit." \
+            --latest

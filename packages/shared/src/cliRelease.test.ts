@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { cliArchiveTarCommand, newestCliReleaseVersion, parseChecksums } from "./cliRelease.ts";
+import {
+  cliArchiveTarCommand,
+  crossesReleaseTrack,
+  newestCliReleaseVersion,
+  parseChecksums,
+} from "./cliRelease.ts";
 
 describe("cliRelease", () => {
   it("parses sha256sum output including binary-mode markers", () => {
@@ -38,5 +43,13 @@ describe("cliRelease", () => {
     expect(newestCliReleaseVersion(releases, "nightly")).toBe("1.2.4-nightly.20260912.7");
     expect(newestCliReleaseVersion(releases, "stable")).toBe("1.2.3");
     expect(newestCliReleaseVersion([{ tag_name: "v1.2.3" }], "preview")).toBeUndefined();
+  });
+
+  it("treats this fork's grant builds as the stable track", () => {
+    expect(newestCliReleaseVersion([{ tag_name: "v0.1.9-grant.2" }], "stable")).toBe(
+      "0.1.9-grant.2",
+    );
+    expect(crossesReleaseTrack("0.1.7", "0.1.9-grant.1")).toBe(false);
+    expect(crossesReleaseTrack("0.1.9-grant.1", "0.1.9-grant.2")).toBe(false);
   });
 });
