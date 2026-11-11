@@ -128,11 +128,6 @@ function readTranscript(scenario: string, driver: ProviderDriverKind) {
   });
 }
 
-function compactExpectedText(text: string, maxLength = 240): string {
-  const compacted = text.replace(/\s+/gu, " ").trim();
-  return compacted.length <= maxLength ? compacted : `${compacted.slice(0, maxLength - 3)}...`;
-}
-
 function forkDeltaSummary(input: {
   readonly sourceThreadId: ThreadId;
   readonly targetThreadId: ThreadId;
@@ -146,8 +141,8 @@ function forkDeltaSummary(input: {
     "Covered fork runs: 1-1",
     "",
     "Fork delta:",
-    `- User: ${compactExpectedText(input.forkUserText)}`,
-    `- Assistant: ${compactExpectedText(input.forkAssistantText)}`,
+    `- User: ${input.forkUserText.trim()}`,
+    `- Assistant: ${input.forkAssistantText.trim()}`,
     "- Checkpoint: 0 files",
   ].join("\n");
 }

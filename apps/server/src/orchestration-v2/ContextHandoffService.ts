@@ -204,12 +204,21 @@ export const readForkHistoryItems = Effect.fn(
   ];
 });
 
+const DELTA_ITEM_TYPES = new Set<OrchestrationV2TurnItem["type"]>([
+  "user_message",
+  "assistant_message",
+  "command_execution",
+  "file_change",
+  "checkpoint",
+  "handoff",
+]);
+
 function summarizeDeltaItem(item: OrchestrationV2TurnItem): string | null {
   switch (item.type) {
     case "user_message":
-      return `- User: ${compactText(item.text)}`;
+      return `- User: ${item.text.trim()}`;
     case "assistant_message":
-      return `- Assistant: ${compactText(item.text)}`;
+      return `- Assistant: ${item.text.trim()}`;
     case "command_execution":
       return `- Command: ${compactText(item.input)}`;
     case "file_change":
@@ -223,28 +232,61 @@ function summarizeDeltaItem(item: OrchestrationV2TurnItem): string | null {
   }
 }
 
-function makeForkDeltaSummary(input: {
+/** Keeps whole lines, newest first, until `budget` runs out; older lines are dropped, never cut. */
+function newestLinesWithin(
+  digest: ReadonlyArray<string | OrchestrationV2TurnItem>,
+  budget: number,
+  cost: (line: string) => number,
+) {
+  const kept: Array<string> = [];
+  let remaining = budget;
+  let index = digest.length - 1;
+  for (; index >= 0; index--) {
+    const item = digest[index]!;
+    const line = typeof item === "string" ? item : summarizeDeltaItem(item);
+    if (line === null) continue;
+    if (cost(line) + 1 > remaining) break;
+    kept.unshift(line);
+    remaining -= cost(line) + 1;
+  }
+  const omitted = digest
+    .slice(0, index + 1)
+    .filter((item) => typeof item === "string" || DELTA_ITEM_TYPES.has(item.type)).length;
+  return { kept, omitted };
+}
+
+const utf8Bytes = (line: string) => Buffer.byteLength(line);
+
+export function makeForkDeltaSummary(input: {
   readonly sourceThreadId: ThreadId;
   readonly targetThreadId: ThreadId;
   readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
   readonly deltaItems: ReadonlyArray<OrchestrationV2TurnItem>;
+  readonly budget: number;
 }): string {
-  const itemLines = input.deltaItems.flatMap((item) => {
-    const line = summarizeDeltaItem(item);
-    return line === null ? [] : [line];
-  });
-  return [
+  const header = [
     "Merge-back context from forked conversation.",
     `Source thread: ${input.sourceThreadId}`,
     `Target thread: ${input.targetThreadId}`,
     `Covered fork runs: ${input.coveredRunOrdinals.from}-${input.coveredRunOrdinals.to}`,
     "",
     "Fork delta:",
-    ...(itemLines.length === 0 ? ["- No user-visible delta items."] : itemLines),
+  ];
+  const omittedLine = (count: number) =>
+    `- ${count} earlier ${count === 1 ? "item" : "items"} omitted to fit the context budget; read them with t3_thread_read on thread ${input.sourceThreadId}.`;
+  const { kept, omitted } = newestLinesWithin(
+    input.deltaItems,
+    input.budget - utf8Bytes(header.join("\n")) - utf8Bytes(omittedLine(input.deltaItems.length)),
+    utf8Bytes,
+  );
+  return [
+    ...header,
+    ...(omitted > 0 ? [omittedLine(omitted)] : []),
+    ...(kept.length === 0 && omitted === 0 ? ["- No user-visible delta items."] : kept),
   ].join("\n");
 }
 
-const SIDE_CHAT_CONTEXT_MAX_CHARS = 8_000;
+const SIDE_CHAT_CONTEXT_MAX_CHARS = 64_000;
 
 /** Oldest first; raw parent items are summarized only until the context cap is reached. */
 export function makeSideChatContext(input: {
@@ -256,25 +298,15 @@ export function makeSideChatContext(input: {
   const header = "Main thread activity since this side chat's starting point:";
   const truncated = "- Earlier items truncated.";
   const footer = `Use t3_thread_read on thread ${input.parentThreadId} to see the main thread's live state.`;
-  const kept: Array<string> = [];
-  let omitted = false;
   // The cap covers the whole block, so the fixed lines are reserved before any digest line.
-  let remaining =
-    SIDE_CHAT_CONTEXT_MAX_CHARS - [framing, "", header, truncated, "", footer].join("\n").length;
-  for (let index = input.digest.length - 1; index >= 0; index--) {
-    const item = input.digest[index]!;
-    const line = typeof item === "string" ? item : summarizeDeltaItem(item);
-    if (line === null) continue;
-    if (line.length + 1 > remaining) {
-      omitted = true;
-      break;
-    }
-    kept.unshift(line);
-    remaining -= line.length + 1;
-  }
+  const { kept, omitted } = newestLinesWithin(
+    input.digest,
+    SIDE_CHAT_CONTEXT_MAX_CHARS - [framing, "", header, truncated, "", footer].join("\n").length,
+    (line) => line.length,
+  );
   return [
     framing,
-    ...(kept.length === 0 ? [] : ["", header, ...(omitted ? [truncated] : []), ...kept]),
+    ...(kept.length === 0 ? [] : ["", header, ...(omitted > 0 ? [truncated] : []), ...kept]),
     "",
     footer,
   ].join("\n");
@@ -470,7 +502,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           strategy: "fork_delta_summary",
           status: "ready",
           summaryMessageId: null,
-          summaryText: makeForkDeltaSummary(input),
+          summaryText: makeForkDeltaSummary({ ...input, budget: tokenCap }),
           history: {
             messages: selected.messages,
             coverage,

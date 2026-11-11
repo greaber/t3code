@@ -170,12 +170,12 @@ it.effect("caps the side chat context block without summarizing discarded parent
       ...importedItem({
         role: index % 2 === 0 ? "user" : "assistant",
         id: `parent-${index}`,
-        text: `item-${index} ${"x".repeat(228)}😀${"x".repeat(70)}`,
+        text: `item-${index} ${"x".repeat(1_228)}😀\n${"x".repeat(70)}`,
         ordinal: index,
       }),
       get text() {
         summarizedItems++;
-        return `item-${index} ${"x".repeat(228)}😀${"x".repeat(70)}`;
+        return `item-${index} ${"x".repeat(1_228)}😀\n${"x".repeat(70)}`;
       },
     }));
     const service = yield* ContextHandoffService.ContextHandoffServiceV2;
@@ -196,8 +196,8 @@ it.effect("caps the side chat context block without summarizing discarded parent
 
     assert.include(context, "- Earlier items truncated.");
     assert.notInclude(context, "item-0 ");
-    assert.include(context, "- Assistant: item-59 ");
-    assert.isAtMost(context.length, 8_000);
+    assert.include(context, `- Assistant: item-59 ${"x".repeat(1_228)}😀\n${"x".repeat(70)}`);
+    assert.isAtMost(context.length, 64_000);
     assert.isTrue(context.isWellFormed());
     assert.isTrue(
       context.endsWith(
@@ -243,6 +243,36 @@ it.effect("caps the side chat context block without summarizing discarded parent
     assert.include(multiFilePatch, "- File change: src/a.ts, src/b.ts, src/new.ts");
   }).pipe(Effect.provide(layerTest)),
 );
+
+it("keeps whole merge-back messages and drops the oldest past the budget", () => {
+  const deltaItems = Array.from({ length: 6 }, (_, index) =>
+    importedItem({
+      role: index % 2 === 0 ? "user" : "assistant",
+      id: `fork-${index}`,
+      text: `fork-${index}\n${"y".repeat(1_000)}`,
+      ordinal: index,
+    }),
+  );
+  const summarize = (budget: number) =>
+    ContextHandoffService.makeForkDeltaSummary({
+      sourceThreadId: ThreadId.make("thread:fork"),
+      targetThreadId: ThreadId.make("thread:main"),
+      coveredRunOrdinals: { from: 1, to: 2 },
+      deltaItems,
+      budget,
+    });
+
+  const full = summarize(1_000_000);
+  assert.include(full, `- User: fork-0\n${"y".repeat(1_000)}`);
+  assert.notInclude(full, "omitted");
+
+  const cut = summarize(3_000);
+  assert.isAtMost(Buffer.byteLength(cut), 3_000);
+  assert.include(cut, "- 4 earlier items omitted to fit the context budget");
+  assert.notInclude(cut, "fork-3");
+  assert.include(cut, `- User: fork-4\n${"y".repeat(1_000)}`);
+  assert.include(cut, `- Assistant: fork-5\n${"y".repeat(1_000)}`);
+});
 
 it("covers the run range of a very long delta", () => {
   const runs = [
