@@ -30,7 +30,9 @@ never shortens your request to make it fit.
 Recovery leaves running background work intact. Let it finish or stop it before retrying the handoff.
 
 By default, history may use up to half of the target model's context window, or 200,000 tokens
-when the window is unknown. Server operators can set `T3CODE_CONTEXT_HANDOFF_TOKEN_CAP` to use a
+when the window is unknown. Switching a long thread to a large-window model can therefore send a
+lot of history on the first turn, which costs tokens with providers that bill by usage; start a
+new thread instead when you do not need the earlier conversation. Server operators can set `T3CODE_CONTEXT_HANDOFF_TOKEN_CAP` to use a
 fixed allowance instead (clamped to 1,024–1,000,000). Either way it is an upper bound, not a
 provider context-window guarantee. Text accounting conservatively charges one token per UTF-8 byte,
 including attribution and JSON escaping. Your current input and attachments do not count against
