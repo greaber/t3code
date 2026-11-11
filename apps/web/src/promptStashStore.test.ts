@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
 import {
   collectAssistantCitations,
@@ -9,7 +9,9 @@ import { removeLocalStorageItem } from "./hooks/useLocalStorage";
 
 import {
   PROMPT_STASH_STORAGE_KEY,
+  STASH_IMAGE_STORAGE_BUDGET_CHARS,
   keepImagesThatFit,
+  promptStashStorageForTest,
   usePromptStashStore,
   writePromptStashStorageForTest,
   type PromptStashEntry,
@@ -60,7 +62,7 @@ describe("keepImagesThatFit", () => {
     const writes: Array<ReadonlyArray<string>> = [];
     const fits = keepImagesThatFit(images, (kept) => {
       writes.push(kept.map((attachment) => attachment.id));
-      return { written: true };
+      return { written: true, storageFull: false };
     });
     expect(fits.kept).toEqual(images);
     expect(fits.droppedNames).toEqual([]);
@@ -68,7 +70,8 @@ describe("keepImagesThatFit", () => {
     writes.length = 0;
     const full = keepImagesThatFit(images, (kept, dropped) => {
       writes.push([...kept.map((attachment) => attachment.id), ...dropped]);
-      return { written: kept.reduce((sum, attachment) => sum + attachment.dataUrl.length, 0) < 50 };
+      const written = kept.reduce((sum, attachment) => sum + attachment.dataUrl.length, 0) < 50;
+      return { written, storageFull: !written };
     });
     expect(full.kept.map((attachment) => attachment.id)).toEqual(["small"]);
     expect(full.droppedNames).toEqual(["huge.png", "medium.png"]);
@@ -78,9 +81,18 @@ describe("keepImagesThatFit", () => {
       ["small", "huge.png", "medium.png"],
     ]);
 
-    const nothingFits = keepImagesThatFit(images, () => ({ written: false }));
+    const nothingFits = keepImagesThatFit(images, () => ({ written: false, storageFull: true }));
     expect(nothingFits.kept).toEqual([]);
     expect(nothingFits.result.written).toBe(false);
+
+    // A failure other than a full quota is not fixed by dropping images.
+    let attempts = 0;
+    const broken = keepImagesThatFit(images, () => {
+      attempts += 1;
+      return { written: false, storageFull: false };
+    });
+    expect(attempts).toBe(1);
+    expect(broken.kept).toEqual(images);
   });
 });
 
@@ -130,6 +142,57 @@ describe("promptStashStore", () => {
     expect(entries).toHaveLength(50);
     expect(entries[0]?.id).toBe("entry-49");
     expect(entries.at(-1)?.id).toBe("entry-0");
+  });
+
+  it("keeps existing entries intact when a write hits the storage quota", () => {
+    const store = usePromptStashStore.getState();
+    store.stashEntry(makeEntry({ id: "kept-1" }));
+    store.stashEntry(makeEntry({ id: "kept-2" }));
+    const storage = promptStashStorageForTest();
+    const saved = storage.getItem(PROMPT_STASH_STORAGE_KEY);
+    {
+      using _full = vi.spyOn(storage, "setItem").mockImplementation(() => {
+        throw new DOMException("full", "QuotaExceededError");
+      });
+      expect(store.stashEntry(makeEntry({ id: "rejected" }))).toEqual({
+        written: false,
+        durable: false,
+        storageFull: true,
+      });
+    }
+    {
+      using _denied = vi.spyOn(storage, "setItem").mockImplementation(() => {
+        throw new DOMException("denied", "SecurityError");
+      });
+      expect(store.stashEntry(makeEntry({ id: "denied" })).storageFull).toBe(false);
+    }
+    expect(usePromptStashStore.getState().entries.map((entry) => entry.id)).toEqual([
+      "kept-2",
+      "kept-1",
+    ]);
+    expect(storage.getItem(PROMPT_STASH_STORAGE_KEY)).toBe(saved);
+  });
+
+  it("leaves images out once the stash would pass its share of storage", () => {
+    const store = usePromptStashStore.getState();
+    store.stashEntry({ ...makeEntry({ id: "big-images" }), pendingImageCount: 2 });
+    const image = (id: string, chars: number) => ({
+      id,
+      name: `${id}.png`,
+      mimeType: "image/png",
+      sizeBytes: chars,
+      dataUrl: "x".repeat(chars),
+    });
+    const result = store.finalizeEntryImages("big-images", {
+      attachments: [image("small", 1_000), image("huge", STASH_IMAGE_STORAGE_BUDGET_CHARS)],
+      droppedImageNames: [],
+      unreadableImageNames: [],
+    });
+    expect(result.storageDroppedImageNames).toEqual(["huge.png"]);
+    expect(usePromptStashStore.getState().entries[0]).toMatchObject({
+      attachments: [{ id: "small" }],
+      droppedImageNames: ["huge.png"],
+    });
   });
 
   // regression: #4787 stashed prompts were lost when switching providers

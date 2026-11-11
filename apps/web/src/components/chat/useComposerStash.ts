@@ -520,7 +520,7 @@ export function useComposerStash(input: {
       // crash or closed tab mid-encode still leaves the prompt recoverable,
       // while clearing before the async image work means edits typed during
       // encoding are not wiped.
-      const { written, durable } = stashEntryToQueue({
+      const { written, durable, storageFull } = stashEntryToQueue({
         id: entryId,
         createdAt: new Date().toISOString(),
         prompt,
@@ -539,8 +539,9 @@ export function useComposerStash(input: {
         toastManager.add({
           type: "error",
           title: "Could not stash this prompt",
-          description:
-            "Browser storage is full. Your earlier stashed prompts are unchanged and this one stays in the composer. Delete stashed prompts you no longer need, then try again.",
+          description: storageFull
+            ? "Browser storage is full. Your earlier stashed prompts are unchanged and this one stays in the composer. Delete stashed prompts you no longer need, then try again."
+            : "Browser storage rejected the write. Your earlier stashed prompts are unchanged and this one stays in the composer.",
           data: { hideCopyButton: true },
         });
         return;
@@ -613,7 +614,7 @@ export function useComposerStash(input: {
           toastManager.add({
             type: "warning",
             title: "Some stashed images were not saved",
-            description: `Browser storage is full, so the prompt was stashed without ${storageDroppedImageNames.join(", ")}. Delete stashed prompts you no longer need to make room.`,
+            description: `The stash is at its share of browser storage, which it leaves partly free for drafts, so the prompt was stashed without ${storageDroppedImageNames.join(", ")}. Delete stashed prompts you no longer need to make room.`,
             data: { hideCopyButton: true },
           });
         } else if (!imagesDurable && durable && images.length > 0) {
