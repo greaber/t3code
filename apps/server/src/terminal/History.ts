@@ -395,6 +395,27 @@ export class BoundedTerminalHistory {
     return pieces.join("");
   }
 
+  /** The first character boundary at or after `offset` in memory. */
+  alignForward(offset: number): number {
+    if (offset <= this.memoryStart) return this.memoryStart;
+    if (offset >= this.end) return this.end;
+    let chunkStart = this.memoryStart;
+    for (let index = this.start; index < this.chunks.length; index += 1) {
+      const chunk = this.chunks[index]!;
+      if (chunkStart + chunk.byteLength > offset) {
+        let consumed = 0;
+        for (let at = 0; consumed < offset - chunkStart;) {
+          const codePoint = chunk.data.codePointAt(at)!;
+          consumed += utf8Width(codePoint);
+          at += codePoint <= 0xffff ? 1 : 2;
+        }
+        return chunkStart + consumed;
+      }
+      chunkStart += chunk.byteLength;
+    }
+    return this.end;
+  }
+
   /** Whether the text just before `offset` is a line break, when memory holds it. */
   lineBreakBefore(offset: number): boolean | undefined {
     if (offset <= this.memoryStart || offset > this.end) return undefined;
@@ -500,4 +521,27 @@ export function releaseHistoryMemory(
     total -= before - history.memoryBytes;
     if (total <= budget) return;
   }
+}
+
+/**
+ * Where to read history `[from, to)` in a file holding it from `fileStart`, taken under
+ * the file's lock: a rewrite can have trimmed the history or moved the file's start since
+ * the range was chosen. Reads one byte more in front, to tell whether the range starts a
+ * line. Null when the file holds none of it.
+ */
+export function historyFileRead(
+  from: number,
+  to: number,
+  historyStart: number,
+  fileStart: number,
+): {
+  readonly from: number;
+  readonly readFrom: number;
+  readonly position: number;
+  readonly length: number;
+} | null {
+  const lower = Math.max(from, historyStart, fileStart);
+  if (to <= lower) return null;
+  const readFrom = Math.max(fileStart, lower - 1);
+  return { from: lower, readFrom, position: readFrom - fileStart, length: to - readFrom };
 }

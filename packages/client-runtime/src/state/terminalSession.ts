@@ -130,6 +130,8 @@ function terminalBufferStateFromSnapshot(
             end: snapshot.historyEnd,
             older: snapshot.olderHistory ?? false,
           },
+      // The output must fit the rows of views drawing this grid.
+      nextGrid(current.grid, snapshot)?.cols,
     ),
     grid: nextGrid(current.grid, snapshot),
     status: snapshot.status,
@@ -195,7 +197,7 @@ export function applyTerminalAttachStreamEvent(
           : event.type === "newerHistory"
             ? appendNewerOutput
             : showLatestOutput;
-      const output = apply(current.output, event.page, maxBufferBytes);
+      const output = apply(current.output, event.page, maxBufferBytes, current.grid?.cols);
       return output === current.output
         ? current
         : { ...current, output, version: current.version + 1 };
@@ -223,7 +225,13 @@ export function applyTerminalAttachStreamEvent(
     case "output":
       return {
         ...current,
-        output: appendOutput(current.output, event.data, maxBufferBytes, event.historyEnd),
+        output: appendOutput(
+          current.output,
+          event.data,
+          maxBufferBytes,
+          event.historyEnd,
+          current.grid?.cols,
+        ),
         status: current.status === "closed" ? "running" : current.status,
         error: null,
         version: current.version + 1,

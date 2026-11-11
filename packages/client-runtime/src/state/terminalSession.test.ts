@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { EnvironmentId, TerminalSessionSnapshot, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  TERMINAL_VIEW_SCROLLBACK_ROWS,
+  TerminalSessionSnapshot,
+  ThreadId,
+} from "@t3tools/contracts";
 
 import {
   applyTerminalAttachStreamEvent,
@@ -347,6 +352,134 @@ describe("terminal session reducers", () => {
     state = apply(state, output("z\n", 16));
     state = apply(state, { type: "latestHistory", page: page("$ x\ny\n", 8, 14, false) });
     expect(terminalOutputText(state.output)).toBe("$ x\ny\nz\n");
+    expect(state.output.detached).toBeNull();
+  });
+
+  it("keeps its start at a known offset when live output arrives in large events", () => {
+    let state = applyTerminalAttachStreamEvent(
+      EMPTY_TERMINAL_BUFFER_STATE,
+      {
+        type: "snapshot",
+        snapshot: { ...BASE_SNAPSHOT, history: "", historyOffset: 0, historyEnd: 0 },
+      },
+      256 * 1024,
+    );
+    let end = 0;
+    // Each event splits into chunks; only the last knows its server offset.
+    const event = `${"x".repeat(41 * 1024 - 1)}\n`;
+    for (let index = 0; index < 20; index += 1) {
+      end += event.length;
+      state = applyTerminalAttachStreamEvent(
+        state,
+        {
+          type: "output",
+          threadId: TARGET.threadId,
+          terminalId: TARGET.terminalId,
+          data: event,
+          historyEnd: end,
+        },
+        256 * 1024,
+      );
+      // Once the window drops output, its start is where an event ended.
+      if (end <= 256 * 1024) continue;
+      expect(canLoadOlderTerminalOutput(state.output)).toBe(true);
+      expect((end - state.output.historyOffset!) % event.length).toBe(0);
+    }
+  });
+
+  it("holds no more output than a narrow view can show", () => {
+    let state = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
+      type: "activity",
+      threadId: TARGET.threadId,
+      terminalId: TARGET.terminalId,
+      hasRunningSubprocess: false,
+      label: "Terminal 1",
+      cols: 40,
+      rows: 20,
+    });
+    state = applyTerminalAttachStreamEvent(state, {
+      type: "snapshot",
+      snapshot: {
+        ...BASE_SNAPSHOT,
+        history: "",
+        historyOffset: 0,
+        historyEnd: 0,
+        cols: 40,
+        rows: 20,
+      },
+    });
+    const line = `${"y".repeat(399)}\n`;
+    let end = 0;
+    for (let index = 0; index < 100; index += 1) {
+      const data = line.repeat(256);
+      end += data.length;
+      state = applyTerminalAttachStreamEvent(state, {
+        type: "output",
+        threadId: TARGET.threadId,
+        terminalId: TARGET.terminalId,
+        data,
+        historyEnd: end,
+      });
+    }
+    // Each 400-character line takes ten rows at 40 columns.
+    const rows = state.output.retainedLines * 10;
+    expect(rows).toBeLessThanOrEqual(TERMINAL_VIEW_SCROLLBACK_ROWS);
+    // An older page still fits, pushing out the newest output instead.
+    const page = line.repeat(64);
+    state = applyTerminalAttachStreamEvent(state, {
+      type: "olderHistory",
+      page: {
+        data: page,
+        offset: state.output.historyOffset! - page.length,
+        end: state.output.historyOffset!,
+        olderHistory: true,
+        newerHistory: true,
+      },
+    });
+    expect(terminalOutputText(state.output).startsWith(page)).toBe(true);
+    expect(state.output.retainedLines * 10).toBeLessThanOrEqual(TERMINAL_VIEW_SCROLLBACK_ROWS);
+  });
+
+  it("shows where the server trimmed output a paused view had not reached", () => {
+    let state = applyTerminalAttachStreamEvent(
+      EMPTY_TERMINAL_BUFFER_STATE,
+      {
+        type: "snapshot",
+        snapshot: { ...BASE_SNAPSHOT, history: "c\nd\n", historyOffset: 4, historyEnd: 8 },
+      },
+      8,
+    );
+    state = applyTerminalAttachStreamEvent(
+      state,
+      {
+        type: "output",
+        threadId: TARGET.threadId,
+        terminalId: TARGET.terminalId,
+        data: "$ ",
+        historyEnd: 10,
+      },
+      8,
+    );
+    state = applyTerminalAttachStreamEvent(
+      state,
+      {
+        type: "olderHistory",
+        page: { data: "a\nb\n", offset: 0, end: 4, olderHistory: false, newerHistory: true },
+      },
+      8,
+    );
+    expect(state.output.detached).toMatchObject({ end: 8 });
+    // The server trimmed past the paused view's end; its next page starts later.
+    state = applyTerminalAttachStreamEvent(
+      state,
+      {
+        type: "newerHistory",
+        page: { data: "new\n", offset: 20, end: 24, olderHistory: false, newerHistory: false },
+      },
+      256,
+    );
+    expect(terminalOutputText(state.output)).toContain("Earlier output was removed");
+    expect(terminalOutputText(state.output).endsWith("new\n")).toBe(true);
     expect(state.output.detached).toBeNull();
   });
 

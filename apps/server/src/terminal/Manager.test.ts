@@ -1071,6 +1071,70 @@ it.layer(
     }),
   );
 
+  it.effect("waits longer after each failed history write", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      let attempts = 0;
+      const full = FileSystem.FileSystem.of({
+        ...fs,
+        makeTempFileScoped: () => {
+          attempts += 1;
+          return Effect.fail(
+            PlatformError.systemError({
+              _tag: "Unknown",
+              module: "FileSystem",
+              method: "makeTempFileScoped",
+              cause: { code: "ENOSPC" },
+            }),
+          );
+        },
+      });
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        processTable: Effect.succeed([]),
+      }).pipe(Effect.provideService(FileSystem.FileSystem, full));
+      yield* manager.open(openInput());
+      const process = ptyAdapter.processes[0]!;
+      const quarterSeconds = (count: number) =>
+        Effect.forEach(Array.from({ length: count }), () => TestClock.adjust("250 millis"), {
+          discard: true,
+        });
+      process.emitData("a\n");
+      yield* quarterSeconds(1);
+      expect(attempts).toBe(1);
+      // Output keeps arriving, but the next attempt waits a second, then two.
+      for (const output of ["b\n", "c\n", "d\n"]) process.emitData(output);
+      yield* quarterSeconds(3);
+      expect(attempts).toBe(1);
+      yield* quarterSeconds(2);
+      expect(attempts).toBe(2);
+      process.emitData("e\n");
+      yield* quarterSeconds(6);
+      expect(attempts).toBe(2);
+      yield* quarterSeconds(4);
+      expect(attempts).toBe(3);
+      // Closing writes at once, whatever the delay; it waits out a pending debounce.
+      const closing = yield* manager
+        .close({ threadId: "thread-1" })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* quarterSeconds(1);
+      yield* Fiber.join(closing);
+      expect(attempts).toBe(4);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("removes rewrites a crash left behind when it starts", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { join } = yield* Path.Path;
+      const logsDir = join(yield* fs.makeTempDirectoryScoped(), "terminals");
+      yield* fs.makeDirectory(join(logsDir, ".history-abc123"), { recursive: true });
+      yield* fs.writeFileString(join(logsDir, ".history-abc123", "f00d"), "partial");
+      yield* fs.writeFileString(join(logsDir, "kept.log"), "history\n");
+      yield* TerminalManager.makeWithOptions({ logsDir, ptyAdapter: new FakePtyAdapter() });
+      expect(yield* fs.readDirectory(logsDir)).toEqual(["kept.log"]);
+    }),
+  );
+
   it.effect("replaces a mostly trimmed history file by renaming a complete copy", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

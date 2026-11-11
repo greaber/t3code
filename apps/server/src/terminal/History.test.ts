@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   BoundedTerminalHistory,
+  historyFileRead,
   planHistoryFileWrite,
   releaseHistoryMemory,
   startPageAtLine,
@@ -143,5 +144,28 @@ describe("BoundedTerminalHistory", () => {
     expect(histories.reduce((sum, history) => sum + history.memoryBytes, 0)).toBeLessThanOrEqual(
       500 * 1024,
     );
+  });
+
+  it("starts memory pages at a character and file reads within what the file holds", () => {
+    const history = new BoundedTerminalHistory(100, "a名b", 1_000);
+    // Byte 2 is inside 名, which starts at 1 and ends at 4.
+    expect(history.alignForward(2)).toBe(4);
+    expect(history.alignForward(1)).toBe(1);
+    expect(history.memoryText(history.alignForward(2))).toBe("b");
+
+    expect(historyFileRead(100, 200, 50, 40)).toEqual({
+      from: 100,
+      readFrom: 99,
+      position: 59,
+      length: 101,
+    });
+    // A rewrite trimmed the history and moved the file's start past the chosen range.
+    expect(historyFileRead(100, 200, 150, 150)).toEqual({
+      from: 150,
+      readFrom: 150,
+      position: 0,
+      length: 50,
+    });
+    expect(historyFileRead(100, 200, 250, 250)).toBeNull();
   });
 });

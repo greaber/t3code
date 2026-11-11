@@ -37,7 +37,10 @@ import {
   CodexSettings,
   ProviderInstanceId,
 } from "@t3tools/contracts";
-import { makeKeyedCoalescingWorker } from "@t3tools/shared/KeyedCoalescingWorker";
+import {
+  makeKeyedCoalescingWorker,
+  type KeyedCoalescingWorker,
+} from "@t3tools/shared/KeyedCoalescingWorker";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -48,6 +51,7 @@ import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Config from "effect/Config";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -80,6 +84,7 @@ import { terminalOutputStream } from "./OutputProtocol.ts";
 import {
   BoundedTerminalHistory,
   DEFAULT_HISTORY_BYTE_LIMIT,
+  historyFileRead,
   planHistoryFileWrite,
   releaseHistoryMemory,
   startPageAtLine,
@@ -112,6 +117,10 @@ const DEFAULT_HISTORY_MEMORY_BUDGET = 512 * 1024 * 1024;
 // A terminal keeps at least this much in memory, so attaching never reads its file.
 const MIN_HISTORY_MEMORY_BYTES = 2 * TERMINAL_HISTORY_PAGE_BYTES;
 const HISTORY_FILE_BLOCK_BYTES = 1024 * 1024;
+const HISTORY_TEMP_PREFIX = ".history-";
+// After a failed history write, the next waits this long, doubling to the maximum.
+const PERSIST_RETRY_BASE_MS = 1_000;
+const PERSIST_RETRY_MAX_MS = 60_000;
 // eCryptfs permits 143-byte names.
 const MAX_HISTORY_FILENAME_BYTES = 143;
 const DEFAULT_PERSIST_DEBOUNCE_MS = 250;
@@ -415,7 +424,7 @@ function terminalWireLabel(session: TerminalSessionState): string {
 /** The newest output held in memory, up to one page, starting at a line. */
 function newestHistoryPage(history: BoundedTerminalHistory): HistoryPage {
   const end = history.endOffset;
-  const from = Math.max(history.memoryStart, end - TERMINAL_HISTORY_PAGE_BYTES);
+  const from = history.alignForward(end - TERMINAL_HISTORY_PAGE_BYTES);
   const page = startPageAtLine(
     history.memoryText(from, end),
     from,
@@ -1523,6 +1532,19 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const unregisterTerminal = options.unregisterTerminal ?? (() => Effect.void);
 
   yield* fileSystem.makeDirectory(logsDir, { recursive: true }).pipe(Effect.orDie);
+  // A crash during a rewrite leaves its temporary directory behind.
+  yield* fileSystem.readDirectory(logsDir).pipe(
+    Effect.flatMap((entries) =>
+      Effect.forEach(
+        entries.filter((name) => name.startsWith(HISTORY_TEMP_PREFIX)),
+        (name) => fileSystem.remove(path.join(logsDir, name), { recursive: true, force: true }),
+        { discard: true },
+      ),
+    ),
+    Effect.catch((error) =>
+      Effect.logWarning("failed to remove leftover terminal history rewrites", { error }),
+    ),
+  );
 
   const managerStateRef = yield* SynchronizedRef.make<TerminalManagerState>({
     sessions: new Map(),
@@ -1859,7 +1881,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     yield* Effect.gen(function* () {
       const temporaryPath = yield* fileSystem.makeTempFileScoped({
         directory: logsDir,
-        prefix: ".history-",
+        prefix: HISTORY_TEMP_PREFIX,
       });
       yield* Effect.gen(function* () {
         const out = yield* fileSystem.open(temporaryPath, { flag: "w" });
@@ -1884,50 +1906,70 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     history.persisted = write.persisted;
   });
 
-  const persistWorker = yield* makeKeyedCoalescingWorker<
-    string,
-    PersistHistoryRequest,
-    never,
-    never
-  >({
-    merge: (current, next) => ({
-      history: next.history,
-      immediate: current.immediate || next.immediate,
-    }),
-    process: Effect.fn("terminal.persistHistoryWorker")(function* (sessionKey, request) {
-      if (!request.immediate) {
-        yield* Effect.sleep(DEFAULT_PERSIST_DEBOUNCE_MS);
-      }
+  // Consecutive failed writes per terminal and when the next may run, so a full disk does
+  // not cost a rewrite attempt every debounce.
+  const persistRetries = new Map<string, { readonly failures: number; readonly at: number }>();
 
-      const [threadId, terminalId] = sessionKey.split("\u0000");
-      if (!threadId || !terminalId) {
-        return;
-      }
+  const persistWorker: KeyedCoalescingWorker<string, PersistHistoryRequest> =
+    yield* makeKeyedCoalescingWorker<string, PersistHistoryRequest, never, never>({
+      merge: (current, next) => ({
+        history: next.history,
+        immediate: current.immediate || next.immediate,
+      }),
+      process: Effect.fn("terminal.persistHistoryWorker")(function* (sessionKey, request) {
+        if (!request.immediate) {
+          yield* Effect.sleep(DEFAULT_PERSIST_DEBOUNCE_MS);
+          // After a failure, wait out the retry delay, but let an immediate write through.
+          const retry = persistRetries.get(sessionKey);
+          if (retry !== undefined && (yield* Clock.currentTimeMillis) < retry.at) {
+            yield* persistWorker.enqueue(sessionKey, request);
+            return;
+          }
+        }
 
-      yield* historyFileLocks
-        .withLock(
-          sessionKey,
-          writeHistoryFile(historyPath(threadId, terminalId), request.history).pipe(
-            Effect.tap(() => Effect.sync(() => request.history.spill(historyMemoryBytes))),
-          ),
-        )
-        .pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("failed to persist terminal history", {
-              threadId,
-              terminalId,
-              cause,
-            }),
-          ),
+        const [threadId, terminalId] = sessionKey.split("\u0000");
+        if (!threadId || !terminalId) {
+          return;
+        }
+
+        yield* historyFileLocks
+          .withLock(
+            sessionKey,
+            writeHistoryFile(historyPath(threadId, terminalId), request.history).pipe(
+              Effect.tap(() => Effect.sync(() => request.history.spill(historyMemoryBytes))),
+            ),
+          )
+          .pipe(
+            Effect.tap(() => Effect.sync(() => persistRetries.delete(sessionKey))),
+            Effect.catchCause((cause) =>
+              Effect.gen(function* () {
+                const failures = (persistRetries.get(sessionKey)?.failures ?? 0) + 1;
+                const delayMs = Math.min(
+                  PERSIST_RETRY_MAX_MS,
+                  PERSIST_RETRY_BASE_MS * 2 ** (failures - 1),
+                );
+                persistRetries.set(sessionKey, {
+                  failures,
+                  at: (yield* Clock.currentTimeMillis) + delayMs,
+                });
+                yield* Effect.logWarning("failed to persist terminal history", {
+                  threadId,
+                  terminalId,
+                  failures,
+                  retryInMs: delayMs,
+                  cause,
+                });
+              }),
+            ),
+          );
+        const { sessions } = yield* readManagerState;
+        releaseHistoryMemory(
+          [...sessions.values()].map((session) => session.history),
+          historyMemoryBudget,
+          MIN_HISTORY_MEMORY_BYTES,
         );
-      const { sessions } = yield* readManagerState;
-      releaseHistoryMemory(
-        [...sessions.values()].map((session) => session.history),
-        historyMemoryBudget,
-        MIN_HISTORY_MEMORY_BYTES,
-      );
-    }),
-  });
+      }),
+    });
 
   const queuePersist = Effect.fn("terminal.queuePersist")(function* (
     threadId: string,
@@ -2071,31 +2113,46 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   ) {
     // Read memory first: releasing output to the file while reading only moves it on disk.
     const memoryStart = history.memoryStart;
-    const memoryPart = history.memoryText(Math.max(from, memoryStart), to);
+    const memoryFrom = history.alignForward(from);
+    const memoryPart = history.memoryText(memoryFrom, to);
     const persisted = history.persisted;
     if (from >= memoryStart || persisted === null) {
       return {
         data: memoryPart,
-        from: Math.max(from, memoryStart),
+        from: memoryFrom,
         to,
-        lineBreakBefore: history.lineBreakBefore(Math.max(from, memoryStart)) ?? false,
+        lineBreakBefore: history.lineBreakBefore(memoryFrom) ?? false,
       };
     }
     const diskEnd = Math.min(to, memoryStart);
-    // One byte more in front tells whether the range starts a line.
-    const readFrom = Math.max(persisted.fileStart, from - 1);
-    const bytes = yield* historyFileLocks.withLock(
+    const read = yield* historyFileLocks.withLock(
       toSessionKey(threadId, terminalId),
       Effect.suspend(() => {
-        const current = history.persisted ?? persisted;
-        return readFileRange(
-          historyPath(threadId, terminalId),
-          readFrom - current.fileStart,
-          diskEnd - current.fileStart,
+        const plan = historyFileRead(
+          from,
+          diskEnd,
+          history.startOffset,
+          (history.persisted ?? persisted).fileStart,
         );
+        return plan === null
+          ? Effect.succeed(null)
+          : readFileRange(
+              historyPath(threadId, terminalId),
+              plan.position,
+              plan.position + plan.length,
+            ).pipe(Effect.map((bytes) => ({ ...plan, bytes })));
       }),
     );
-    let start = from - readFrom;
+    if (read === null) {
+      return {
+        data: memoryPart,
+        from: memoryStart,
+        to,
+        lineBreakBefore: history.lineBreakBefore(memoryStart) ?? false,
+      };
+    }
+    const { bytes, readFrom } = read;
+    let start = read.from - readFrom;
     const lineBreakBefore = start > 0 && bytes[start - 1] === 10;
     while (start < bytes.length && isContinuationByte(bytes[start])) start += 1;
     let stop = bytes.length;
@@ -2127,6 +2184,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             yield* fileSystem.remove(filePath, { force: true });
           }
         }).pipe(
+          // A rewrite in flight would rename its file back after the removal.
+          (removal) => historyFileLocks.withLock(toSessionKey(threadId, terminalId), removal),
           Effect.catch((error) =>
             Effect.logWarning("failed to delete terminal history", {
               threadId,

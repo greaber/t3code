@@ -5,9 +5,7 @@ import { ProviderInstanceId } from "./providerInstance.ts";
 export const DEFAULT_TERMINAL_ID = "term-1";
 /** How much output a client holds per terminal; older or newer output is paged in. */
 export const DEFAULT_MAX_TERMINAL_BUFFER_BYTES = 4 * 1024 * 1024;
-/** Line breaks a client holds per terminal, so its rows stay within the view's scrollback. */
-export const MAX_TERMINAL_BUFFER_LINES = 25_000;
-/** Rows a terminal view keeps, above what the buffer's lines need for wrapped lines. */
+/** Rows a terminal view keeps; a client holds no more output than fits in them. */
 export const TERMINAL_VIEW_SCROLLBACK_ROWS = 60_000;
 /** The newest output an attach sends, and the size of each page after it. */
 export const TERMINAL_HISTORY_PAGE_BYTES = 512 * 1024;

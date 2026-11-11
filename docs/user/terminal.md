@@ -8,8 +8,9 @@ truncated. To change the limits, set `T3CODE_TERMINAL_HISTORY_MAX_LINES` or
 
 When you open or reconnect to a terminal, it shows the most recent output first.
 On web and desktop, scrolling to the top loads earlier output, and you can keep
-going back to the oldest output the server keeps. A terminal view holds about
-4 MiB of output at a time, so when you read far back, the newest output is set
+going back to the oldest output the server keeps. A terminal view holds up to
+4 MiB of output at a time (less in narrow terminals, so all of it fits in the
+view's scrollback), so when you read far back, the newest output is set
 aside and a **Jump to latest** button appears; scrolling down loads later
 output again. On iPhone, iPad, and Android, use **Load earlier output**, **Load
 later output**, and **Jump to latest output** in the terminal menu.

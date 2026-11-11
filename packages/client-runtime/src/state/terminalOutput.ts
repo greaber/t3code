@@ -1,4 +1,4 @@
-import { MAX_TERMINAL_BUFFER_LINES, TERMINAL_HISTORY_PAGE_BYTES } from "@t3tools/contracts";
+import { TERMINAL_HISTORY_PAGE_BYTES, TERMINAL_VIEW_SCROLLBACK_ROWS } from "@t3tools/contracts";
 
 export interface TerminalOutputChunk {
   readonly startOffset: number;
@@ -89,6 +89,8 @@ const DEFAULT_TERMINAL_CHUNK_BYTES = 16 * 1024;
 const MAX_TERMINAL_OUTPUT_CHUNKS = 2_048;
 // Live output kept aside while the held output ends before it.
 const MAX_DETACHED_BUFFER_BYTES = TERMINAL_HISTORY_PAGE_BYTES;
+const TRIMMED_OUTPUT_MARKER =
+  "\r\n\u001b[0;2m[Earlier output was removed from this terminal's history]\u001b[0m\r\n";
 const textEncoder = new TextEncoder();
 // A BOM at a retained chunk boundary is terminal data, not an encoding marker.
 const textDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
@@ -247,41 +249,61 @@ interface Window {
   dropped: boolean;
 }
 
+// Columns assumed before the terminal reports its grid.
+const DEFAULT_TERMINAL_COLS = 80;
+// Rows the held output may take in a view, short of its scrollback for an estimate's slack.
+const VIEW_ROW_BUDGET = Math.floor(TERMINAL_VIEW_SCROLLBACK_ROWS * 0.9);
+
+/**
+ * Bytes the window may hold: its budget, and few enough that its rows fit the view's
+ * scrollback, counting a row per line plus one per `cols` bytes, an upper bound for any
+ * mix of short and wrapped lines. Past the view's rows, older output would not show.
+ */
+function byteBudget(maxBytes: number, lines: number, cols: number): number {
+  return Math.min(maxBytes, (VIEW_ROW_BUDGET - lines) * Math.max(1, cols));
+}
+
 /**
  * Drops the oldest output until the window fits. Output whose server offsets are known
  * goes a chunk at a time (live output) or exactly (server text), so the window's start
  * stays a known offset older output can be read before.
  */
-function trimFront(window: Window, maxBytes: number, maxLines: number): void {
-  while (window.chunks.length > 0 && (window.bytes > maxBytes || window.lines > maxLines)) {
+function trimFront(window: Window, maxBytes: number, cols: number): void {
+  for (;;) {
+    const budget = byteBudget(maxBytes, window.lines, cols);
+    if (window.chunks.length === 0 || window.bytes <= budget) return;
     const first = window.chunks[0]!;
-    const bytesOver = window.bytes - maxBytes;
-    const linesOver = window.lines - maxLines;
+    const bytesOver = window.bytes - Math.max(0, budget);
     window.dropped = true;
-    const whole = first.byteLength <= bytesOver || first.lineBreaks <= linesOver - 1;
-    if (!whole && (first.exact || (first.serverEnd === null && !first.pendingEnd))) {
-      const trimmed = trimChunkStart(first, Math.max(0, bytesOver), Math.max(0, linesOver));
+    if (
+      first.byteLength > bytesOver &&
+      (first.exact || (first.serverEnd === null && !first.pendingEnd))
+    ) {
+      const trimmed = trimChunkStart(first, bytesOver, 0);
       window.bytes -= trimmed.droppedBytes;
       window.lines -= first.lineBreaks - trimmed.chunk.lineBreaks;
       window.historyOffset =
         first.exact && window.historyOffset !== null
           ? window.historyOffset + trimmed.droppedBytes
           : null;
-      if (trimmed.chunk.data.length > 0) {
-        window.chunks[0] = trimmed.chunk;
-        continue;
-      }
-      window.chunks.shift();
+      if (trimmed.chunk.data.length > 0) window.chunks[0] = trimmed.chunk;
+      else window.chunks.shift();
       continue;
     }
-    window.chunks.shift();
-    window.bytes -= first.byteLength;
-    window.lines -= first.lineBreaks;
+    // Live output split into chunks knows its offset only at its last one: drop through it.
+    let dropped = first;
+    let droppedBytes = 0;
+    for (;;) {
+      window.chunks.shift();
+      window.bytes -= dropped.byteLength;
+      window.lines -= dropped.lineBreaks;
+      droppedBytes += dropped.byteLength;
+      if (dropped.serverEnd !== null || !dropped.pendingEnd || window.chunks.length === 0) break;
+      dropped = window.chunks[0]!;
+    }
     window.historyOffset =
-      first.serverEnd ??
-      (first.exact && window.historyOffset !== null
-        ? window.historyOffset + first.byteLength
-        : null);
+      dropped.serverEnd ??
+      (dropped.exact && window.historyOffset !== null ? window.historyOffset + droppedBytes : null);
   }
 }
 
@@ -321,7 +343,7 @@ function appendOutput(
   data: string,
   maxBufferBytes: number,
   serverEnd?: number,
-  maxLines = MAX_TERMINAL_BUFFER_LINES,
+  cols = DEFAULT_TERMINAL_COLS,
 ): TerminalOutputState {
   if (data.length === 0) return current;
   const detached = current.detached;
@@ -359,7 +381,7 @@ function appendOutput(
       Math.min(DEFAULT_TERMINAL_CHUNK_BYTES, Math.max(1, maxBufferBytes)),
     ),
   ]);
-  trimFront(window, maxBufferBytes, maxLines);
+  trimFront(window, maxBufferBytes, cols);
   return fromWindow(current, window, {
     nextOffset: current.nextOffset + data.length,
   });
@@ -371,7 +393,7 @@ function resetOutput(
   data: string,
   maxBufferBytes: number,
   history?: { readonly offset: number; readonly end: number; readonly older: boolean },
-  maxLines = MAX_TERMINAL_BUFFER_LINES,
+  cols = DEFAULT_TERMINAL_COLS,
 ): TerminalOutputState {
   const window: Window = {
     chunks: [
@@ -394,7 +416,7 @@ function resetOutput(
     window.bytes = 0;
     window.lines = 0;
   }
-  trimFront(window, Math.max(0, maxBufferBytes), maxLines);
+  trimFront(window, Math.max(0, maxBufferBytes), cols);
   return {
     ...fromWindow({ ...current, olderHistory: history?.older ?? false }, window, {}),
     resetVersion: current.resetVersion + 1,
@@ -428,12 +450,15 @@ function prependOutput(
   current: TerminalOutputState,
   page: TerminalHistoryPageInput,
   maxBufferBytes: number,
-  maxLines = MAX_TERMINAL_BUFFER_LINES,
+  cols = DEFAULT_TERMINAL_COLS,
 ): TerminalOutputState {
   const end = windowEnd(current);
-  if (current.historyOffset === null || page.end !== current.historyOffset || end === null) {
-    return current;
+  if (current.historyOffset === null || end === null) return current;
+  // The server no longer keeps output before what is held.
+  if (page.end > current.historyOffset || (page.data.length === 0 && !page.olderHistory)) {
+    return current.olderHistory ? { ...current, olderHistory: false } : current;
   }
+  if (page.end !== current.historyOffset) return current;
   if (page.data.length === 0) {
     return page.olderHistory === current.olderHistory
       ? current
@@ -446,7 +471,7 @@ function prependOutput(
   // Drop the newest output, keeping the end at a known offset, until the window fits.
   let newEnd = end;
   let droppedNewest = false;
-  while (chunks.length > added.length && (bytes > maxBufferBytes || lines > maxLines)) {
+  while (chunks.length > added.length && bytes > byteBudget(maxBufferBytes, lines, cols)) {
     const last = chunks.pop()!;
     bytes -= last.byteLength;
     lines -= last.lineBreaks;
@@ -460,7 +485,7 @@ function prependOutput(
   }
   const window: Window = { chunks, bytes, lines, historyOffset: page.offset, dropped: false };
   // A page larger than the whole budget keeps its newest part.
-  trimFront(window, maxBufferBytes, maxLines);
+  trimFront(window, maxBufferBytes, cols);
   const split =
     added.reduce((total, chunk) => total + chunk.data.length, 0) -
     (window.chunks[0]?.startOffset ?? 0);
@@ -492,16 +517,25 @@ function appendNewerOutput(
   current: TerminalOutputState,
   page: TerminalHistoryPageInput,
   maxBufferBytes: number,
-  maxLines = MAX_TERMINAL_BUFFER_LINES,
+  cols = DEFAULT_TERMINAL_COLS,
 ): TerminalOutputState {
   const detached = current.detached;
-  if (detached === null || page.offset !== detached.end) return current;
-  const pageChunks = makeChunks(page.data, current.nextOffset, {
+  if (detached === null || page.offset < detached.end) return current;
+  // The server trimmed output the paused view had not reached; say so where it was.
+  const marker =
+    page.offset > detached.end
+      ? makeChunks(TRIMMED_OUTPUT_MARKER, current.nextOffset, {
+          exact: false,
+          serverEnd: page.offset,
+        })
+      : [];
+  let nextOffset = current.nextOffset + (marker.length > 0 ? TRIMMED_OUTPUT_MARKER.length : 0);
+  const pageChunks = makeChunks(page.data, nextOffset, {
     exact: true,
     serverEnd: page.end,
   });
-  let nextOffset = current.nextOffset + page.data.length;
-  const appended = [...pageChunks];
+  nextOffset += page.data.length;
+  const appended = [...marker, ...pageChunks];
   let stillDetached: TerminalDetachedWindow | null = { ...detached, end: page.end };
   if (!page.newerHistory && detached.bufferedFrom <= page.end) {
     for (const entry of detached.buffered) {
@@ -513,7 +547,7 @@ function appendNewerOutput(
     stillDetached = null;
   }
   const window = windowOf(current, [...current.chunks, ...appended]);
-  trimFront(window, maxBufferBytes, maxLines);
+  trimFront(window, maxBufferBytes, cols);
   const dropped = window.chunks[0]?.startOffset ?? nextOffset;
   const firstBefore = current.chunks[0]?.startOffset ?? current.nextOffset;
   if (dropped === firstBefore) {
@@ -535,7 +569,7 @@ function showLatestOutput(
   current: TerminalOutputState,
   page: TerminalHistoryPageInput,
   maxBufferBytes: number,
-  maxLines = MAX_TERMINAL_BUFFER_LINES,
+  cols = DEFAULT_TERMINAL_COLS,
 ): TerminalOutputState {
   const detached = current.detached;
   if (detached === null) return current;
@@ -544,7 +578,7 @@ function showLatestOutput(
     page.data,
     maxBufferBytes,
     { offset: page.offset, end: page.end, older: page.olderHistory },
-    maxLines,
+    cols,
   );
   if (page.newerHistory || detached.bufferedFrom > page.end) {
     return { ...reset, detached: { ...detached, end: page.end } };
@@ -553,7 +587,7 @@ function showLatestOutput(
     (state, entry) =>
       entry.end <= page.end
         ? state
-        : appendOutput(state, entry.data, maxBufferBytes, entry.end, maxLines),
+        : appendOutput(state, entry.data, maxBufferBytes, entry.end, cols),
     reset,
   );
 }
