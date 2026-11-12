@@ -199,6 +199,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.terminalOpen]: "terminal",
   [WS_METHODS.terminalAttach]: "terminal",
   [WS_METHODS.terminalObserve]: "terminal",
+  [WS_METHODS.terminalHistory]: "terminal",
   [WS_METHODS.terminalWrite]: "terminal",
   [WS_METHODS.terminalResize]: "terminal",
   [WS_METHODS.terminalClear]: "terminal",

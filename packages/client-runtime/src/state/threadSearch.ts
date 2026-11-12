@@ -1,6 +1,7 @@
 import {
   EnvironmentId,
   OrchestrationSearchThreadsInput,
+  THREAD_SEARCH_MAX_EXCLUDED_THREADS,
   ProjectId,
   type OrchestrationThreadSearchMatch,
   type OrchestrationV2SearchThreadsInput,
@@ -9,7 +10,7 @@ import {
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { AsyncResult, Atom } from "effect/reactivity";
+import { AsyncResult, Atom, type AtomRegistry } from "effect/reactivity";
 import {
   foldSearchQuery,
   messageSearchTokens,
@@ -20,6 +21,9 @@ import { threadSearchPullRequests } from "@t3tools/shared/threadPullRequests";
 
 import type { EnvironmentThreadShell } from "./models.ts";
 import { getThreadSortTimestamp } from "./threadSort.ts";
+
+// Pages a search reads on its own, past ones without matches, before showing "more".
+const EMPTY_PAGES_PER_REQUEST = 3;
 
 // When this client last sent an open per thread, by its own clock: a server
 // timestamp would be off by any clock skew. The server merges opens closer
@@ -52,6 +56,10 @@ export interface EnvironmentThreadSearchMatch extends OrchestrationThreadSearchM
 export interface ThreadSearchResultsState {
   readonly matches: ReadonlyArray<EnvironmentThreadSearchMatch>;
   readonly isLoading: boolean;
+  /** Older messages may hold more matches; `loadMore` reads the next page. */
+  readonly hasMore: boolean;
+  /** The search listed as many threads as later pages can leave out, and stopped there. */
+  readonly partial: boolean;
   /** Rows of matching older settled threads, which shells that omit them do not hold. */
   readonly rows: ReadonlyArray<{
     readonly environmentId: EnvironmentId;
@@ -117,11 +125,21 @@ export function createThreadSearchResultsAtomFamily<E>(options: {
   readonly olderSettledBefore?: (environmentId: EnvironmentId) => Atom.Atom<string | null>;
   readonly labelPrefix: string;
 }) {
+  // How many pages of message matches each environment has been asked for, per search.
+  const requestedPages = Atom.family((pagesKey: string) =>
+    Atom.make(1).pipe(Atom.withLabel(`${options.labelPrefix}-pages:${pagesKey}`)),
+  );
   const results = Atom.family((key: string) =>
     Atom.make((get): ThreadSearchResultsState => {
       const parsedKey = parseThreadSearchKey(key);
       if (Option.isNone(parsedKey)) {
-        return { matches: [], isLoading: false, rows: EMPTY_SEARCH_ROWS };
+        return {
+          matches: [],
+          isLoading: false,
+          hasMore: false,
+          partial: false,
+          rows: EMPTY_SEARCH_ROWS,
+        };
       }
 
       const [environmentIds, query, scope = {}] = parsedKey.value;
@@ -131,6 +149,8 @@ export function createThreadSearchResultsAtomFamily<E>(options: {
       const matches: EnvironmentThreadSearchMatch[] = [];
       const rows: Array<ThreadSearchResultsState["rows"][number]> = [];
       let isLoading = false;
+      let hasMore = false;
+      let partial = false;
 
       for (const environmentId of environmentIds) {
         const before = options.olderSettledBefore
@@ -162,9 +182,56 @@ export function createThreadSearchResultsAtomFamily<E>(options: {
             });
           }
         }
+        // Later pages leave out the threads earlier ones returned. Each request reads until a
+        // page finds matches or a few in a row find none, so a long history without matches
+        // shows "more" instead of reading on unseen.
+        const wanted = get(requestedPages(JSON.stringify([key, environmentId])));
+        const excludedThreadIds = value?.matches.map((match) => match.threadId) ?? [];
+        let cursor = value?.cursor;
+        let request = 1;
+        let satisfied = (value?.matches.length ?? 0) > 0;
+        let emptyPages = satisfied ? 0 : 1;
+        while (cursor !== undefined) {
+          if (satisfied || emptyPages >= EMPTY_PAGES_PER_REQUEST) {
+            if (request >= wanted) break;
+            request += 1;
+            satisfied = false;
+            emptyPages = 0;
+          }
+          if (excludedThreadIds.length >= THREAD_SEARCH_MAX_EXCLUDED_THREADS) {
+            partial = true;
+            cursor = undefined;
+            break;
+          }
+          const next = get(
+            options.getSearchAtom(environmentId, {
+              query,
+              cursor,
+              excludedThreadIds: [...excludedThreadIds],
+            }),
+          );
+          isLoading ||= next.waiting;
+          const nextValue = AsyncResult.getOrElse(next, () => null);
+          if (nextValue === null) {
+            cursor = undefined;
+            break;
+          }
+          matches.push(...nextValue.matches.map((match) => ({ ...match, environmentId })));
+          excludedThreadIds.push(...nextValue.matches.map((match) => match.threadId));
+          cursor = nextValue.cursor;
+          if (nextValue.matches.length > 0) satisfied = true;
+          else emptyPages += 1;
+        }
+        hasMore ||= cursor !== undefined;
       }
 
-      return { matches, isLoading, rows: rows.length === 0 ? EMPTY_SEARCH_ROWS : rows };
+      return {
+        matches,
+        isLoading,
+        hasMore,
+        partial,
+        rows: rows.length === 0 ? EMPTY_SEARCH_ROWS : rows,
+      };
     }).pipe(Atom.withLabel(`${options.labelPrefix}:${key}`)),
   );
   const rowsAtom = Atom.family((rowsKey: string) => {
@@ -182,6 +249,15 @@ export function createThreadSearchResultsAtomFamily<E>(options: {
   });
   return {
     results,
+    /** Reads the next page of message matches for a search key, where there is one. */
+    loadMore: (registry: AtomRegistry.AtomRegistry, key: string) => {
+      const parsedKey = parseThreadSearchKey(key);
+      if (Option.isNone(parsedKey)) return;
+      for (const environmentId of parsedKey.value[0]) {
+        const pages = requestedPages(JSON.stringify([key, environmentId]));
+        registry.set(pages, registry.get(pages) + 1);
+      }
+    },
     /** One environment's older settled rows for a search key, for `mountRows`. */
     rows: (key: string, environmentId: EnvironmentId) =>
       rowsAtom(JSON.stringify([key, environmentId])),

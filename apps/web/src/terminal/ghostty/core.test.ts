@@ -320,14 +320,15 @@ describe("GhosttyTerminalCore snapshots", () => {
     const initial = readTerminalOutputUpdate(state.output, INITIAL_TERMINAL_OUTPUT_CURSOR);
     writeTerminalOutputUpdate(core, initial);
     const reset = vi.spyOn(core, "resetAndWrite");
-    const data = "line\r\n".repeat(8192);
-    for (let index = 0; index < 16; index += 1) state = append(state, data);
+    const data = `${"line".repeat(100)}\r\n`.repeat(128);
+    const appends = Math.ceil((1.5 * DEFAULT_MAX_TERMINAL_BUFFER_BYTES) / data.length);
+    for (let index = 0; index < appends; index += 1) state = append(state, data);
 
     const recovery = readTerminalOutputUpdate(state.output, initial.cursor);
     if (recovery.type !== "reset") throw new Error(`Expected reset, received ${recovery.type}`);
-    expect(new TextEncoder().encode(recovery.data).byteLength).toBe(
-      DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
-    );
+    // The recovery replays only what the bounded buffer holds.
+    expect(new TextEncoder().encode(recovery.data).byteLength).toBe(state.output.retainedBytes);
+    expect(state.output.retainedBytes).toBeLessThanOrEqual(DEFAULT_MAX_TERMINAL_BUFFER_BYTES);
     writeTerminalOutputUpdate(core, recovery);
     reference.resetAndWrite(recovery.data);
     expect(core.snapshot()).toEqual(reference.snapshot());

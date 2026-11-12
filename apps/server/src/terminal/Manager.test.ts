@@ -237,6 +237,8 @@ interface CreateManagerOptions {
   >[0]["registerTerminalProcesses"];
   maxRetainedInactiveSessions?: number;
   historyByteLimit?: number;
+  historyMemoryBytes?: number;
+  historyCompactionBytes?: number;
   ptyAdapter?: FakePtyAdapter;
   resolveProviderInstanceEnvironment?: Parameters<
     typeof TerminalManager.makeWithOptions
@@ -274,6 +276,12 @@ const createManager = (
         ptyAdapter,
         ...(options.historyByteLimit !== undefined
           ? { historyByteLimit: options.historyByteLimit }
+          : {}),
+        ...(options.historyMemoryBytes !== undefined
+          ? { historyMemoryBytes: options.historyMemoryBytes }
+          : {}),
+        ...(options.historyCompactionBytes !== undefined
+          ? { historyCompactionBytes: options.historyCompactionBytes }
           : {}),
         ...(options.shellResolver !== undefined ? { shellResolver: options.shellResolver } : {}),
         ...(options.env !== undefined ? { env: options.env } : {}),
@@ -383,6 +391,8 @@ it("preserves line and byte limits across arbitrary chunks, Unicode, ANSI sequen
         history.append(chunk);
         expected = retainedHistory(expected + chunk, maxLines, maxBytes);
         expect(history.value()).toBe(expected);
+        expect(history.memoryText(history.startOffset)).toBe(expected);
+        expect(history.endOffset - history.startOffset).toBe(Buffer.byteLength(expected));
       }
     }
   }
@@ -1021,6 +1031,138 @@ it.layer(
     }),
   );
 
+  it.effect("pages any part of history, from memory or its file, in both directions", () =>
+    Effect.gen(function* () {
+      // Memory keeps about 1 MiB; the rest is read back from the file after a reopen.
+      const { manager, ptyAdapter } = yield* createManager(1_000_000, {
+        historyByteLimit: 64 * 1024 * 1024,
+        historyMemoryBytes: 1,
+      });
+      yield* manager.open(openInput());
+      const lines = Array.from({ length: 120_000 }, (_, index) => `output line ${index} ✓\n`);
+      for (let index = 0; index < lines.length; index += 1_000) {
+        ptyAdapter.processes[0]!.emitData(lines.slice(index, index + 1_000).join(""));
+      }
+      yield* manager.close({ threadId: "thread-1" });
+      const attached = yield* manager.open(openInput());
+      expect(attached.olderHistory).toBe(true);
+      const all = lines.join("");
+      const target = { threadId: "thread-1", terminalId: DEFAULT_TERMINAL_ID };
+
+      let text = attached.history;
+      let before = attached.historyOffset!;
+      for (let older = true; older;) {
+        const page = yield* manager.historyPage({ ...target, before });
+        expect(page.end).toBe(before);
+        expect(Buffer.byteLength(page.data)).toBeLessThanOrEqual(512 * 1024);
+        text = page.data + text;
+        before = page.offset;
+        older = page.olderHistory;
+      }
+      expect(before).toBe(0);
+      expect(text.startsWith(all)).toBe(true);
+
+      let forward = "";
+      let after = 0;
+      for (let newer = true; newer;) {
+        const page = yield* manager.historyPage({ ...target, after });
+        expect(page.offset).toBe(after);
+        forward += page.data;
+        after = page.end;
+        newer = page.newerHistory;
+      }
+      expect(forward).toBe(text);
+    }),
+  );
+
+  it.effect("waits longer after each failed history write", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      let attempts = 0;
+      const full = FileSystem.FileSystem.of({
+        ...fs,
+        makeTempFileScoped: () => {
+          attempts += 1;
+          return Effect.fail(
+            PlatformError.systemError({
+              _tag: "Unknown",
+              module: "FileSystem",
+              method: "makeTempFileScoped",
+              cause: { code: "ENOSPC" },
+            }),
+          );
+        },
+      });
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        processTable: Effect.succeed([]),
+      }).pipe(Effect.provideService(FileSystem.FileSystem, full));
+      yield* manager.open(openInput());
+      const process = ptyAdapter.processes[0]!;
+      const quarterSeconds = (count: number) =>
+        Effect.forEach(Array.from({ length: count }), () => TestClock.adjust("250 millis"), {
+          discard: true,
+        });
+      process.emitData("a\n");
+      yield* quarterSeconds(1);
+      expect(attempts).toBe(1);
+      // Output keeps arriving, but the next attempt waits a second, then two.
+      for (const output of ["b\n", "c\n", "d\n"]) process.emitData(output);
+      yield* quarterSeconds(3);
+      expect(attempts).toBe(1);
+      yield* quarterSeconds(2);
+      expect(attempts).toBe(2);
+      process.emitData("e\n");
+      yield* quarterSeconds(6);
+      expect(attempts).toBe(2);
+      yield* quarterSeconds(4);
+      expect(attempts).toBe(3);
+      // Closing writes at once, whatever the delay; it waits out a pending debounce.
+      const closing = yield* manager
+        .close({ threadId: "thread-1" })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* quarterSeconds(1);
+      yield* Fiber.join(closing);
+      expect(attempts).toBe(4);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("removes rewrites a crash left behind when it starts", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { join } = yield* Path.Path;
+      const logsDir = join(yield* fs.makeTempDirectoryScoped(), "terminals");
+      yield* fs.makeDirectory(join(logsDir, ".history-abc123"), { recursive: true });
+      yield* fs.writeFileString(join(logsDir, ".history-abc123", "f00d"), "partial");
+      yield* fs.writeFileString(join(logsDir, "kept.log"), "history\n");
+      yield* TerminalManager.makeWithOptions({ logsDir, ptyAdapter: new FakePtyAdapter() });
+      expect(yield* fs.readDirectory(logsDir)).toEqual(["kept.log"]);
+    }),
+  );
+
+  it.effect("replaces a mostly trimmed history file by renaming a complete copy", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { manager, ptyAdapter, logsDir } = yield* createManager(1_000, {
+        historyByteLimit: 100,
+        historyCompactionBytes: 1,
+      });
+      yield* manager.open(openInput());
+      ptyAdapter.processes[0]!.emitData("first\n");
+      yield* manager.close({ threadId: "thread-1" });
+      const filePath = yield* historyLogPath(logsDir);
+      const before = yield* fs.stat(filePath);
+      yield* manager.open(openInput());
+      ptyAdapter.processes[1]!.emitData("x".repeat(60) + "\n" + "y".repeat(60) + "\n");
+      yield* manager.close({ threadId: "thread-1" });
+      // A rewrite in place would keep the file and could leave it half written.
+      expect((yield* fs.stat(filePath)).ino).not.toBe(before.ino);
+      expect(yield* readFileString(filePath)).toBe(
+        ("x".repeat(60) + "\n" + "y".repeat(60) + "\n").slice(-100),
+      );
+      expect(yield* fs.readDirectory(logsDir)).toHaveLength(1);
+    }),
+  );
+
   it.effect("bounds persisted and attached history without truncating live output", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter, logsDir } = yield* createManager(5, { historyByteLimit: 10 });
@@ -1492,23 +1634,19 @@ it.layer(
   it.effect("retains encoded history if migration cannot write the bounded file", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
-      let failNextWrite = true;
+      let failNextRename = true;
       const limited = FileSystem.FileSystem.of({
         ...fs,
-        writeFileString: (filePath, data, options) => {
-          if (!failNextWrite) return fs.writeFileString(filePath, data, options);
-          failNextWrite = false;
-          return fs.writeFileString(filePath, "partial").pipe(
-            Effect.andThen(
-              Effect.fail(
-                PlatformError.systemError({
-                  _tag: "Unknown",
-                  module: "FileSystem",
-                  method: "writeFileString",
-                  cause: { code: "ENOSPC" },
-                }),
-              ),
-            ),
+        rename: (from, to) => {
+          if (!failNextRename) return fs.rename(from, to);
+          failNextRename = false;
+          return Effect.fail(
+            PlatformError.systemError({
+              _tag: "Unknown",
+              module: "FileSystem",
+              method: "rename",
+              cause: { code: "ENOSPC" },
+            }),
           );
         },
       });

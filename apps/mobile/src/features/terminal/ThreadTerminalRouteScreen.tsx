@@ -7,7 +7,11 @@ import {
   ThreadId,
   sessionGrantsScope,
 } from "@t3tools/contracts";
-import { type KnownTerminalSession } from "@t3tools/client-runtime/state/terminal";
+import {
+  canLoadNewerTerminalOutput,
+  canLoadOlderTerminalOutput,
+  type KnownTerminalSession,
+} from "@t3tools/client-runtime/state/terminal";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppBar } from "../../components/ui/AppBar";
 import { useNativeColumnLayoutMetrics } from "../../native/native-layout-metrics";
@@ -105,6 +109,11 @@ function TerminalHeader(props: {
   readonly onIncreaseFontSize: () => void;
   readonly onOpenNewTerminal: () => void;
   readonly onSelectTerminal: (terminalId: string) => void;
+  /** Null when the view already holds the oldest output the server keeps. */
+  readonly onLoadOlderOutput: (() => void) | null;
+  /** Set while the view shows earlier output instead of following the live output. */
+  readonly onLoadNewerOutput: (() => void) | null;
+  readonly onShowLatestOutput: (() => void) | null;
 }) {
   return (
     <AppBar
@@ -159,6 +168,38 @@ function TerminalHeader(props: {
                     selected: session.terminalId === props.terminalId,
                     onPress: () => props.onSelectTerminal(session.terminalId),
                   })),
+                  ...(props.onLoadOlderOutput === null
+                    ? []
+                    : [
+                        {
+                          id: "terminal-load-older",
+                          title: "Load earlier output",
+                          icon: "arrow.up",
+                          subtitle: "Older output the environment still keeps",
+                          onPress: props.onLoadOlderOutput,
+                        },
+                      ]),
+                  ...(props.onLoadNewerOutput === null
+                    ? []
+                    : [
+                        {
+                          id: "terminal-load-newer",
+                          title: "Load later output",
+                          icon: "arrow.down",
+                          subtitle: "Showing earlier output; live output is paused here",
+                          onPress: props.onLoadNewerOutput,
+                        },
+                      ]),
+                  ...(props.onShowLatestOutput === null
+                    ? []
+                    : [
+                        {
+                          id: "terminal-show-latest",
+                          title: "Jump to latest output",
+                          icon: "arrow.down.circle",
+                          onPress: props.onShowLatestOutput,
+                        },
+                      ]),
                   {
                     id: "terminal-new",
                     disabled: !props.canOperateTerminal,
@@ -511,6 +552,11 @@ function ThreadTerminal(props: {
         ? { threadId: selectedThread.id, terminalId }
         : null,
   });
+  const outputTarget = {
+    environmentId: selectedThread.environmentId,
+    threadId: selectedThread.id,
+    terminalId,
+  };
   useAtomMount(
     terminalSessionDriver.driver(
       canOperateTerminal
@@ -829,6 +875,36 @@ function ThreadTerminal(props: {
         onIncreaseFontSize={handleIncreaseFontSize}
         onOpenNewTerminal={handleOpenNewTerminal}
         onSelectTerminal={handleSelectTerminal}
+        onLoadOlderOutput={
+          canLoadOlderTerminalOutput(terminal.output)
+            ? () =>
+                void terminalEnvironment.loadOlderOutput(
+                  appAtomRegistry,
+                  outputTarget,
+                  terminal.output,
+                )
+            : null
+        }
+        onLoadNewerOutput={
+          canLoadNewerTerminalOutput(terminal.output)
+            ? () =>
+                void terminalEnvironment.loadNewerOutput(
+                  appAtomRegistry,
+                  outputTarget,
+                  terminal.output,
+                )
+            : null
+        }
+        onShowLatestOutput={
+          canLoadNewerTerminalOutput(terminal.output)
+            ? () =>
+                void terminalEnvironment.showLatestOutput(
+                  appAtomRegistry,
+                  outputTarget,
+                  terminal.output,
+                )
+            : null
+        }
       />
 
       <ScreenContent>

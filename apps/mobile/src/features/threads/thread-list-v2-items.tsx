@@ -25,7 +25,11 @@ import {
   formatWorkingDurationLabel,
   resolveThreadWorkingStartedAt,
 } from "@t3tools/client-runtime/state/models";
-import { AuthOrchestrationOperateScope, type EnvironmentMachineKind } from "@t3tools/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  THREAD_SEARCH_MAX_EXCLUDED_THREADS,
+  type EnvironmentMachineKind,
+} from "@t3tools/contracts";
 import type { SnoozePresetSetting } from "@t3tools/contracts/settings";
 import { canSnooze } from "@t3tools/client-runtime/state/thread-settled";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
@@ -343,6 +347,40 @@ export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(pro
           : label
       }
       disabled={props.state === "loading"}
+      onPress={props.onPress}
+      className="mx-4 mt-2 items-center rounded-lg border border-dashed border-border py-2.5"
+      style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
+    >
+      <Text
+        className={
+          props.pane === "sidebar"
+            ? "text-xs font-t3-medium text-drawer-foreground-muted"
+            : "text-xs font-t3-medium text-foreground-muted"
+        }
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+});
+
+/** Reads the next page of message matches, or says the search stopped at its most threads. */
+export const ThreadSearchMoreRow = memo(function ThreadSearchMoreRow(props: {
+  readonly pane?: "screen" | "sidebar";
+  readonly loading: boolean;
+  readonly partial?: boolean;
+  readonly onPress: () => void;
+}) {
+  const label = props.partial
+    ? `Showing the first ${THREAD_SEARCH_MAX_EXCLUDED_THREADS.toLocaleString()} threads with matching messages`
+    : props.loading
+      ? "Searching older messages…"
+      : "Search older messages";
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      disabled={props.loading || props.partial === true}
       onPress={props.onPress}
       className="mx-4 mt-2 items-center rounded-lg border border-dashed border-border py-2.5"
       style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}

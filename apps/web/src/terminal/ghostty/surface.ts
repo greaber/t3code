@@ -531,6 +531,10 @@ export interface GhosttyTerminalSurfaceOptions {
   readonly onLinkHover?: (text: string | null) => void;
   /** The host must prevent the default menu; native Paste cannot reach a canvas terminal. */
   readonly onContextMenu?: (event: MouseEvent) => void;
+  /** The user scrolled up to the oldest row the view holds. */
+  readonly onScrollbackStart?: () => void;
+  /** The user scrolled down to the newest row the view holds. */
+  readonly onScrollbackEnd?: () => void;
 }
 
 export class GhosttyTerminalSurface {
@@ -569,6 +573,7 @@ export class GhosttyTerminalSurface {
   private forceFullRender = true;
   private scrollbarDirty = true;
   private scrollbarState: GhosttyScrollbar | null = null;
+  private scrollbackEdgeNotified: "start" | "end" | null = null;
   private scrollbarPointerId: number | null = null;
   private scrollbarPointerOffset = 0;
   private disposed = false;
@@ -776,8 +781,42 @@ export class GhosttyTerminalSurface {
     this.requestRender();
   }
 
+  /**
+   * Replaces the contents with `data`, keeping the rows the user is reading in place:
+   * `data` holds the text shown so far starting (`start`) or ending (`end`) at `split`.
+   */
+  resetAndWriteAnchored(data: string, anchor: { split: number; keep: "start" | "end" }): void {
+    if (this.disposed) return;
+    const before = this.core.scrollbarState();
+    const head = data.slice(0, anchor.split);
+    this.resetAndWrite(head);
+    const middle = this.core.scrollbarState();
+    this.write(data.slice(anchor.split));
+    const after = this.core.scrollbarState();
+    if (before === null || middle === null || after === null) return;
+    // The split's row is the cursor's: the last screen row once the screen has filled,
+    // else at least one row per line break before it.
+    let lineBreaks = 0;
+    for (let index = head.indexOf("\n"); index !== -1; index = head.indexOf("\n", index + 1)) {
+      lineBreaks += 1;
+    }
+    const splitRow =
+      middle.total > middle.len ? middle.total - 1 : Math.min(middle.len - 1, lineBreaks);
+    const target =
+      anchor.keep === "start"
+        ? splitRow + before.offset
+        : splitRow - (before.total - 1 - before.offset);
+    const offset = Math.max(0, Math.min(target, after.total - after.len));
+    this.moveViewport(offset - after.offset);
+    // Rows that arrived at an edge the user already reached do not ask for more until
+    // the user leaves that edge, so a page that adds nothing cannot chain more pages.
+    this.scrollbackEdgeNotified =
+      offset === 0 ? "start" : offset === after.total - after.len ? "end" : null;
+  }
+
   resetAndWrite(data: string): void {
     if (this.disposed) return;
+    this.scrollbackEdgeNotified = null;
     this.cancelSynchronizedRenderTimer();
     this.lastMouseMotionData = "";
     this.core.resetAndWrite(data);
@@ -1923,14 +1962,32 @@ export class GhosttyTerminalSurface {
   }
 
   private scrollViewport(deltaRows: number): void {
-    let delta = Math.trunc(deltaRows);
+    const requested = Math.trunc(deltaRows);
+    let delta = requested;
     const state = this.readScrollbarState();
     if (state !== null) {
       const maxOffset = Math.max(0, state.total - state.len);
       const offset = Math.max(0, Math.min(state.offset + delta, maxOffset));
       delta = offset - state.offset;
       this.scrollbarState = { ...state, offset };
+      const reached =
+        requested < 0 && offset === 0
+          ? "start"
+          : requested > 0 && offset === maxOffset
+            ? "end"
+            : null;
+      if (reached !== null && reached !== this.scrollbackEdgeNotified) {
+        this.scrollbackEdgeNotified = reached;
+        if (reached === "start") this.options.onScrollbackStart?.();
+        else this.options.onScrollbackEnd?.();
+      } else if (reached === null && delta !== 0) {
+        this.scrollbackEdgeNotified = null;
+      }
     }
+    this.moveViewport(delta);
+  }
+
+  private moveViewport(delta: number): void {
     if (delta === 0) return;
     this.core.scroll(delta);
     this.forceFullRender = true;
