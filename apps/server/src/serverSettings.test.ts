@@ -293,11 +293,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("server settings"
     }).pipe(Effect.provide(layerServerSettings())),
   );
 
-  it.effect("tells clients it reads idle compaction modes before any settings are saved", () =>
+  it.effect("defaults to never compacting idle threads, and says so in the mode field", () =>
     Effect.gen(function* () {
       const service = yield* ServerSettingsModule.ServerSettingsService;
       const settings = yield* service.getSettings;
-      assert.equal(settings.idleCompaction, "onReturn");
+      assert.equal(settings.idleCompaction, "off");
       assert.strictEqual(settings.compactIdleThreads, false);
     }).pipe(Effect.provide(layerServerSettings())),
   );
