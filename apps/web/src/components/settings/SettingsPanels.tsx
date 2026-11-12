@@ -1536,8 +1536,11 @@ export function CompactIdleThreadsRow() {
 function ScopedCompactIdleThreadsRow() {
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
-  const { targets } = useSettingsScope();
+  const { scope, targets } = useSettingsScope();
   const idleCompaction = scopedIdleCompaction(targets.length > 0 ? targets : [{ settings }]);
+  // Under All environments the choice is saved for every environment; one too old to store
+  // "Never" is listed as such rather than blocking the choice.
+  const neverSelectable = scope.kind === "all" || idleCompaction.neverAvailable;
 
   return (
     <SettingsRow
@@ -1580,7 +1583,7 @@ function ScopedCompactIdleThreadsRow() {
                 key={mode.value}
                 value={mode.value}
                 // A server from before modes has only the on/off switch, so it cannot store "Never".
-                disabled={mode.value === "off" && !idleCompaction.neverAvailable}
+                disabled={mode.value === "off" && !neverSelectable}
               >
                 {mode.label}
               </SelectItem>

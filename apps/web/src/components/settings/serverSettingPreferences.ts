@@ -166,9 +166,9 @@ export type PreferenceSyncAttempts = Map<
 >;
 
 /**
- * The writes to send now. Each distinct patch goes to an environment at most once per
- * connection, so a failed or dropped write is not repeated, a value another client changes
- * is set back only on the next connection, and a config that arrives late is planned again.
+ * The writes to send now: each distinct patch at most once per connection, so failed writes
+ * aren't repeated and two clients can't fight. A value changed elsewhere is set back now if
+ * this connection hasn't sent that patch yet, otherwise on the next connection.
  * `connected` lists every environment connected right now; the rest are forgotten.
  */
 export function nextPreferenceWrites(
