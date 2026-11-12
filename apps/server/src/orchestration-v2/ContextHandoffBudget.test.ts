@@ -19,13 +19,14 @@ import * as Schema from "effect/Schema";
 import {
   contextUsageForHandoff,
   handoffBudget,
+  MAX_HANDOFF_TOKEN_CAP,
   historyCost,
   historyResponseItems,
   selectHistory,
   historicalMessage,
 } from "@t3tools/provider-core/server/handoffBudget";
 import { projectContextHandoffForWire } from "./WireProjection.ts";
-import { deliverContextHandoffs } from "./ContextHandoffDelivery.ts";
+import { deliverContextHandoffs, textBesideHistory } from "./ContextHandoffDelivery.ts";
 
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeHandoff = Schema.decodeUnknownSync(OrchestrationV2ContextHandoff);
@@ -260,6 +261,34 @@ describe("handoff budget", () => {
       );
     }
     assert.equal(handoffBudget({ ...base, tokenCap: 2_000 }), 2_000);
+
+    // A side chat's parent digest is sent beside history, so it shares the room.
+    const sideChat = { ...base, tokenCap: undefined, modelContextWindow: 128_000 };
+    const withoutSideChat = handoffBudget(sideChat);
+    const withSideChat = handoffBudget({
+      ...sideChat,
+      userText: textBesideHistory({
+        userText: base.userText,
+        restartNote: "",
+        sideChatContext: "s".repeat(64_000),
+      }),
+    });
+    assert.isBelow(withSideChat, withoutSideChat);
+    assert.isAtMost(withSideChat, 128_000 - 32_000 - 64_000);
+
+    const uncapped = { ...base, tokenCap: undefined };
+    assert.equal(
+      handoffBudget({ ...uncapped, modelContextWindow: 1_000_000 }),
+      500_000,
+      "half of a known window",
+    );
+    assert.equal(
+      handoffBudget({ ...uncapped, modelContextWindow: 4_000_000 }),
+      MAX_HANDOFF_TOKEN_CAP,
+    );
+    const unknownWindow = handoffBudget({ ...uncapped, modelContextWindow: undefined });
+    assert.isAbove(unknownWindow, 64_000, "the assumed 128k window bounds an unknown model");
+    assert.isBelow(unknownWindow, 128_000 - 32_000);
   });
 
   it("keeps measured occupancy across a model change", () => {
@@ -454,6 +483,7 @@ describe("handoff delivery", () => {
         messages.map((item) => item.itemId),
       );
       assert.deepEqual(durable.delivery?.omittedItemIds, [omittedBeforeDelivery, oversized.itemId]);
+      assert.equal(result.omittedItems, 2);
       assert.deepEqual(decodeHandoff(durable).delivery, durable.delivery);
     }),
   );
@@ -480,6 +510,7 @@ describe("handoff delivery", () => {
       };
       const first = yield* deliverContextHandoffs({ ...input, handoffs: [durable] });
       assert.equal(first.context, "");
+      assert.equal(first.omittedItems, 0);
       assert.deepEqual(statuses, ["pending", "injected"]);
       assert.lengthOf(history, 3);
       const second = yield* deliverContextHandoffs({ ...input, handoffs: [durable] });

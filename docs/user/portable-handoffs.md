@@ -12,9 +12,10 @@ Codex receives historical messages directly when its installed version supports 
 Other providers receive the same selection as attributed conversation context. A handoff does not
 copy the outgoing provider's reasoning, tool-call state, or attachments.
 
-The handoff includes references to omitted history. The agent can use T3 Code's thread-reading tool
-to retrieve saved messages and activity, including the remainder of a long item. For an important
-constraint, you can still repeat it in your next message. A handoff is a budgeted selection, not an
+When history is left out, the thread shows a notice saying how many items did not fit, and the
+handoff includes references to them. The agent can use T3 Code's thread-reading tool to retrieve
+saved messages and activity, including the remainder of a long item. For an important constraint,
+you can still repeat it in your next message. A handoff is a budgeted selection, not an
 agent-written summary.
 
 ## Context limits
@@ -28,11 +29,14 @@ never shortens your request to make it fit.
 
 Recovery leaves running background work intact. Let it finish or stop it before retrying the handoff.
 
-Server operators can set `T3CODE_CONTEXT_HANDOFF_TOKEN_CAP` to change the initial history allowance
-(default 16,000; clamped to 1,024–64,000). This is an upper bound, not a provider context-window
-guarantee. Text accounting conservatively charges one token per UTF-8 byte, including attribution
-and JSON escaping. Imported history has a separate 64,000-byte ceiling; your current input and
-attachment payloads do not consume that ceiling.
+By default, history may use up to half of the target model's context window, or 200,000 tokens
+when the window is unknown. Switching a long thread to a large-window model can therefore send a
+lot of history on the first turn, which costs tokens with providers that bill by usage; start a
+new thread instead when you do not need the earlier conversation. Server operators can set `T3CODE_CONTEXT_HANDOFF_TOKEN_CAP` to use a
+fixed allowance instead (clamped to 1,024–1,000,000). Either way it is an upper bound, not a
+provider context-window guarantee. Text accounting conservatively charges one token per UTF-8 byte,
+including attribution and JSON escaping. Your current input and attachments do not count against
+the allowance.
 
 T3 Code uses available capacity information for your selected model and options, together with
 provider context telemetry. Starting a fresh provider conversation clears prior usage, while keeping

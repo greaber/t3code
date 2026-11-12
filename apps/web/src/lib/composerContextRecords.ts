@@ -204,6 +204,29 @@ export function terminalContextRecord(context: TerminalContextDraft): TerminalCo
   };
 }
 
+/** Labels of draft context that sending would cut, so the composer can say so first. */
+export function oversizedComposerContextLabels(input: {
+  readonly terminalContexts: ReadonlyArray<TerminalContextDraft>;
+  readonly reviewComments: ReadonlyArray<ReviewCommentContext>;
+}): string[] {
+  return [
+    ...input.terminalContexts
+      .filter(
+        (context) =>
+          normalizeTerminalContextText(context.text).length >
+          COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS,
+      )
+      .map(formatTerminalContextLabel),
+    ...input.reviewComments
+      .filter(
+        (comment) =>
+          comment.text.length > COMPOSER_CONTEXT_REVIEW_TEXT_MAX_CHARS ||
+          comment.diff.length > COMPOSER_CONTEXT_REVIEW_DIFF_MAX_CHARS,
+      )
+      .map(reviewCommentContextLabel),
+  ];
+}
+
 export function reviewCommentContextRecord(
   comment: ReviewCommentContext,
 ): ReviewCommentContextRecord {

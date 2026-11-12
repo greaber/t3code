@@ -19,12 +19,7 @@ import {
   useComposerDraftStore,
 } from "../../composerDraftStore";
 import { type ComposerPromptEditorHandle } from "../ComposerPromptEditorTiptap";
-import {
-  MAX_STASH_ENTRIES,
-  type PromptStashEntry,
-  partitionStashAttachments,
-  usePromptStashStore,
-} from "../../promptStashStore";
+import { type PromptStashEntry, usePromptStashStore } from "../../promptStashStore";
 import { type PendingUserInput } from "../../session-logic";
 import { type ReviewCommentContext } from "../../reviewCommentContext";
 import { collapseExpandedComposerCursor } from "../../composer-logic";
@@ -379,7 +374,7 @@ export function useComposerStash(input: {
     const missingImageReasons: string[] = [];
     if (entry.droppedImageNames.length > 0) {
       missingImageReasons.push(
-        `${entry.droppedImageNames.join(", ")} exceeded the stash size limit when this prompt was saved.`,
+        `${entry.droppedImageNames.join(", ")} did not fit in browser storage when this prompt was saved.`,
       );
     }
     if (entry.unreadableImageNames && entry.unreadableImageNames.length > 0) {
@@ -399,7 +394,7 @@ export function useComposerStash(input: {
     }
     if (expiredFileNames.length > 0) {
       missingImageReasons.push(
-        `${expiredFileNames.join(", ")}: stashed files are kept for 24 hours and this upload expired. Attach the file again.`,
+        `${expiredFileNames.join(", ")}: stashed files are kept for 30 days and this upload expired. Attach the file again.`,
       );
     }
     if (missingImageReasons.length > 0) {
@@ -525,7 +520,7 @@ export function useComposerStash(input: {
       // crash or closed tab mid-encode still leaves the prompt recoverable,
       // while clearing before the async image work means edits typed during
       // encoding are not wiped.
-      const { evicted, written, durable } = stashEntryToQueue({
+      const { written, durable, storageFull } = stashEntryToQueue({
         id: entryId,
         createdAt: new Date().toISOString(),
         prompt,
@@ -544,8 +539,9 @@ export function useComposerStash(input: {
         toastManager.add({
           type: "error",
           title: "Could not stash this prompt",
-          description:
-            "Browser storage rejected the write, so the composer was left as-is. Free up site data and try again.",
+          description: storageFull
+            ? "Browser storage is full. Your earlier stashed prompts are unchanged and this one stays in the composer. Delete stashed prompts you no longer need, then try again."
+            : "Browser storage rejected the write. Your earlier stashed prompts are unchanged and this one stays in the composer.",
           data: { hideCopyButton: true },
         });
         return;
@@ -579,22 +575,6 @@ export function useComposerStash(input: {
       setComposerTrigger(null);
       pulseStashBadge();
 
-      if (evicted) {
-        for (const file of evicted.files ?? []) {
-          releasePersistedAttachmentUpload({
-            id: file.id,
-            environmentId: file.environmentId,
-            attachmentId: file.attachmentId,
-          });
-        }
-        toastManager.add({
-          type: "warning",
-          title: "Oldest stashed prompt discarded",
-          description: `The stash holds ${MAX_STASH_ENTRIES} prompts; the oldest was removed to make room.`,
-          data: { hideCopyButton: true },
-        });
-      }
-
       // Images are re-encoded for the stash rather than stored verbatim: the
       // composer allows up to 10MB per image, but localStorage gives the whole
       // origin ~5MB.
@@ -620,15 +600,24 @@ export function useComposerStash(input: {
             : {}),
         });
       }
-      const { kept, droppedNames } = partitionStashAttachments(candidateAttachments);
-
-      const { attached, durable: imagesDurable } = finalizeStashEntryImages(entryId, {
-        attachments: kept,
-        droppedImageNames: [...oversizedImageNames, ...droppedNames],
+      const {
+        attached,
+        durable: imagesDurable,
+        storageDroppedImageNames,
+      } = finalizeStashEntryImages(entryId, {
+        attachments: candidateAttachments,
+        droppedImageNames: oversizedImageNames,
         unreadableImageNames,
       });
       if (attached) {
-        if (!imagesDurable && durable && images.length > 0) {
+        if (storageDroppedImageNames.length > 0 && imagesDurable) {
+          toastManager.add({
+            type: "warning",
+            title: "Some stashed images were not saved",
+            description: `The stash is at its share of browser storage, which it leaves partly free for drafts, so the prompt was stashed without ${storageDroppedImageNames.join(", ")}. Delete stashed prompts you no longer need to make room.`,
+            data: { hideCopyButton: true },
+          });
+        } else if (!imagesDurable && durable && images.length > 0) {
           toastManager.add({
             type: "warning",
             title: "Stashed images were not saved",
@@ -637,11 +626,11 @@ export function useComposerStash(input: {
             data: { hideCopyButton: true },
           });
         }
-      } else if (kept.length > 0) {
+      } else if (candidateAttachments.length > 0) {
         toastManager.add({
           type: "warning",
           title: "Stashed images did not attach",
-          description: `That prompt was restored or deleted before ${kept.length} image${kept.length === 1 ? "" : "s"} finished saving. Re-attach ${kept.length === 1 ? "it" : "them"} if you still need ${kept.length === 1 ? "it" : "them"}.`,
+          description: `That prompt was restored or deleted before ${candidateAttachments.length} image${candidateAttachments.length === 1 ? "" : "s"} finished saving. Re-attach ${candidateAttachments.length === 1 ? "it" : "them"} if you still need ${candidateAttachments.length === 1 ? "it" : "them"}.`,
           data: { hideCopyButton: true },
         });
       }

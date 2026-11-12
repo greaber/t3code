@@ -115,4 +115,17 @@ describe("limitRecoveryCommand arming", () => {
     const thread = failedThread(30 * HOUR_MS, 24 * HOUR_MS + 1);
     assert.isNull(limitRecoveryCommand(thread, true, nowMs));
   });
+
+  it("resumes a recovery armed before the reset, however late the server sees it", () => {
+    const thread = failedThread(5 * 24 * HOUR_MS, 4 * 24 * HOUR_MS);
+    const armed = {
+      ...thread,
+      limitRecovery: {
+        runId: thread.latestRunId!,
+        resetAt: thread.usageLimitResetAt!,
+        autoResume: true,
+      },
+    };
+    assert.equal(limitRecoveryCommand(armed, true, nowMs)?.type, "message.dispatch");
+  });
 });

@@ -27,6 +27,7 @@ import { vi } from "vite-plus/test";
 
 import * as AssetSigner from "./AssetSigner.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { sweepStalePendingAttachments } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
@@ -1274,6 +1275,33 @@ describe("AssetAccess", () => {
         );
         expect(result.imageDimensions).toEqual({ width: 390, height: 844 });
       }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps a draft's pending upload alive whenever a client asks for its URL", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      yield* fileSystem.makeDirectory(config.attachmentsDir, { recursive: true });
+      const now = 1_800_000_000_000;
+      const longAgo = DateTime.toDateUtc(DateTime.makeUnsafe(now - 60 * 24 * 60 * 60 * 1000));
+      const attachmentId = "pending-00000000-0000-4000-8000-000000000042-pdf";
+      const filePath = path.join(config.attachmentsDir, `${attachmentId}.pdf`);
+      const sidecarPath = `${filePath}.txt`;
+      for (const target of [filePath, sidecarPath]) {
+        yield* fileSystem.writeFileString(target, "draft");
+        yield* fileSystem.utimes(target, longAgo, longAgo);
+      }
+      yield* TestClock.setTime(now);
+
+      yield* issueAssetUrl({ resource: { _tag: "attachment", attachmentId } });
+
+      expect(
+        sweepStalePendingAttachments({ attachmentsDir: config.attachmentsDir, nowMs: now }),
+      ).toEqual({ deleted: 0 });
+      expect(yield* fileSystem.exists(filePath)).toBe(true);
+      expect(yield* fileSystem.exists(sidecarPath)).toBe(true);
+    }).pipe(Effect.provide(layerTest)),
   );
 
   it.effect("serves document attachments inline when a viewer requests it", () =>

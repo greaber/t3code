@@ -1,10 +1,13 @@
 import type { EnvironmentId, ServerConfig, ServerSelfUpdateCapability } from "@t3tools/contracts";
+import type { EnvironmentPresentation } from "@t3tools/client-runtime/connection";
 import type { ServerUpdateState } from "@t3tools/client-runtime/state/server";
 import { cliInstallScriptCommand } from "@t3tools/shared/cliRelease";
 import { compareSemverVersions, parseSemver } from "@t3tools/shared/semver";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import { APP_VERSION } from "./branding";
+import { isElectron } from "./env";
 import { getLocalStorageItem, setLocalStorageItem } from "./hooks/useLocalStorage";
 
 export interface VersionMismatch {
@@ -85,6 +88,25 @@ export function resolveServerSelfUpdateCapability(
   serverConfig: Pick<ServerConfig, "environment"> | null | undefined,
 ): ServerSelfUpdateCapability | null {
   return serverConfig?.environment.capabilities.serverSelfUpdate ?? null;
+}
+
+/** Whether this desktop app started the environment's server over SSH and can restart it. */
+export function isAppStartedSshServer(entry: Pick<EnvironmentPresentation["entry"], "profile">) {
+  const profile = Option.getOrNull(entry.profile);
+  return (
+    isElectron && profile?._tag === "SshConnectionProfile" && profile.remoteServerKind === "managed"
+  );
+}
+
+/** The version a restart starts on a server this desktop app started over SSH, which reports no
+ * self-update of its own. Other servers keep their own update guidance. */
+export function sshRestartVersion(
+  environment: Pick<EnvironmentPresentation, "entry" | "serverConfig">,
+): string | null {
+  return resolveServerSelfUpdateCapability(environment.serverConfig) === null &&
+    isAppStartedSshServer(environment.entry)
+    ? APP_VERSION
+    : null;
 }
 
 export function supportsDesktopAppUpdate(

@@ -1,5 +1,9 @@
 import { attachSidebarTree } from "../lib/sidebarTree";
-import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
+import {
+  THREAD_SEARCH_MAX_EXCLUDED_THREADS,
+  type EnvironmentId,
+  type ScopedProjectRef,
+} from "@t3tools/contracts";
 import type { EnvironmentServerConfig } from "@t3tools/client-runtime/connection";
 import {
   dropThreadContext,
@@ -3270,6 +3274,24 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                       );
                     })}
                   </ul>
+                  {threadSearch.hasMore ? (
+                    <Button
+                      size="xs"
+                      variant="ghost-muted"
+                      className="mx-2 mt-1"
+                      disabled={threadSearch.isPending}
+                      onClick={threadSearch.loadMore}
+                    >
+                      {threadSearch.isPending
+                        ? "Searching older messages…"
+                        : "Search older messages"}
+                    </Button>
+                  ) : threadSearch.partial ? (
+                    <p className="px-2 py-2 text-center text-xs text-sidebar-muted-foreground">
+                      Showing the first {THREAD_SEARCH_MAX_EXCLUDED_THREADS.toLocaleString()}{" "}
+                      threads with matching messages. Refine the search to see others.
+                    </p>
+                  ) : null}
                 </DndContext>
               </TooltipProvider>
             ) : (

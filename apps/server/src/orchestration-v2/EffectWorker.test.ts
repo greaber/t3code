@@ -395,6 +395,78 @@ it.effect("requeues a claim when a pre-execution worker check fails", () =>
   }),
 );
 
+it.effect.each([
+  // Background cleanup keeps retrying for about ten minutes, with backoff capped at 30 s.
+  { type: "terminal.cleanup", attemptCount: 5, expected: { retryDelayMs: 1_600 } },
+  { type: "provider-session.detach", attemptCount: 20, expected: { retryDelayMs: 30_000 } },
+  { type: "attachment.cleanup", attemptCount: 27, expected: { retryDelayMs: 30_000 } },
+  { type: "terminal.cleanup", attemptCount: 28, expected: "failed" },
+  // A user is waiting on these, and backoff blocks the thread's later effects.
+  { type: "provider-turn.start", attemptCount: 4, expected: { retryDelayMs: 800 } },
+  { type: "provider-turn.start", attemptCount: 5, expected: "failed" },
+] as const)(
+  "after a failed $type attempt $attemptCount the worker settles with $expected",
+  ({ type, attemptCount, expected }) =>
+    Effect.gen(function* () {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const workerId = "worker-retry-budget";
+      const claimedEffect: EffectOutbox.OrchestrationEffectV2 = {
+        id: `effect:retry-budget:${type}`,
+        commandId: CommandId.make(`command:retry-budget:${type}`),
+        threadId: ThreadId.make("thread:retry-budget"),
+        request:
+          type === "provider-turn.start"
+            ? { type, runId: RunId.make("run:retry-budget") }
+            : type === "provider-session.detach"
+              ? { type, providerSessionId: oldSessionId }
+              : type === "attachment.cleanup"
+                ? { type, attachmentIds: [] }
+                : { type },
+        status: "running",
+        attemptCount,
+        availableAt: now,
+        leaseOwner: workerId,
+        createdAt: now,
+        updatedAt: now,
+        completedAt: null,
+        lastError: null,
+      };
+      const settled = yield* Ref.make<ReadonlyArray<unknown>>([]);
+      const settle = (outcome: unknown) =>
+        Ref.update(settled, (existing) => [...existing, outcome]).pipe(Effect.as(true));
+      const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+        claimNext: () => Effect.succeedSome(claimedEffect),
+        get: () => Effect.succeedSome(claimedEffect),
+        awaitCancellation: () => Effect.never,
+        clearCancellation: () => Effect.void,
+        retry: ({ delayMs }) => settle({ retryDelayMs: delayMs }),
+        fail: () => settle("failed"),
+      });
+      const layerExecutor = Layer.succeed(
+        EffectWorker.OrchestrationEffectExecutorV2,
+        EffectWorker.OrchestrationEffectExecutorV2.of({
+          execute: (effect) =>
+            Effect.fail(
+              new EffectWorker.OrchestrationEffectExecutionError({
+                effectId: effect.id,
+                effectType: effect.request.type,
+                cause: "simulated transient failure",
+              }),
+            ),
+        }),
+      );
+      yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+        Effect.flatMap((worker) => worker.runOnce),
+        Effect.provide(
+          EffectWorker.layerWithOptions({ workerId }).pipe(
+            Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+          ),
+        ),
+      );
+      assert.deepEqual(yield* Ref.get(settled), [expected]);
+    }),
+);
+
 it.effect("arms cancellation before the durable pre-execution check", () =>
   Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);

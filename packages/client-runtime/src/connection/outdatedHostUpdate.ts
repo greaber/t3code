@@ -101,6 +101,36 @@ export const updateOutdatedHost = Effect.fn("clientRuntime.connection.updateOutd
     }
 
     const capabilities = descriptor.capabilities;
+    // A server this desktop app started over SSH updates by restarting it on the
+    // app's version: stop it, then the next connect launches the new one.
+    if (
+      capabilities.serverSelfUpdate === undefined &&
+      entry.target._tag === "SshConnectionTarget"
+    ) {
+      yield* onStage("resuming");
+      yield* registry.restartSshServer(environmentId).pipe(
+        Effect.mapError(
+          (error) =>
+            new OutdatedHostUpdateError({
+              environmentId,
+              message:
+                error._tag === "ConnectionBlockedError" && error.reason === "unsupported"
+                  ? `Update T3 Code on ${descriptor.label} manually; this app did not start it.`
+                  : error.message,
+            }),
+        ),
+      );
+      const restarted = (yield* reachOutdatedHost(environmentId)).descriptor;
+      if (!isCompatibleDescriptor(restarted)) {
+        return yield* new OutdatedHostUpdateError({
+          environmentId,
+          message: `${descriptor.label} restarted on T3 Code ${restarted.serverVersion}, which this app cannot use.`,
+        });
+      }
+      yield* switchBackOn;
+      return { targetVersion: restarted.serverVersion };
+    }
+
     if (
       capabilities.serverSelfUpdate === undefined ||
       (capabilities.serverSelfUpdate === "desktop-managed" &&

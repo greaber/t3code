@@ -628,6 +628,16 @@ export class OrchestrationEffectWorkerV2 extends Context.Service<
   OrchestrationEffectWorkerV2Shape
 >()("t3/orchestration-v2/EffectWorker/OrchestrationEffectWorkerV2") {}
 
+// Retry backoff blocks the thread's later effects, so effects a user waits on keep a short
+// budget (about 1.5 s) and surface their failure; background cleanup, which does not block,
+// retries for about ten minutes before giving up.
+const INTERACTIVE_EFFECT_MAX_ATTEMPTS = 5;
+const BACKGROUND_EFFECT_MAX_ATTEMPTS = 28;
+const BACKGROUND_EFFECT_TYPES: ReadonlySet<EffectOutbox.OrchestrationEffectRequestV2["type"]> =
+  new Set(EffectOutbox.BACKGROUND_EFFECT_TYPES);
+const retryDelayMs = (attemptCount: number) =>
+  Math.min(30_000, 100 * 2 ** Math.max(0, attemptCount - 1));
+
 export interface OrchestrationEffectWorkerOptions {
   readonly workerId?: string;
   readonly maxAttempts?: number;
@@ -646,7 +656,14 @@ export const layerWithOptions = (
       const outbox = yield* EffectOutbox.EffectOutboxV2;
       const executor = yield* OrchestrationEffectExecutorV2;
       const workerId = options.workerId ?? `orchestration-v2:${process.pid}`;
-      const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
+      const maxAttemptsFor = (effect: EffectOutbox.OrchestrationEffectV2) =>
+        Math.max(
+          1,
+          options.maxAttempts ??
+            (BACKGROUND_EFFECT_TYPES.has(effect.request.type)
+              ? BACKGROUND_EFFECT_MAX_ATTEMPTS
+              : INTERACTIVE_EFFECT_MAX_ATTEMPTS),
+        );
       const wasCancelled = (effectId: string) =>
         outbox.get(effectId).pipe(
           Effect.map(
@@ -783,7 +800,7 @@ export const layerWithOptions = (
           if (cancelledBeforeExecution) return true;
 
           const execution = executor
-            .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
+            .execute(effect, { willRetry: effect.attemptCount < maxAttemptsFor(effect) })
             .pipe(boundExecution(effect), Effect.as("executed" as const));
           const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
             Effect.ensuring(outbox.clearCancellation(effect.id)),
@@ -815,11 +832,21 @@ export const layerWithOptions = (
             nonRetryable,
             error,
           });
+          const exhausted = !nonRetryable && effect.attemptCount >= maxAttemptsFor(effect);
+          if (exhausted) {
+            yield* Effect.logError("Orchestration effect gave up after its last attempt", {
+              effectId: effect.id,
+              effectType: effect.request.type,
+              threadId: effect.threadId,
+              attemptCount: effect.attemptCount,
+              error,
+            });
+          }
           const updated = nonRetryable
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
+            : exhausted
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
@@ -828,7 +855,7 @@ export const layerWithOptions = (
                     effectId: effect.id,
                     workerId,
                     error,
-                    delayMs: Math.min(30_000, 100 * 2 ** Math.max(0, effect.attemptCount - 1)),
+                    delayMs: retryDelayMs(effect.attemptCount),
                   })
                   .pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
           if (!updated) {

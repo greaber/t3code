@@ -223,9 +223,12 @@ check with:
 ssh user@example.com 'sh -lc "command -v claude codex"'
 ```
 
-If SSH reconnecting fails after an app update, retry the launch once. Removing
-the connection stops a server that T3 Code launched; a server that was already
-running is left alone.
+A server T3 Code launched keeps running when you quit the app, so agent work
+continues, and reconnecting picks it up again. After an app update it stays on
+its old version until you choose **Update**, which restarts it on the app's
+version and stops any agent turns running there. Removing the connection or
+switching the environment off stops a server that T3 Code launched; a server
+that was already running is left alone.
 
 Each desktop app keeps one session on the host for its SSH connection and reuses
 it when it reconnects. Revoke sessions you no longer use in **Settings →

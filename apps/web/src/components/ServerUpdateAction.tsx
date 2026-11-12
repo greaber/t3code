@@ -30,7 +30,7 @@ import { useServerConfigs } from "~/state/entities";
 import { useManagedPolicy } from "~/state/managedPolicy";
 import { environmentPresentations } from "~/state/presentation";
 import { ManagedControl } from "./ManagedPolicy";
-import { manualServerUpdateCommand } from "~/versionSkew";
+import { isAppStartedSshServer, manualServerUpdateCommand, sshRestartVersion } from "~/versionSkew";
 import { crossesReleaseTrack } from "@t3tools/shared/cliRelease";
 import { Button } from "./ui/button";
 import { toastManager } from "./ui/toast";
@@ -94,6 +94,8 @@ export interface ServerUpdateTarget {
   readonly targetDatabaseMigration?: number;
   /** The host already runs its track's newest build and only saves the track. */
   readonly trackOnly?: boolean;
+  /** This desktop app started the server over SSH and updates it by restarting it. */
+  readonly restartSshServer?: boolean;
 }
 
 type UpdateButtonProps = Pick<ComponentProps<typeof Button>, "variant" | "size" | "className"> & {
@@ -132,6 +134,7 @@ export function useServerUpdate() {
     pendingUpdateEnvironmentIds.add(environmentId);
     const result = await updateServer({
       environmentId,
+      ...(target.restartSshServer === true ? { restartSshServer: true } : {}),
       input: {
         targetVersion,
         ...(target.channel === undefined ? {} : { channel: target.channel }),
@@ -182,7 +185,7 @@ export function ServerUpdatesAction({
   const [isPending, setIsPending] = useState(false);
   const eligible = targets.filter(
     (target) =>
-      target.selfUpdate !== null &&
+      (target.selfUpdate !== null || target.restartSshServer === true) &&
       (target.selfUpdate !== "desktop-managed" || target.desktopAppUpdate) &&
       managedUpdatesDenial(serverConfigs.get(target.environmentId)?.managedPolicy) === undefined &&
       !refusedCrossing(target, serverConfigs.get(target.environmentId)?.environment.serverVersion),
@@ -204,6 +207,14 @@ export function ServerUpdatesAction({
           )) ?? true;
         if (!confirmed) return;
       }
+      const sshTargets = available.filter((target) => target.restartSshServer === true);
+      if (sshTargets.length > 0) {
+        const confirmed =
+          (await requestConfirmDialog(sshRestartConfirmation(sshTargets), {
+            initialFocus: "confirm",
+          })) ?? true;
+        if (!confirmed) return;
+      }
       await Promise.all(available.map((target) => update(target)));
     });
     pending.current = false;
@@ -220,6 +231,10 @@ export function ServerUpdatesAction({
       {label}
     </Button>
   );
+}
+
+function sshRestartConfirmation(targets: ReadonlyArray<Pick<ServerUpdateTarget, "serverLabel">>) {
+  return `Restart T3 Code on ${targets.map((target) => target.serverLabel).join(", ")} to update? Agent turns running there will stop.`;
 }
 
 export function canUpdateServer(
@@ -268,6 +283,9 @@ export function ServerUpdateAction({
   appearance = "button",
 }: ServerUpdateTarget & UpdateButtonProps) {
   const isDesktopAppUpdate = selfUpdate === "desktop-managed";
+  const presentation = useAtomValue(environmentPresentations.presentationAtom(environmentId));
+  const restartSshServer =
+    presentation !== null && sshRestartVersion(presentation) === targetVersion;
   const serverVersion = useServerConfigs().get(environmentId)?.environment.serverVersion;
   const sessionStateAtom = environmentSession.sessionStateAtom(environmentId);
   const canUpdate = useAtomValue(sessionStateAtom, canUpdateServer);
@@ -298,6 +316,13 @@ export function ServerUpdateAction({
     ) {
       return;
     }
+    if (restartSshServer) {
+      const confirmed =
+        (await requestConfirmDialog(sshRestartConfirmation([{ serverLabel }]), {
+          initialFocus: "confirm",
+        })) ?? true;
+      if (!confirmed) return;
+    }
     if (isDesktopAppUpdate) {
       const confirmed =
         (await requestConfirmDialog(
@@ -315,6 +340,7 @@ export function ServerUpdateAction({
       selfUpdate,
       desktopAppUpdate,
       targetVersion,
+      restartSshServer,
     });
   };
 
@@ -342,7 +368,8 @@ export function ServerUpdateAction({
     return <CrossTrackNote />;
   }
 
-  const manualCommand = selfUpdate === null ? manualServerUpdateCommand(targetVersion) : null;
+  const manualCommand =
+    selfUpdate === null && !restartSshServer ? manualServerUpdateCommand(targetVersion) : null;
   const actionLabel = manualCommand !== null ? "Copy update command" : label;
   const onClick =
     manualCommand !== null
@@ -399,8 +426,17 @@ export function OutdatedServerUpdateAction({
   readonly label?: string;
 }) {
   const update = useAtomCommand(updateOutdatedServer, { reportFailure: false });
+  const presentation = useAtomValue(environmentPresentations.presentationAtom(environmentId));
+  const restartsSshServer = presentation !== null && isAppStartedSshServer(presentation.entry);
   const handleUpdate = async () => {
     if (pendingUpdateEnvironmentIds.has(environmentId)) return;
+    if (restartsSshServer) {
+      const confirmed =
+        (await requestConfirmDialog(sshRestartConfirmation([{ serverLabel }]), {
+          initialFocus: "confirm",
+        })) ?? true;
+      if (!confirmed || pendingUpdateEnvironmentIds.has(environmentId)) return;
+    }
     pendingUpdateEnvironmentIds.add(environmentId);
     const result = await update({
       environmentId,

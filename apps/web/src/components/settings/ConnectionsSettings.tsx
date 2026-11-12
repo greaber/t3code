@@ -81,6 +81,7 @@ import { useUiStateStore } from "~/uiStateStore";
 import {
   resolveServerConfigVersionMismatch,
   resolveServerSelfUpdateCapability,
+  sshRestartVersion,
   supportsDesktopAppUpdate,
 } from "~/versionSkew";
 import { hasCloudPublicConfig } from "~/cloud/publicConfig";
@@ -281,13 +282,15 @@ function ConnectionsSettingsContent({
       const mismatch = resolveServerConfigVersionMismatch(environment.serverConfig);
       const selfUpdate = resolveServerSelfUpdateCapability(environment.serverConfig);
       const desktopAppUpdate = supportsDesktopAppUpdate(environment.serverConfig);
+      const restartSshServer =
+        mismatch !== null && sshRestartVersion(environment) === mismatch.clientVersion;
       if (
         !mismatch ||
         updateStatus === "running" ||
         !environment.entry.enabled ||
         environment.connection.phase !== "connected" ||
         isDesktopLocalConnectionTarget(environment.entry.target) ||
-        selfUpdate === null ||
+        (selfUpdate === null && !restartSshServer) ||
         (selfUpdate === "desktop-managed" && !desktopAppUpdate)
       ) {
         return [];
@@ -299,6 +302,7 @@ function ConnectionsSettingsContent({
           selfUpdate,
           desktopAppUpdate,
           targetVersion: mismatch.clientVersion,
+          restartSshServer,
         },
       ];
     },

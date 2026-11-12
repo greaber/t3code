@@ -67,13 +67,19 @@ describe("collectServerUpdateTargets", () => {
         machine("current", "0.0.50", "boot-service"),
         machine("current-offline", "0.0.50", "boot-service", { connected: false }),
         machine("manual", "0.0.40", undefined),
+        machine("ssh", "0.0.40", undefined, { sshRestartVersion: "0.0.50" }),
+        // This app has not restarted on 0.0.50 yet, so a restart would start 0.0.49.
+        machine("ssh-before-app", "0.0.40", undefined, { sshRestartVersion: "0.0.49" }),
       ],
       "0.0.50",
     );
 
-    expect(targets.map((target) => [target.serverLabel, target.targetVersion])).toEqual([
-      ["service", "0.0.50"],
-      ["other-desktop", "0.0.50"],
+    expect(
+      targets.map((target) => [target.serverLabel, target.targetVersion, target.restartSshServer]),
+    ).toEqual([
+      ["service", "0.0.50", undefined],
+      ["other-desktop", "0.0.50", undefined],
+      ["ssh", "0.0.50", true],
     ]);
     expect(skipped.map((entry) => [entry.label, entry.reason])).toEqual([
       ["nightly-service", "on the nightly channel"],
@@ -82,6 +88,7 @@ describe("collectServerUpdateTargets", () => {
       ["no-scope", "no permission"],
       ["busy", "already updating"],
       ["manual", "needs a manual update"],
+      ["ssh-before-app", "updates after this app restarts"],
     ]);
   });
 

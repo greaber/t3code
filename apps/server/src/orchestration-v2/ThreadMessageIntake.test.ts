@@ -7,6 +7,8 @@ import { expect, it } from "@effect/vitest";
 import {
   ChatAttachmentId,
   CommandId,
+  ComposerContextId,
+  PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   EventId,
   GuestMessageId,
   MessageId,
@@ -424,5 +426,45 @@ it.effect("sends a guest message with the guest's files, never ones the client n
     expect(command.attachments).toHaveLength(1);
     // The guest's file, which is already the thread's.
     expect(command.attachments).toEqual([guestFile]);
+  }).pipe(Effect.provide(layerIntakeTest)),
+);
+
+it.effect("refuses a message whose attached context pushes it over the prompt limit", () =>
+  Effect.gen(function* () {
+    const captured: OrchestrationV2ServerCommand[] = [];
+    const record = {
+      version: 1 as const,
+      kind: "terminal" as const,
+      contextId: ComposerContextId.make("terminal_big"),
+      label: "Terminal 1 lines 1-2",
+      terminalId: "default",
+      terminalLabel: "Terminal 1",
+      lineStart: 1,
+      lineEnd: 2,
+      text: "t".repeat(PROVIDER_SEND_TURN_MAX_INPUT_CHARS - 1_000),
+    };
+    const message = (records: ReadonlyArray<typeof record>) =>
+      dispatchCommand({
+        type: "message.dispatch",
+        commandId: CommandId.make("send-large-context"),
+        threadId: ThreadId.make("thread-large-context"),
+        messageId: MessageId.make("message-large-context"),
+        text: `${"p".repeat(2_000)} ${records
+          .map((entry) => `[${entry.label}](t3-context://v1/terminal/${entry.contextId})`)
+          .join(" ")}`,
+        context: { version: 1, records },
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "user",
+        creationSource: "web",
+      }).pipe(Effect.provide(layerFailingDispatch(captured)), Effect.flip);
+
+    const refused = yield* message([record]);
+    expect(refused._tag).toBe("ProviderInputTooLongError");
+    expect(refused.message).toMatch(/over the 120,000-character limit/);
+    expect(captured).toEqual([]);
+
+    yield* message([{ ...record, text: "short" }]);
+    expect(captured).toHaveLength(1);
   }).pipe(Effect.provide(layerIntakeTest)),
 );

@@ -16,7 +16,7 @@ import * as Socket from "effect/socket/Socket";
 
 import type { ConnectionCatalogEntry } from "./catalog.ts";
 import { orchestrationProtocolCompatibilityError } from "./compatibility.ts";
-import { PrimaryConnectionTarget } from "./model.ts";
+import { ConnectionBlockedError, PrimaryConnectionTarget, SshConnectionTarget } from "./model.ts";
 import { describeOutdatedHost, updateOutdatedHost } from "./outdatedHostUpdate.ts";
 import * as EnvironmentRegistry from "./registry.ts";
 import * as ConnectionResolver from "./resolver.ts";
@@ -326,6 +326,106 @@ describe("updateOutdatedHost", () => {
       );
       expect(error).toMatchObject({ _tag: "OutdatedHostUpdateError" });
       expect(opened).toBe(false);
+    }),
+  );
+
+  it.effect.each([
+    { started: true, outcome: "restarts it on the app's version" },
+    { started: false, outcome: "asks for a manual update" },
+  ])("for an SSH server this app started=$started, $outcome", ({ started }) =>
+    Effect.gen(function* () {
+      const sshTarget = new SshConnectionTarget({
+        environmentId: TARGET.environmentId,
+        label: TARGET.label,
+        connectionId: "ssh-old",
+      });
+      // An SSH-launched server reports no self-update; protocol 1 is refused.
+      const sshDescriptor = (protocol: number | undefined, serverVersion: string) => ({
+        ...descriptor(protocol, serverVersion),
+        capabilities: { repositoryIdentity: true },
+      });
+      const calls: string[] = [];
+      const result = yield* Effect.result(
+        updateOutdatedHost(TARGET.environmentId, { targetVersion: "0.0.46" }, () => Effect.void),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.succeed(
+              EnvironmentRegistry.EnvironmentRegistry,
+              EnvironmentRegistry.EnvironmentRegistry.of({
+                entries: yield* SubscriptionRef.make<
+                  ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>
+                >(
+                  new Map([
+                    [
+                      TARGET.environmentId,
+                      { target: sshTarget, profile: Option.none(), enabled: false },
+                    ],
+                  ]),
+                ),
+                restartSshServer: () =>
+                  started
+                    ? Effect.sync(() => calls.push("restart"))
+                    : Effect.fail(
+                        new ConnectionBlockedError({ reason: "unsupported", detail: "external" }),
+                      ),
+                setCompatibility: () => Effect.sync(() => calls.push("compatible")),
+                setEnabled: () => Effect.sync(() => calls.push("enabled")),
+              } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]),
+            ),
+            Layer.succeed(
+              ConnectionResolver.ConnectionResolver,
+              ConnectionResolver.ConnectionResolver.of({
+                prepare: () => Effect.die(new Error("unused")),
+                prepareForUpdate: () =>
+                  Effect.sync(() => ({
+                    // The restarted server comes back on the app's version.
+                    descriptor: calls.includes("restart")
+                      ? sshDescriptor(ORCHESTRATION_PROTOCOL_VERSION, "0.0.46")
+                      : sshDescriptor(undefined, "0.0.45"),
+                    prepared: {
+                      environmentId: TARGET.environmentId,
+                      label: TARGET.label,
+                      httpBaseUrl: "http://127.0.0.1:4010",
+                      socketUrl: "ws://127.0.0.1:4010/ws",
+                      httpAuthorization: null,
+                      target: sshTarget,
+                    },
+                  })),
+              }),
+            ),
+            Layer.succeed(
+              RelayEnvironmentDiscovery.RelayEnvironmentDiscovery,
+              RelayEnvironmentDiscovery.RelayEnvironmentDiscovery.of({
+                state: yield* SubscriptionRef.make(
+                  RelayEnvironmentDiscovery.EMPTY_RELAY_ENVIRONMENT_DISCOVERY_STATE,
+                ),
+                refresh: Effect.void,
+              }),
+            ),
+            Layer.succeed(
+              HttpClient.HttpClient,
+              HttpClient.make(() => Effect.die(new Error("unused"))),
+            ),
+            Layer.succeed(Socket.WebSocketConstructor, () => {
+              throw new Error("An SSH restart opens no bare socket.");
+            }),
+          ),
+        ),
+      );
+      if (started) {
+        expect(result).toMatchObject({ _tag: "Success", success: { targetVersion: "0.0.46" } });
+        expect(calls).toEqual(["restart", "compatible", "enabled"]);
+      } else {
+        expect(result).toMatchObject({
+          _tag: "Failure",
+          failure: {
+            _tag: "OutdatedHostUpdateError",
+            message: expect.stringContaining("manually"),
+          },
+        });
+        expect(calls).toEqual([]);
+      }
     }),
   );
 

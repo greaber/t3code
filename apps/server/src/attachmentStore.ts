@@ -27,7 +27,10 @@ const ATTACHMENT_ID_PATTERN = new RegExp(
 );
 
 export const PENDING_ATTACHMENT_THREAD_SEGMENT = "pending";
-const PENDING_ATTACHMENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Unsent drafts live on clients, so the server cannot see which uploads they still reference.
+// Clients ask for an upload's URL whenever a draft is opened, restored, or sent, which refreshes
+// its timestamp; an upload untouched this long belongs to no draft anyone still opens.
+const PENDING_ATTACHMENT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const PARTIAL_UPLOAD_MAX_AGE_MS = 60 * 60 * 1000;
 
 export function toSafeThreadAttachmentSegment(threadId: string): string | null {

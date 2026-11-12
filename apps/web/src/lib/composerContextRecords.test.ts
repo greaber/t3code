@@ -1,4 +1,6 @@
 import {
+  COMPOSER_CONTEXT_REVIEW_DIFF_MAX_CHARS,
+  COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS,
   type ComposerContextId,
   EnvironmentId,
   MessageId,
@@ -20,6 +22,7 @@ import {
   buildMessageContext,
   composerContextImportLookupIds,
   isSameComposerContextPayload,
+  oversizedComposerContextLabels,
   previewAnnotationContextRecord,
   previewAnnotationFromRecord,
   pullRequestContextKindLabel,
@@ -32,6 +35,7 @@ import {
   terminalContextDraftFromRecord,
   uploadedAttachmentContextRecord,
 } from "./composerContextRecords";
+import { formatTerminalContextLabel } from "./terminalContext";
 
 const decodeMessageContext = Schema.decodeUnknownSync(OrchestrationMessageContext);
 
@@ -265,28 +269,29 @@ describe("composerContextRecords", () => {
   });
 
   it("clamps oversized review and terminal selections so the records still encode", () => {
-    const build = (diffLength: number) =>
-      reviewCommentContextRecord({
-        id: "rc-big",
-        sectionId: "file:a/b.ts",
-        sectionTitle: "File comment",
-        filePath: "a/b.ts",
-        startIndex: 0,
-        endIndex: 1,
-        rangeLabel: "L1",
-        text: "Why?",
-        diff: "d".repeat(diffLength),
-      });
+    const limit = COMPOSER_CONTEXT_REVIEW_DIFF_MAX_CHARS;
+    const comment = (diffLength: number) => ({
+      id: "rc-big",
+      sectionId: "file:a/b.ts",
+      sectionTitle: "File comment",
+      filePath: "a/b.ts",
+      startIndex: 0,
+      endIndex: 1,
+      rangeLabel: "L1",
+      text: "Why?",
+      diff: "d".repeat(diffLength),
+    });
 
-    const atLimit = build(32_000);
-    expect(atLimit.diff).toHaveLength(32_000);
-    const overLimit = build(32_001);
-    expect(overLimit.diff.length).toBeLessThanOrEqual(32_000);
+    const atLimit = reviewCommentContextRecord(comment(limit));
+    expect(atLimit.diff).toHaveLength(limit);
+    const overLimit = reviewCommentContextRecord(comment(limit + 1));
+    expect(overLimit.diff.length).toBeLessThanOrEqual(limit);
     expect(overLimit.diff.endsWith("… truncated …")).toBe(true);
     expect(() => decodeMessageContext({ version: 1, records: [atLimit] })).not.toThrow();
     expect(() => decodeMessageContext({ version: 1, records: [overLimit] })).not.toThrow();
 
-    const terminal = terminalContextRecord({
+    const kept = COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS - 15;
+    const terminalDraft = {
       id: "term-big",
       threadId: ThreadId.make("t"),
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -294,12 +299,20 @@ describe("composerContextRecords", () => {
       terminalLabel: "Terminal 1",
       lineStart: 1,
       lineEnd: 2_000,
-      text: `${"t".repeat(63_985)}${"😀".repeat(8)}`,
-    });
-    expect(terminal.text).toBe(`${"t".repeat(63_985)}\n… truncated …`);
+      text: `${"t".repeat(kept)}${"😀".repeat(8)}`,
+    };
+    const terminal = terminalContextRecord(terminalDraft);
+    expect(terminal.text).toBe(`${"t".repeat(kept)}\n… truncated …`);
     expect(decodeMessageContext({ version: 1, records: [terminal] }).records).toMatchObject([
       { kind: "terminal", text: terminal.text },
     ]);
+
+    expect(
+      oversizedComposerContextLabels({
+        terminalContexts: [terminalDraft, { ...terminalDraft, id: "small", text: "ok" }],
+        reviewComments: [comment(limit), comment(limit + 1)],
+      }),
+    ).toEqual([formatTerminalContextLabel(terminalDraft), "b.ts L1"]);
   });
 
   it("finds the destination collision for different legacy terminal messages", () => {

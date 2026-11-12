@@ -3,8 +3,10 @@
 Give the agent a task in the composer. Add files, quote a previous response, or
 include a skill when the task needs more context.
 
-Messages can contain up to 120,000 characters. Longer drafts stay in the composer
-so you can shorten them or split them into several messages.
+Messages can contain up to 120,000 characters, including attached terminal output
+and review comments. Longer drafts stay in the composer so you can shorten them or
+split them into several messages. A single terminal selection or review comment
+longer than that is cut to fit, and the composer warns you before you send it.
 
 Pasting 32 KiB or more of text adds that fragment as a text-file attachment so
 the agent can inspect it without filling the model context. A smaller paste also
@@ -49,7 +51,11 @@ sends supported videos to Gemini models as video.
 
 Uploads begin when you add an attachment. All uploads must finish before the
 message can send. Retry or remove a failed upload. On web and desktop, reloading
-before an upload finishes requires you to attach that file again.
+before an upload finishes requires you to attach that file again. Files uploaded
+to an unsent draft stay on the environment for 30 days from when the draft was last
+opened. On web and desktop, the app also refreshes them about once a day while it is
+connected to that environment, so an unopened draft keeps its files while you use
+the app.
 
 You can drag or paste images into the web or desktop composer. HEIC and HEIF
 photos are converted to JPEG there and when selected from the mobile photo
@@ -192,9 +198,16 @@ the current prompt and its attachments for later. Wait for uploads to finish fir
 With an empty composer, the same shortcut restores a single stash or opens the
 stash menu when there are several.
 
+Stashes are kept in browser storage, which holds a few megabytes for the whole
+site. There is no limit on the number of stashes; when storage is full, T3 Code
+keeps your existing stashes, leaves the new prompt in the composer, and tells you
+to delete stashes you no longer need. Images are left out, with a warning, once
+the stash would use more than about 60% of that space, so drafts keep room to save.
+If drafts cannot be saved, T3 Code tells you.
+
 Stashes containing uploaded files must be restored in their original environment.
-Those files are retained for 24 hours. After an upload expires, restore the prompt
-and use **Attach again** or remove the missing file before sending.
+Those files are kept like draft uploads above. After an upload expires, restore the prompt and use
+**Attach again** or remove the missing file before sending.
 
 ## Voice input on web and desktop
 

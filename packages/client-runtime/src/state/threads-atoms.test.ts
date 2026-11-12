@@ -139,6 +139,7 @@ const makeHarness = Effect.fn("TestThreadAtoms.makeHarness")(function* (options?
     reorderRoutes: () => Effect.die("Unexpected route reorder"),
     removeRelayEnvironments: () => Effect.die("Unexpected environment removal"),
     retryNow: () => Effect.void,
+    restartSshServer: () => Effect.die("Unexpected SSH restart"),
     setEnabled: () => Effect.die("Unexpected environment toggle"),
     setCompatibility: () => Effect.die("Unexpected compatibility update"),
     state: () => SubscriptionRef.get(supervisor.state),

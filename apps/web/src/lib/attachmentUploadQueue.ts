@@ -563,7 +563,7 @@ export function retryAttachmentUpload(input: {
   startAttachmentUpload(input);
 }
 
-/** Verifies uploads before stash restore; pending uploads expire after 24 hours. */
+/** Verifies uploads before stash restore; pending uploads expire after 30 days unused. */
 export function verifyStashedAttachmentUpload(input: {
   readonly environmentId: EnvironmentId;
   readonly attachmentId: string;
