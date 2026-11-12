@@ -63,7 +63,6 @@ export function useAutoBalanceUpdateBanner(
         environmentId: environment.environmentId,
         serverLabel: environment.label,
         selfUpdate,
-        installation: environment.serverConfig?.environment.capabilities.serverInstallation,
         desktopAppUpdate,
         targetVersion,
         restartSshServer,

@@ -1,11 +1,7 @@
-import type {
-  EnvironmentId,
-  ServerConfig,
-  ServerInstallation,
-  ServerSelfUpdateCapability,
-} from "@t3tools/contracts";
+import type { EnvironmentId, ServerConfig, ServerSelfUpdateCapability } from "@t3tools/contracts";
 import type { EnvironmentPresentation } from "@t3tools/client-runtime/connection";
 import type { ServerUpdateState } from "@t3tools/client-runtime/state/server";
+import { cliInstallScriptCommand } from "@t3tools/shared/cliRelease";
 import { compareSemverVersions, parseSemver } from "@t3tools/shared/semver";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -59,9 +55,11 @@ export function resolveVersionMismatch(
 
   const clientCore = versionCore(normalizedClientVersion);
   const serverCore = versionCore(normalizedServerVersion);
+  // Builds of one prerelease track (nightly, or this fork's `grant`) share a core version.
+  const clientTrack = parseSemver(normalizedClientVersion)?.prerelease[0];
   const compareNightlyBuilds =
-    parseSemver(normalizedClientVersion)?.prerelease[0] === "nightly" &&
-    parseSemver(normalizedServerVersion)?.prerelease[0] === "nightly";
+    (clientTrack === "nightly" || clientTrack === "grant") &&
+    parseSemver(normalizedServerVersion)?.prerelease[0] === clientTrack;
   const serverIsBehind =
     parseSemver(clientCore) && parseSemver(serverCore)
       ? compareSemverVersions(
@@ -117,17 +115,8 @@ export function supportsDesktopAppUpdate(
   return serverConfig?.environment.capabilities.desktopAppUpdate === true;
 }
 
-export function manualServerUpdateCommand(
-  targetVersion: string,
-  installation?: ServerInstallation,
-): string {
-  if (installation?.kind === "npm-global") {
-    const prefix = `'${installation.prefix.replaceAll("'", "'\\''")}'`;
-    return `npm install --global --prefix ${prefix} t3@${targetVersion}`;
-  }
-  const runner =
-    installation?.kind === "pnpm-dlx" ? "pnpm dlx" : installation?.kind === "bunx" ? "bunx" : "npx";
-  return `${runner} t3@${targetVersion}`;
+export function manualServerUpdateCommand(targetVersion: string): string {
+  return cliInstallScriptCommand(targetVersion);
 }
 
 export function buildVersionMismatchDismissalKey(

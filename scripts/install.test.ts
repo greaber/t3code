@@ -65,6 +65,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer chan
   it.each([
     // regression: #32897
     ["stable", "1.2.3", 1],
+    ["stable", "1.2.3-grant.2", 0],
     ["preview", "1.2.4-preview.20261019.50", 0],
   ])("finds %s %s behind nightlies and %i HTTP 504s", async (channel, version, failures) => {
     const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-install-index-"));
@@ -73,10 +74,10 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer chan
       if (failures-- > 0) return response.writeHead(504).end();
       const url = new URL(request.url ?? "/", "http://fixture");
       const body =
-        url.pathname === "/pingdotgg/t3code/releases/latest" &&
+        url.pathname === "/greaber/t3code/releases/latest" &&
         request.headers.accept === "application/json"
-          ? { tag_name: "v1.2.3" }
-          : url.pathname === "/repos/pingdotgg/t3code/releases"
+          ? { tag_name: channel === "stable" ? `v${version}` : "v1.2.3" }
+          : url.pathname === "/repos/greaber/t3code/releases"
             ? { "1": nightlies, "2": [{ tag_name: `v${version}` }, { tag_name: "v1.2.3" }] }[
                 url.searchParams.get("page") ?? ""
               ]

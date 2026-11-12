@@ -1,6 +1,7 @@
 # Release Checklist
 
-> For maintainers. Using T3 Code? See [docs/user](../user/).
+> For maintainers. Using T3 Code? See [docs/user](../user/). This fork releases with
+> [Fork releases](./fork-release.md) instead.
 
 This document covers the unified release workflow for stable and nightly desktop releases.
 

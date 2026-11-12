@@ -10,7 +10,6 @@ import { environmentSession } from "~/state/session";
 import type {
   DesktopUpdateChannel,
   EnvironmentId,
-  ServerInstallation,
   ServerSelfUpdateCapability,
 } from "@t3tools/contracts";
 import type { ServerUpdateStage, ServerUpdateState } from "@t3tools/client-runtime/state/server";
@@ -87,7 +86,6 @@ export interface ServerUpdateTarget {
   readonly environmentId: EnvironmentId;
   readonly serverLabel: string;
   readonly selfUpdate: ServerSelfUpdateCapability | null;
-  readonly installation?: ServerInstallation | undefined;
   readonly desktopAppUpdate?: boolean;
   readonly targetVersion: string;
   /** Set only by a track switch; the host's desktop app moves to this track. */
@@ -275,7 +273,6 @@ export function ServerUpdateAction({
   environmentId,
   serverLabel,
   selfUpdate,
-  installation,
   desktopAppUpdate = false,
   targetVersion,
   channel,
@@ -295,16 +292,12 @@ export function ServerUpdateAction({
   const updatesDenial = managedUpdatesDenial(useManagedPolicy(environmentId));
   const update = useServerUpdate();
   const { copyToClipboard } = useCopyToClipboard<{ command: string }>({
-    target: installation?.kind === "npm-global" ? "update command" : "relaunch command",
+    target: "update command",
     onCopy: ({ command }) => {
       toastManager.add({
         type: "success",
-        title:
-          installation?.kind === "npm-global" ? "Update command copied" : "Relaunch command copied",
-        description:
-          installation?.kind === "npm-global"
-            ? `Run \`${command}\` on ${serverLabel}, then restart t3 with your usual options.`
-            : `Stop t3 on ${serverLabel}, then relaunch with \`${command}\` using the same subcommand and options. This does not update an installed t3 command.`,
+        title: "Update command copied",
+        description: `Run \`${command}\` on ${serverLabel}, then restart the server as \`~/.local/bin/t3\` with your usual options; another t3 earlier on PATH would run instead.`,
       });
     },
     onError: (error) => {
@@ -376,15 +369,8 @@ export function ServerUpdateAction({
   }
 
   const manualCommand =
-    selfUpdate === null && !restartSshServer
-      ? manualServerUpdateCommand(targetVersion, installation)
-      : null;
-  const actionLabel =
-    manualCommand !== null
-      ? installation?.kind === "npm-global"
-        ? "Copy update command"
-        : "Copy relaunch command"
-      : label;
+    selfUpdate === null && !restartSshServer ? manualServerUpdateCommand(targetVersion) : null;
+  const actionLabel = manualCommand !== null ? "Copy update command" : label;
   const onClick =
     manualCommand !== null
       ? () => copyToClipboard(manualCommand, { command: manualCommand })

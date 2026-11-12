@@ -20,13 +20,10 @@ const MISMATCH_HINT =
   "Version mismatch. Try syncing the client and server to the same T3 Code version.";
 
 describe("versionSkew", () => {
-  it("updates only the proven npm prefix and safely quotes its path", () => {
-    expect(manualServerUpdateCommand("0.0.45", { kind: "npm-global", prefix: "/opt/node" })).toBe(
-      "npm install --global --prefix '/opt/node' t3@0.0.45",
+  it("installs this fork's release from its own tag, since it is not on npm", () => {
+    expect(manualServerUpdateCommand("0.1.9-grant.1")).toBe(
+      "curl -fsSL https://raw.githubusercontent.com/greaber/t3code/v0.1.9-grant.1/scripts/install.sh | T3CODE_VERSION=0.1.9-grant.1 sh",
     );
-    expect(
-      manualServerUpdateCommand("0.0.45", { kind: "npm-global", prefix: "/opt/maria's node" }),
-    ).toBe("npm install --global --prefix '/opt/maria'\\''s node' t3@0.0.45");
   });
   beforeEach(() => {
     branding.APP_VERSION = "0.0.34";
@@ -84,6 +81,17 @@ describe("versionSkew", () => {
       });
     },
   );
+
+  it("warns when a fork server is behind a newer fork build of the same core version", () => {
+    branding.APP_VERSION = "0.1.9-grant.2";
+    expect(resolveVersionMismatch("0.1.9-grant.1")).toEqual({
+      clientVersion: "0.1.9-grant.2",
+      serverVersion: "0.1.9-grant.1",
+      hint: MISMATCH_HINT,
+    });
+    expect(resolveVersionMismatch("0.1.9-grant.2")).toBeNull();
+    expect(resolveVersionMismatch("0.1.7")).not.toBeNull();
+  });
 
   // regression: #7579 versions were compared as strings, not semver
   it("treats a nightly server built past the client as ahead, not skew", () => {
