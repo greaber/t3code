@@ -14,12 +14,17 @@ synced global default.
 A few settings follow you instead: **Compact idle threads**, **Auto-settle when a pull request
 merges or closes**, and **Auto-settle inactive threads** with its number of days. When you change
 one with **All environments** selected, this app remembers the choice and applies it to every
-environment it connects to, including ones that were offline and ones you add later. The setting
-then says it applies everywhere and names any connected environment that still has a different
-value. An environment whose administrator locks the setting keeps its own value. While one
-environment is selected, these settings are read-only; choose **Stop applying everywhere** to let
-each environment keep its own value again. The choice is saved on this device only, so other
-devices and the mobile app don't apply it.
+environment it connects to, including ones that were offline and ones you add later. If a
+connected environment's administrator locks the setting, or this connection can't change settings
+there, the change is saved everywhere else.
+
+After that, the setting says it applies everywhere and lists any connected environment that still
+has a different value, with the reason: managed there, no permission, a version too old to store
+the value, a save that failed, or not applied yet. If the value is changed on an environment some
+other way, such as from your phone or another computer, this app sets it back: right away if it's
+connected there, otherwise the next time it connects. While one environment is selected, a setting this app applies everywhere is
+read-only; choose **Stop applying everywhere** to let each environment keep its own value again.
+The choice is saved on this device only, so other devices and the mobile app don't apply it.
 
 Choose a project to override settings for it on the selected environments. A layers icon beside
 each server row's title shows where the value comes from: the built-in default, the environment,

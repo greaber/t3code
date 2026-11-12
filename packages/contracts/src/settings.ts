@@ -102,6 +102,8 @@ export const IDLE_COMPACTION_MODES = [
 ] as const;
 export const IdleCompactionMode = Schema.Literals(IDLE_COMPACTION_MODES.map((mode) => mode.value));
 export type IdleCompactionMode = typeof IdleCompactionMode.Type;
+/** The mode a server uses when neither its settings file nor a policy chooses one. */
+export const DEFAULT_IDLE_COMPACTION: IdleCompactionMode = "off";
 
 export const MAX_SNOOZE_PRESET_MINUTES = 30 * 24 * 60;
 export const MAX_SNOOZE_PRESETS = 8;
@@ -1758,7 +1760,7 @@ export class ServerSettingsError extends Schema.TaggedError<ServerSettingsError>
 
 export type UnifiedSettings = Omit<ServerSettings, keyof ModelPreferences> & ClientSettings;
 export const DEFAULT_UNIFIED_SETTINGS: UnifiedSettings = {
-  ...DEFAULT_SERVER_SETTINGS,
+  ...withIdleCompaction(DEFAULT_SERVER_SETTINGS, DEFAULT_IDLE_COMPACTION),
   ...DEFAULT_CLIENT_SETTINGS,
 };
 

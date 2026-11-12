@@ -5,6 +5,7 @@ import { useEnvironmentScope, useEnvironmentsWithScope } from "../../state/sessi
 import { useServerConfigs } from "../../state/entities";
 import { InfoIcon, Undo2Icon } from "lucide-react";
 import {
+  DEFAULT_IDLE_COMPACTION,
   DEFAULT_SERVER_SETTINGS,
   isManagedSettingPath,
   type ServerSettings,
@@ -33,9 +34,11 @@ import {
 } from "./scopedSettings";
 import {
   forgetServerSettingPreferences,
+  isCoveredSettingKey,
   isServerSettingPreferenceKey,
   serverSettingPreferenceDifferences,
 } from "./serverSettingPreferences";
+import { useServerSettingPreferenceFailures } from "./serverSettingPreferencesSync";
 import {
   updateServerSettingPreferences,
   useClearProjectOverrides,
@@ -356,15 +359,23 @@ export function SettingsRow({
     context?.connectedEnvironments ?? [],
     AuthSettingsWriteScope,
   );
+  // Under All environments a covered setting saves where it can and lists the rest with reasons.
+  const coveredUnderAll =
+    context?.scope.kind === "all" &&
+    serverScoped &&
+    managedPaths.length === 0 &&
+    settingKeys.length > 0 &&
+    settingKeys.every(isCoveredSettingKey);
   const canWriteSettings = context
     ? context.connectedEnvironments.length > 0 &&
-      context.connectedEnvironments.every((target) => writableIds.has(target.environmentId))
+      (coveredUnderAll ||
+        context.connectedEnvironments.every((target) => writableIds.has(target.environmentId)))
     : primaryCanWrite;
   const serverConfigs = useServerConfigs();
   // An administrator's lock on any target wins over every other reason a control is inert.
   const lockablePaths = [...settingKeys, ...managedPaths];
   const managedBy =
-    lockablePaths.length === 0
+    lockablePaths.length === 0 || coveredUnderAll
       ? undefined
       : (context
           ? context.connectedEnvironments.map((environment) => environment.serverConfig)
@@ -377,6 +388,7 @@ export function SettingsRow({
               lockablePaths.some((path) => isManagedSettingPath(policy, path)),
           )?.organization;
   const preferences = useClientSettings((settings) => settings.serverSettingPreferences);
+  const preferenceFailures = useServerSettingPreferenceFailures();
   const preferenceKeys = serverScoped
     ? settingKeys
         .filter(isServerSettingPreferenceKey)
@@ -481,7 +493,10 @@ export function SettingsRow({
         const environmentSettings = environmentSettingsById.get(candidate.environmentId);
         return (
           environmentSettings !== undefined &&
-          !Equal.equals(environmentSettings[key], DEFAULT_SERVER_SETTINGS[key])
+          !Equal.equals(
+            environmentSettings[key],
+            key === "idleCompaction" ? DEFAULT_IDLE_COMPACTION : DEFAULT_SERVER_SETTINGS[key],
+          )
         );
       }),
     );
@@ -527,16 +542,13 @@ export function SettingsRow({
                     label: environment.label,
                     settings: environment.serverConfig.settings,
                     managedPolicy: environment.serverConfig.managedPolicy,
+                    canWrite: writableIds.has(environment.environmentId),
+                    failure: preferenceFailures.get(environment.environmentId),
                   },
                 ]
               : [],
           ),
         );
-  const listLabels = (locked: boolean) =>
-    preferenceDifferences
-      .filter((difference) => difference.locked === locked)
-      .map((difference) => difference.label)
-      .join(", ");
   const renderedPreferenceStatus =
     preferenceStatus &&
     context !== null &&
@@ -544,8 +556,11 @@ export function SettingsRow({
     preferenceKeys.length > 0 ? (
       <>
         Applied to every environment this app connects to, including new ones.
-        {listLabels(false) ? ` Different on ${listLabels(false)}.` : null}
-        {listLabels(true) ? ` Not applied on ${listLabels(true)}: managed there.` : null}{" "}
+        {preferenceDifferences.length > 0
+          ? ` Different on ${preferenceDifferences
+              .map(({ label, reason }) => `${label} (${reason.replace(/\.$/, "")})`)
+              .join(", ")}.`
+          : null}{" "}
         <Button
           size="xs"
           variant="link"

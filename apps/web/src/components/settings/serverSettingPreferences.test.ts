@@ -8,9 +8,14 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   forgetServerSettingPreferences,
+  nextPreferenceWrites,
   planServerSettingPreferencesPatch,
+  type PreferenceSyncAttempts,
+  type PreferenceSyncTarget,
   recordServerSettingPreferences,
   serverSettingPreferenceDifferences,
+  skipBlockedPreferenceWrites,
+  withoutPreferredFields,
 } from "./serverSettingPreferences";
 
 const settings = (overrides: Partial<ServerSettings> = {}): ServerSettings => ({
@@ -24,6 +29,9 @@ const lockedBy = (...lockedSettings: string[]): ManagedPolicySummary => ({
   organization: "Example Corp",
   lockedSettings,
 });
+
+const laptop = EnvironmentId.make("laptop");
+const server = EnvironmentId.make("server");
 
 describe("recording server setting preferences", () => {
   it("records only covered keys from a change made for all environments", () => {
@@ -49,12 +57,62 @@ describe("recording server setting preferences", () => {
     ).toBeNull();
   });
 
+  it("only updates existing preferences when restoring defaults", () => {
+    const restore = { sidebarAutoSettleOnMerge: false, sidebarAutoSettleAfterDays: 7 };
+    expect(
+      recordServerSettingPreferences({ sidebarAutoSettleOnMerge: true }, { kind: "all" }, restore, {
+        onlyExisting: true,
+      }),
+    ).toEqual({ sidebarAutoSettleOnMerge: false });
+    expect(
+      recordServerSettingPreferences({}, { kind: "all" }, restore, { onlyExisting: true }),
+    ).toBeNull();
+  });
+
   it("forgets only the keys that stop applying", () => {
     expect(
       forgetServerSettingPreferences({ idleCompaction: "off", sidebarAutoSettleOnMerge: true }, [
         "idleCompaction",
       ]),
     ).toEqual({ sidebarAutoSettleOnMerge: true });
+  });
+});
+
+describe("writes made from Settings", () => {
+  it("leave fields applied everywhere out of a single environment's write", () => {
+    expect(
+      withoutPreferredFields(
+        {
+          idleCompaction: "onReturn" as const,
+          compactIdleThreads: false,
+          sidebarAutoSettleOnMerge: false,
+          snoozeLimitedThreads: true,
+        },
+        { idleCompaction: "off" },
+      ),
+    ).toEqual({ sidebarAutoSettleOnMerge: false, snoozeLimitedThreads: true });
+  });
+
+  it("skip what an environment's policy or this connection's permissions block under All environments", () => {
+    const writes = [
+      { environmentId: laptop, patch: { idleCompaction: "off" as const } },
+      { environmentId: server, patch: { compactIdleThreads: false } },
+      { environmentId: EnvironmentId.make("readonly"), patch: { sidebarAutoSettleOnMerge: true } },
+      {
+        environmentId: EnvironmentId.make("readonly"),
+        patch: { sidebarAutoSettleOnMerge: true, snoozeLimitedThreads: true },
+      },
+    ];
+    const kept = skipBlockedPreferenceWrites(writes, {
+      policyOf: (environmentId) =>
+        environmentId === server ? lockedBy("compactIdleThreads") : undefined,
+      canWrite: (environmentId) => environmentId !== "readonly",
+    });
+    expect(kept.map(({ environmentId, patch }) => ({ environmentId, patch }))).toEqual([
+      writes[0],
+      // A write that also changes uncovered settings still goes, and reports its failure.
+      writes[3],
+    ]);
   });
 });
 
@@ -116,31 +174,99 @@ describe("applying server setting preferences on connect", () => {
   });
 });
 
+describe("deciding when to write preferences", () => {
+  const preferences = { sidebarAutoSettleOnMerge: true } as const;
+  const target = (overrides: Partial<PreferenceSyncTarget> = {}): PreferenceSyncTarget => ({
+    environmentId: server,
+    generation: 1,
+    settings: settings(),
+    managedPolicy: undefined,
+    sessionReady: true,
+    ...overrides,
+  });
+  const decide = (
+    attempts: PreferenceSyncAttempts,
+    connected: readonly PreferenceSyncTarget[],
+    prefs: Parameters<typeof nextPreferenceWrites>[2] = preferences,
+    canWrite = true,
+  ) => nextPreferenceWrites(attempts, connected, prefs, () => canWrite).map(({ patch }) => patch);
+
+  it("waits for the session, including one that failed to load, and for write permission", () => {
+    const attempts: PreferenceSyncAttempts = new Map();
+    expect(decide(attempts, [target({ sessionReady: false })])).toEqual([]);
+    expect(decide(attempts, [target()], preferences, false)).toEqual([]);
+    expect(decide(attempts, [target()])).toEqual([{ sidebarAutoSettleOnMerge: true }]);
+  });
+
+  it("plans again when the fresh config arrives after a cached one", () => {
+    const attempts: PreferenceSyncAttempts = new Map();
+    expect(
+      decide(attempts, [target({ settings: settings({ sidebarAutoSettleOnMerge: true }) })]),
+    ).toEqual([]);
+    expect(decide(attempts, [target()])).toEqual([{ sidebarAutoSettleOnMerge: true }]);
+  });
+
+  it("sends each patch once per connection, so a failed write is not repeated", () => {
+    const attempts: PreferenceSyncAttempts = new Map();
+    expect(decide(attempts, [target()])).toHaveLength(1);
+    expect(decide(attempts, [target()])).toEqual([]);
+    // A preference changed during the connection is a different patch.
+    expect(decide(attempts, [target()], { sidebarAutoSettleAfterDays: 5 })).toEqual([
+      { sidebarAutoSettleAfterDays: 5 },
+    ]);
+  });
+
+  it("writes again after a reconnect, even when the new connection restarts its count", () => {
+    const attempts: PreferenceSyncAttempts = new Map();
+    expect(decide(attempts, [target()])).toHaveLength(1);
+    expect(decide(attempts, [])).toEqual([]);
+    expect(decide(attempts, [target()])).toEqual([{ sidebarAutoSettleOnMerge: true }]);
+    expect(decide(attempts, [target({ generation: 2 })])).toEqual([
+      { sidebarAutoSettleOnMerge: true },
+    ]);
+  });
+
+  it("applies a preference saved while a server was connecting once it connects", () => {
+    const attempts: PreferenceSyncAttempts = new Map();
+    expect(decide(attempts, [], preferences)).toEqual([]);
+    expect(decide(attempts, [target()], preferences)).toEqual([{ sidebarAutoSettleOnMerge: true }]);
+  });
+});
+
 describe("environments that differ from a preference", () => {
-  it("lists differing environments and marks those whose policy locks the setting", () => {
+  it("lists each differing environment with why it was not applied", () => {
     const target = (
       label: string,
       serverSettings: ServerSettings,
-      policy?: ManagedPolicySummary,
+      extra: { policy?: ManagedPolicySummary; canWrite?: boolean; failure?: string } = {},
     ) => ({
       environmentId: EnvironmentId.make(label),
       label,
       settings: serverSettings,
-      managedPolicy: policy,
+      managedPolicy: extra.policy,
+      canWrite: extra.canWrite ?? true,
+      failure: extra.failure,
     });
+    const { idleCompaction: _absent, ...switchOnly } = settings();
     expect(
       serverSettingPreferenceDifferences(
         { idleCompaction: "off" },
         ["idleCompaction", "compactIdleThreads"],
         [
           target("Same", settings({ idleCompaction: "off" })),
-          target("Different", settings()),
-          target("Managed", settings(), lockedBy("idleCompaction")),
+          target("Pending", settings()),
+          target("Managed", settings(), { policy: lockedBy("idleCompaction") }),
+          target("Readonly", settings(), { canWrite: false }),
+          target("Old", switchOnly),
+          target("Failed", settings(), { failure: "The save failed." }),
         ],
-      ).map(({ label, locked }) => ({ label, locked })),
+      ).map(({ label, reason }) => [label, reason]),
     ).toEqual([
-      { label: "Different", locked: false },
-      { label: "Managed", locked: true },
+      ["Pending", "not applied yet"],
+      ["Managed", "managed there"],
+      ["Readonly", "no permission to change settings"],
+      ["Old", "can't store Never, update T3 Code there"],
+      ["Failed", "not saved: The save failed."],
     ]);
   });
 });

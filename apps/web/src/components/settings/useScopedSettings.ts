@@ -35,7 +35,12 @@ import {
   type ProjectOverrideEntry,
   type ScopedSettingsPatch,
 } from "./scopedSettings";
-import { recordServerSettingPreferences } from "./serverSettingPreferences";
+import {
+  recordServerSettingPreferences,
+  skipBlockedPreferenceWrites,
+  withoutPreferredFields,
+} from "./serverSettingPreferences";
+import { canWriteServerSettings } from "./serverSettingPreferencesSync";
 
 export function useScopedSettings<T = UnifiedSettings>(
   selector?: (settings: UnifiedSettings) => T,
@@ -108,14 +113,39 @@ export function useUpdateScopedSettings() {
   const { scope, environments } = useSettingsScope();
   const run = useRunScopedPlan();
   /** `onFailed` runs when any target rejects or drops the patch, so a draft can fall back. */
-  return (patch: ScopedSettingsPatch, options?: { readonly onFailed?: () => void }) => {
-    const plan = planScopedSettingsPatch(scope, environments, patch);
+  return (
+    requested: ScopedSettingsPatch,
+    options?: {
+      readonly onFailed?: () => void;
+      /** Update only all-environment settings already applied everywhere, as Restore defaults does. */
+      readonly onlyExistingPreferences?: boolean;
+    },
+  ) => {
+    const preferences = getClientSettings().serverSettingPreferences;
+    // A setting applied everywhere is changed under All environments, not on one environment.
+    const patch =
+      scope.kind === "environment" ? withoutPreferredFields(requested, preferences) : requested;
+    const planned = planScopedSettingsPatch(scope, environments, patch);
+    const plan =
+      scope.kind === "all"
+        ? {
+            ...planned,
+            serverWrites: skipBlockedPreferenceWrites(planned.serverWrites, {
+              policyOf: (environmentId) =>
+                environments.find((environment) => environment.environmentId === environmentId)
+                  ?.serverConfig?.managedPolicy,
+              canWrite: canWriteServerSettings,
+            }),
+          }
+        : planned;
+    const recordOptions = { onlyExisting: options?.onlyExistingPreferences === true };
     if (
       plan.unavailableReason === null &&
-      recordServerSettingPreferences(getClientSettings().serverSettingPreferences, scope, patch)
+      recordServerSettingPreferences(preferences, scope, patch, recordOptions)
     ) {
       updateServerSettingPreferences(
-        (current) => recordServerSettingPreferences(current, scope, patch) ?? current,
+        (current) =>
+          recordServerSettingPreferences(current, scope, patch, recordOptions) ?? current,
       );
     }
     run(plan, options?.onFailed);
