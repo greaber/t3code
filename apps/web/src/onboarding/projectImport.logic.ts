@@ -2,7 +2,14 @@ import {
   findProjectByPath,
   normalizeProjectPathForComparison,
 } from "@t3tools/client-runtime/state/projects";
-import type { AgentSessionProjectCandidate, EnvironmentId, ProjectId } from "@t3tools/contracts";
+import type {
+  AgentSessionImportResult,
+  AgentSessionImportSkipReason,
+  AgentSessionImportSkippedGroup,
+  AgentSessionProjectCandidate,
+  EnvironmentId,
+  ProjectId,
+} from "@t3tools/contracts";
 
 const RECENT_PROJECT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_SELECTION_MIN_THREADS = 3;
@@ -162,4 +169,34 @@ export function splitOnboardingProjectPath(path: string): {
 
 export function onboardingProjectKey(environmentId: EnvironmentId, path: string): string {
   return JSON.stringify([environmentId, path]);
+}
+
+const SKIP_REASON_LABELS: Record<AgentSessionImportSkipReason, string> = {
+  too_large: "Too large to import",
+  import_limit: "Over this import's 4 GiB read limit. Import again to continue",
+  changed_while_reading: "Changed while being read. Import again to retry",
+  unreadable: "Could not be read",
+  outside_project: "Belongs to a different folder",
+  no_conversation: "Has no user messages",
+  unresumable: "Has a session ID the agent cannot resume",
+  import_failed: "Could not be saved",
+};
+
+export function skippedImportLabel(reason: AgentSessionImportSkipReason): string {
+  return SKIP_REASON_LABELS[reason];
+}
+
+/** Skips that importing again cannot change do not keep a project marked unfinished. */
+const PERMANENT_SKIP_REASONS: ReadonlySet<AgentSessionImportSkipReason> = new Set([
+  "no_conversation",
+]);
+
+export function hasRetryableImportSkips(
+  result: Pick<AgentSessionImportResult, "skippedCount" | "skipped">,
+): boolean {
+  if (result.skipped === undefined) return result.skippedCount > 0;
+  return result.skipped.some(
+    (group: AgentSessionImportSkippedGroup) =>
+      group.count > 0 && !PERMANENT_SKIP_REASONS.has(group.reason),
+  );
 }

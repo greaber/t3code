@@ -112,6 +112,7 @@ import { readEnvironmentScope } from "../../state/session";
 import { useOrchestrationCommand } from "../../state/use-orchestration-command";
 import {
   ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
+  projectComposerContextForProvider,
   threadContextsOutsideEnvironment,
 } from "@t3tools/shared/composerContextReferences";
 import {
@@ -801,7 +802,12 @@ export function useComposerSend(input: ComposerSendInput) {
       effort: ctxSelectedPromptEffort,
       text: messageTextForSend || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
     });
-    if (composerRef.current?.validateProviderInput(outgoingMessageText) === false) {
+    // The provider receives attached context rendered into the prompt, so measure that.
+    const projectedProviderInput = projectComposerContextForProvider({
+      text: outgoingMessageText,
+      records: outgoingMessageContext?.records ?? [],
+    });
+    if (composerRef.current?.validateProviderInput(projectedProviderInput) === false) {
       return;
     }
 

@@ -6,15 +6,11 @@ import {
   PersistedComposerFileAttachment,
   PersistedComposerImageAttachment,
 } from "./composerDraftStore";
-import { createMemoryStorage, type StateStorage } from "./lib/storage";
+import { createMemoryStorage, isStorageQuotaError, type StateStorage } from "./lib/storage";
 
 export const PROMPT_STASH_STORAGE_KEY = "t3code:prompt-stash:v2";
 const LEGACY_PROMPT_STASH_STORAGE_KEY = "t3code:prompt-stash:v1";
 const PROMPT_STASH_STORAGE_VERSION = 2;
-
-export const MAX_STASH_ENTRIES = 20;
-// Share localStorage's ~5MB quota with drafts; record oversized attachments in droppedImageNames.
-export const MAX_STASH_ENTRY_ATTACHMENT_CHARS = 2_700_000;
 
 const StashEntrySchema = Schema.Struct({
   id: Schema.String,
@@ -57,24 +53,36 @@ function clearOrphanedPendingImages(
   });
 }
 
-export function partitionStashAttachments(
+/**
+ * Write every image when it fits; when storage is full, drop the largest until the
+ * write succeeds, and report what was dropped.
+ */
+export function keepImagesThatFit<
+  Result extends { readonly written: boolean; readonly storageFull: boolean },
+>(
   attachments: ReadonlyArray<PersistedComposerImageAttachment>,
+  write: (
+    kept: ReadonlyArray<PersistedComposerImageAttachment>,
+    droppedNames: ReadonlyArray<string>,
+  ) => Result,
 ): {
-  kept: PersistedComposerImageAttachment[];
+  kept: ReadonlyArray<PersistedComposerImageAttachment>;
   droppedNames: string[];
+  result: Result;
 } {
-  const kept: PersistedComposerImageAttachment[] = [];
+  let kept = [...attachments];
   const droppedNames: string[] = [];
-  let usedChars = 0;
-  for (const attachment of attachments) {
-    if (usedChars + attachment.dataUrl.length > MAX_STASH_ENTRY_ATTACHMENT_CHARS) {
-      droppedNames.push(attachment.name);
-      continue;
+  for (;;) {
+    const result = write(kept, droppedNames);
+    if (result.written || !result.storageFull || kept.length === 0) {
+      return { kept, droppedNames, result };
     }
-    usedChars += attachment.dataUrl.length;
-    kept.push(attachment);
+    const largest = kept.reduce((max, attachment) =>
+      attachment.dataUrl.length > max.dataUrl.length ? attachment : max,
+    );
+    kept = kept.filter((attachment) => attachment !== largest);
+    droppedNames.push(largest.name);
   }
-  return { kept, droppedNames };
 }
 
 // Accessing localStorage itself can throw SecurityError before get/set.
@@ -89,24 +97,36 @@ function resolveBaseStorage(): { storage: StateStorage; durable: boolean } {
 
 const { storage: baseStashStorage, durable: storageIsDurable } = resolveBaseStorage();
 
+/**
+ * localStorage holds ~5M characters per origin, shared with drafts. Images stop being
+ * stashed past ~60% of that so drafts keep room to save.
+ */
+export const STASH_IMAGE_STORAGE_BUDGET_CHARS = 3_000_000;
+
+function serializeEntries(entries: ReadonlyArray<PromptStashEntry>): string {
+  return JSON.stringify({ version: PROMPT_STASH_STORAGE_VERSION, state: { entries } });
+}
+
+interface PersistResult {
+  readonly written: boolean;
+  readonly durable: boolean;
+  /** Only a quota error means storage is full; other failures say nothing about space. */
+  readonly storageFull: boolean;
+}
+
 // Clear the composer only after a durable write; debounce cannot confirm durability.
-function persistEntries(entries: ReadonlyArray<PromptStashEntry>): {
-  written: boolean;
-  durable: boolean;
-} {
+function persistSerialized(serialized: string): PersistResult {
   try {
-    baseStashStorage.setItem(
-      PROMPT_STASH_STORAGE_KEY,
-      JSON.stringify({
-        version: PROMPT_STASH_STORAGE_VERSION,
-        state: { entries },
-      }),
-    );
-    return { written: true, durable: storageIsDurable };
+    baseStashStorage.setItem(PROMPT_STASH_STORAGE_KEY, serialized);
+    return { written: true, durable: storageIsDurable, storageFull: false };
   } catch (error) {
-    console.error("[PROMPT-STASH] Could not persist stash (storage quota?).", error);
-    return { written: false, durable: false };
+    console.error("[PROMPT-STASH] Could not persist stash.", error);
+    return { written: false, durable: false, storageFull: isStorageQuotaError(error) };
   }
+}
+
+function persistEntries(entries: ReadonlyArray<PromptStashEntry>): PersistResult {
+  return persistSerialized(serializeEntries(entries));
 }
 
 function readPersistedEntries(): ReadonlyArray<PromptStashEntry> | null {
@@ -125,15 +145,18 @@ function readPersistedEntries(): ReadonlyArray<PromptStashEntry> | null {
 interface PromptStashStoreState {
   entries: ReadonlyArray<PromptStashEntry>;
   stashEntry: (entry: PromptStashEntry) => {
-    evicted: PromptStashEntry | null;
     /** False when the write failed outright (e.g. quota); nothing was kept. */
     written: boolean;
+    storageFull: boolean;
     /** False for failed writes or in-memory fallback; the entry will not survive reload. */
     durable: boolean;
   };
   /** durable=false means removal was not persisted and reload would restore the entry. */
   takeEntry: (entryId: string) => { entry: PromptStashEntry | null; durable: boolean };
-  /** attached=false means the entry disappeared while encoding, so images could not be saved. */
+  /**
+   * attached=false means the entry disappeared while encoding, so images could not be saved.
+   * storageDroppedImageNames lists images left out because browser storage was full.
+   */
   finalizeEntryImages: (
     entryId: string,
     images: {
@@ -141,21 +164,20 @@ interface PromptStashStoreState {
       droppedImageNames: ReadonlyArray<string>;
       unreadableImageNames: ReadonlyArray<string>;
     },
-  ) => { attached: boolean; durable: boolean };
+  ) => { attached: boolean; durable: boolean; storageDroppedImageNames: ReadonlyArray<string> };
 }
 
 export const usePromptStashStore = create<PromptStashStoreState>()((set, get) => ({
   entries: [],
   stashEntry: (entry) => {
     const nextEntries = [entry, ...get().entries];
-    const evicted = nextEntries.length > MAX_STASH_ENTRIES ? (nextEntries.pop() ?? null) : null;
-    const { written, durable } = persistEntries(nextEntries);
-    // Failed writes must not duplicate the intact composer; eviction also commits only on success.
+    const { written, durable, storageFull } = persistEntries(nextEntries);
+    // A failed write keeps the existing stash and the intact composer; nothing is evicted.
     if (!written) {
-      return { evicted: null, written: false, durable: false };
+      return { written: false, durable: false, storageFull };
     }
     set(() => ({ entries: nextEntries }));
-    return { evicted, written: true, durable };
+    return { written: true, durable, storageFull: false };
   },
   takeEntry: (entryId) => {
     const entries = get().entries;
@@ -170,18 +192,33 @@ export const usePromptStashStore = create<PromptStashStoreState>()((set, get) =>
     const entries = get().entries;
     const index = entries.findIndex((candidate) => candidate.id === entryId);
     const existing = index === -1 ? undefined : entries[index];
-    if (!existing) return { attached: false, durable: true };
-    const nextEntries = [...entries];
-    nextEntries[index] = {
-      ...existing,
-      attachments: images.attachments,
-      droppedImageNames: images.droppedImageNames,
-      unreadableImageNames: images.unreadableImageNames,
-      pendingImageCount: 0,
+    if (!existing) return { attached: false, durable: true, storageDroppedImageNames: [] };
+    const withImages = (
+      attachments: ReadonlyArray<PersistedComposerImageAttachment>,
+      storageDroppedImageNames: ReadonlyArray<string>,
+    ) => {
+      const nextEntries = [...entries];
+      nextEntries[index] = {
+        ...existing,
+        attachments,
+        droppedImageNames: [...images.droppedImageNames, ...storageDroppedImageNames],
+        unreadableImageNames: images.unreadableImageNames,
+        pendingImageCount: 0,
+      };
+      return nextEntries;
     };
-    const { durable } = persistEntries(nextEntries);
-    set(() => ({ entries: nextEntries }));
-    return { attached: true, durable };
+    const { kept, droppedNames, result } = keepImagesThatFit(
+      images.attachments,
+      (attachments, dropped) => {
+        const serialized = serializeEntries(withImages(attachments, dropped));
+        // Over the image budget counts as full, so drafts keep their share of the quota.
+        return attachments.length > 0 && serialized.length > STASH_IMAGE_STORAGE_BUDGET_CHARS
+          ? { written: false, durable: false, storageFull: true }
+          : persistSerialized(serialized);
+      },
+    );
+    set(() => ({ entries: withImages(kept, droppedNames) }));
+    return { attached: true, durable: result.durable, storageDroppedImageNames: droppedNames };
   },
 }));
 
@@ -198,4 +235,8 @@ export const usePromptStashStore = create<PromptStashStoreState>()((set, get) =>
 export function writePromptStashStorageForTest(raw: string): void {
   baseStashStorage.setItem(PROMPT_STASH_STORAGE_KEY, raw);
   usePromptStashStore.setState({ entries: readPersistedEntries() ?? [] });
+}
+
+export function promptStashStorageForTest(): StateStorage {
+  return baseStashStorage;
 }

@@ -43,6 +43,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+  PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
 } from "@t3tools/contracts";
 import type { EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
 import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -181,6 +182,7 @@ import {
   threadContextReference,
   environmentContextRecord,
   environmentContextReference,
+  oversizedComposerContextLabels,
 } from "~/lib/composerContextRecords";
 import { rememberCopiedComposerAttachments } from "~/lib/copiedComposerAttachments";
 import { useThreadContextDrop, threadContextDropTargetProps } from "./threadContextDrag";
@@ -233,7 +235,7 @@ import { observeResize } from "~/lib/observeResize";
 
 const isEnvironmentRequestInvalidError = Schema.is(EnvironmentRequestInvalidError);
 import { toastManager } from "../ui/toast";
-import { BuildingIcon, PlayIcon } from "lucide-react";
+import { BuildingIcon, PlayIcon, ScissorsIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import { useManagedPolicy } from "../../state/managedPolicy";
 import { hasProviderSetup } from "./ProviderStatusBanner";
@@ -2475,12 +2477,29 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 }),
           },
         ];
+  const oversizedContextLabels = oversizedComposerContextLabels({
+    terminalContexts: composerTerminalContexts,
+    reviewComments: composerReviewComments,
+  });
+  const bannerItemsWithContextWarning: readonly ComposerBannerStackItem[] =
+    oversizedContextLabels.length === 0
+      ? bannerItems
+      : [
+          ...bannerItems,
+          {
+            id: "oversized-context",
+            variant: "warning",
+            icon: <ScissorsIcon />,
+            title: "Attached context will be cut when sent",
+            description: `${oversizedContextLabels.join(", ")} ${oversizedContextLabels.length === 1 ? "is" : "are"} longer than ${PROVIDER_SEND_TURN_MAX_INPUT_CHARS.toLocaleString("en-US")} characters, so only the start will be sent. Select less to send all of it.`,
+          },
+        ];
   const shelfItems = hasBlockingComposerTopDrawer
-    ? bannerItems.filter(
+    ? bannerItemsWithContextWarning.filter(
         (item) =>
           item.group === "environment" && (item.variant === "error" || item.variant === "warning"),
       )
-    : bannerItems;
+    : bannerItemsWithContextWarning;
 
   const insertComposerText = (
     text: string,

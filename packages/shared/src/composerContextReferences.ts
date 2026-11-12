@@ -8,6 +8,7 @@ import {
   type KnownComposerContextRecord,
   type ScopedThreadRef,
   type ThreadContextRecord,
+  PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
 } from "@t3tools/contracts";
 
 import { replaceThreadLinks, threadLinkCandidates } from "./threadLinks.ts";
@@ -449,4 +450,19 @@ export function remapComposerContextAttachments(
         : record,
     ),
   };
+}
+
+/** The over-limit message for a prompt of `length` characters, or null when it fits. */
+export function promptLengthErrorMessage(length: number): string | null {
+  const excess = length - PROVIDER_SEND_TURN_MAX_INPUT_CHARS;
+  if (excess <= 0) return null;
+  return `Prompt is ${excess.toLocaleString("en-US")} ${excess === 1 ? "character" : "characters"} over the ${PROVIDER_SEND_TURN_MAX_INPUT_CHARS.toLocaleString("en-US")}-character limit, including attached context. Shorten or split it before sending.`;
+}
+
+/** Measures the text the provider receives: the prompt with its context records rendered in. */
+export function providerInputLengthErrorMessage(input: {
+  text: string;
+  records: ReadonlyArray<ComposerContextRecord>;
+}): string | null {
+  return promptLengthErrorMessage(projectComposerContextForProvider(input).trim().length);
 }

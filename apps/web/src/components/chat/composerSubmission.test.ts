@@ -49,7 +49,7 @@ describe("submitComposerDraft", () => {
     expect(dispatchedDrafts).toEqual([]);
     expect(draft).toHaveLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS + 1);
     expect(validationMessage).toBe(
-      "Prompt is 1 character over the 120,000-character limit. Shorten or split it before sending.",
+      "Prompt is 1 character over the 120,000-character limit, including attached context. Shorten or split it before sending.",
     );
     expect(preventDefault).toHaveBeenCalledOnce();
 
@@ -74,7 +74,7 @@ describe("submitComposerDraft", () => {
 
     expect(result).toEqual({
       validationMessage:
-        "Prompt is 18 characters over the 120,000-character limit. Shorten or split it before sending.",
+        "Prompt is 18 characters over the 120,000-character limit, including attached context. Shorten or split it before sending.",
       didDispatch: false,
     });
     expect(draft).toHaveLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS);
@@ -130,7 +130,7 @@ describe("submitComposerDraft", () => {
 
       expect(result).toEqual({
         validationMessage:
-          "Prompt is 1 character over the 120,000-character limit. Shorten or split it before sending.",
+          "Prompt is 1 character over the 120,000-character limit, including attached context. Shorten or split it before sending.",
         didDispatch: false,
       });
       expect(onSend).not.toHaveBeenCalled();
@@ -161,7 +161,7 @@ describe("submitComposerDraft", () => {
 
     expect(result).toEqual({
       validationMessage:
-        "Prompt is 1 character over the 120,000-character limit. Shorten or split it before sending.",
+        "Prompt is 1 character over the 120,000-character limit, including attached context. Shorten or split it before sending.",
       didDispatch: false,
     });
     expect(onSend).not.toHaveBeenCalled();

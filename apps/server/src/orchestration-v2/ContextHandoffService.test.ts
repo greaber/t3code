@@ -149,8 +149,9 @@ it.layer(layerTest)("ContextHandoffService legacy import", (it) => {
         createdAt: DateTime.makeUnsafe("2026-01-02T00:00:00.000Z"),
       });
 
+      // Delivery narrows history to the target window; preparation keeps the whole message.
       assert.include(
-        handoff.history?.omittedItemIds ?? [],
+        handoff.history?.messages.map((message) => message.itemId) ?? [],
         TurnItemId.make("turn-item:long-single-token"),
       );
       assert.isAtMost(handoff.summaryText.length, 32_000);
@@ -169,12 +170,12 @@ it.effect("caps the side chat context block without summarizing discarded parent
       ...importedItem({
         role: index % 2 === 0 ? "user" : "assistant",
         id: `parent-${index}`,
-        text: `item-${index} ${"x".repeat(228)}😀${"x".repeat(70)}`,
+        text: `item-${index} ${"x".repeat(1_228)}😀\n${"x".repeat(70)}`,
         ordinal: index,
       }),
       get text() {
         summarizedItems++;
-        return `item-${index} ${"x".repeat(228)}😀${"x".repeat(70)}`;
+        return `item-${index} ${"x".repeat(1_228)}😀\n${"x".repeat(70)}`;
       },
     }));
     const service = yield* ContextHandoffService.ContextHandoffServiceV2;
@@ -195,8 +196,8 @@ it.effect("caps the side chat context block without summarizing discarded parent
 
     assert.include(context, "- Earlier items truncated.");
     assert.notInclude(context, "item-0 ");
-    assert.include(context, "- Assistant: item-59 ");
-    assert.isAtMost(context.length, 8_000);
+    assert.include(context, `- Assistant: item-59 ${"x".repeat(1_228)}😀\n${"x".repeat(70)}`);
+    assert.isAtMost(context.length, 64_000);
     assert.isTrue(context.isWellFormed());
     assert.isTrue(
       context.endsWith(
@@ -242,6 +243,36 @@ it.effect("caps the side chat context block without summarizing discarded parent
     assert.include(multiFilePatch, "- File change: src/a.ts, src/b.ts, src/new.ts");
   }).pipe(Effect.provide(layerTest)),
 );
+
+it("keeps whole merge-back messages and drops the oldest past the budget", () => {
+  const deltaItems = Array.from({ length: 6 }, (_, index) =>
+    importedItem({
+      role: index % 2 === 0 ? "user" : "assistant",
+      id: `fork-${index}`,
+      text: `fork-${index}\n${"y".repeat(1_000)}`,
+      ordinal: index,
+    }),
+  );
+  const summarize = (budget: number) =>
+    ContextHandoffService.makeForkDeltaSummary({
+      sourceThreadId: ThreadId.make("thread:fork"),
+      targetThreadId: ThreadId.make("thread:main"),
+      coveredRunOrdinals: { from: 1, to: 2 },
+      deltaItems,
+      budget,
+    });
+
+  const full = summarize(1_000_000);
+  assert.include(full, `- User: fork-0\n${"y".repeat(1_000)}`);
+  assert.notInclude(full, "omitted");
+
+  const cut = summarize(3_000);
+  assert.isAtMost(Buffer.byteLength(cut), 3_000);
+  assert.include(cut, "- 4 earlier items omitted to fit the context budget");
+  assert.notInclude(cut, "fork-3");
+  assert.include(cut, `- User: fork-4\n${"y".repeat(1_000)}`);
+  assert.include(cut, `- Assistant: fork-5\n${"y".repeat(1_000)}`);
+});
 
 it("covers the run range of a very long delta", () => {
   const runs = [
@@ -300,4 +331,43 @@ it.effect("inherited history stops at a missing fork ancestor", () =>
     );
     assert.deepEqual(items, []);
   }),
+);
+
+it.effect("stores provider handoff history once, bounded by a known target window", () =>
+  Effect.gen(function* () {
+    const service = yield* ContextHandoffService.ContextHandoffServiceV2;
+    const items = Array.from({ length: 40 }, (_, index) =>
+      importedItem({
+        role: index % 2 === 0 ? "user" : "assistant",
+        id: `switch-${index}`,
+        text: `switch-${index} ${"z".repeat(4_000)}`,
+        ordinal: index,
+      }),
+    );
+    const prepare = (modelContextWindow: number | undefined) =>
+      service.prepareProviderHandoff({
+        threadId: ThreadId.make("thread:switch"),
+        targetRunId: RunId.make("run:switch"),
+        transferId: null,
+        fromProviderThreadIds: [ProviderThreadId.make("provider-thread:from")],
+        toProviderThreadId: ProviderThreadId.make("provider-thread:to"),
+        fromProviderInstanceId: ProviderInstanceId.make("codex"),
+        toProviderInstanceId: ProviderInstanceId.make("claudeAgent"),
+        coveredRunOrdinals: { from: 1, to: 2 },
+        strategy: "full_thread_summary",
+        items,
+        createdAt: DateTime.makeUnsafe(0),
+        modelContextWindow,
+      });
+
+    const unknown = yield* prepare(undefined);
+    assert.lengthOf(unknown.history?.messages ?? [], items.length);
+    assert.notInclude(unknown.summaryText, "z".repeat(100));
+    assert.isBelow(unknown.summaryText.length, 2_000);
+
+    const small = yield* prepare(40_000);
+    assert.isBelow(small.history?.messages.length ?? 0, items.length);
+    assert.isAbove(small.history?.omittedItems ?? 0, 0);
+    assert.include(small.history?.messages.at(-1)?.text ?? "", "switch-39");
+  }).pipe(Effect.provide(layerTest)),
 );

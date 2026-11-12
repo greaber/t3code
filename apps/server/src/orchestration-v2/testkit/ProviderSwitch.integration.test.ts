@@ -1,5 +1,5 @@
 import { vi } from "vite-plus/test";
-import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
+import { historyResponseItems, renderHistory } from "@t3tools/provider-core/server/handoffBudget";
 import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
@@ -46,6 +46,7 @@ import {
   canReuseCodexContextUsage,
 } from "../Adapters/CodexAdapterV2.ts";
 import { AcpProviderCapabilitiesV2 } from "@t3tools/provider-acp/server/adapter";
+import { omittedHistoryNotice } from "../ContextHandoffDelivery.ts";
 import * as EventSink from "../EventSink.ts";
 import * as EventStore from "../EventStore.ts";
 import * as LegacyV1ThreadImporter from "../legacy/LegacyV1ThreadImporter.ts";
@@ -822,7 +823,12 @@ describe("orchestration v2 provider switching", () => {
             if (scenario.includes("legacy-replacement")) {
               const recovered = yield* orchestrator.getThreadProjection(threadId);
               const handoff = recovered.contextHandoffs.at(-1)!;
-              const { history: _history, ...legacyHandoff } = handoff;
+              // Records from before history existed carried the rendered transcript as summaryText.
+              const { history, ...withoutHistory } = handoff;
+              const legacyHandoff = {
+                ...withoutHistory,
+                summaryText: renderHistory(history!.messages, handoff.summaryText),
+              };
               yield* eventSink.write({
                 events: [
                   {
@@ -982,7 +988,12 @@ describe("orchestration v2 provider switching", () => {
             assert.deepEqual((yield* Ref.get(capturedTurns)).at(-1)!.attachments, screenshots);
           }
           if (scenario === "compact-legacy") {
-            const { history: _history, ...legacyHandoff } = handoff;
+            // Records from before history existed carried the rendered transcript as summaryText.
+            const { history, ...withoutHistory } = handoff;
+            const legacyHandoff = {
+              ...withoutHistory,
+              summaryText: renderHistory(history!.messages, handoff.summaryText),
+            };
             yield* eventSink.write({
               events: [
                 {
@@ -1183,6 +1194,14 @@ describe("orchestration v2 provider switching", () => {
                 const delivery = retried.contextHandoffs.at(-1)!.delivery!;
                 assert.include(delivery.omittedItemIds ?? [], missedRequest.id);
                 assert.notInclude(delivery.itemIds, missedRequest.id);
+                assert.deepEqual(
+                  retried.turnItems.flatMap((item) =>
+                    item.type === "system_notice" && item.runId === retried.runs.at(-1)!.id
+                      ? [item.message]
+                      : [],
+                  ),
+                  [omittedHistoryNotice(1)],
+                );
               } else assert.include(delta, "First target request");
               assert.notInclude(delta, "Original request with constraints");
               assert.notInclude(delta, "Original partial work");
@@ -2523,7 +2542,7 @@ describe("orchestration v2 provider switching", () => {
         );
         assert.isBelow(handoffItem?.ordinal ?? Infinity, queuedUserItem?.ordinal ?? -Infinity);
         assert.include(
-          handoffItem?.type === "handoff" ? handoffItem.summary : "",
+          projection.contextHandoffs[0]?.history?.messages.map((message) => message.text) ?? [],
           "Codex second queued turn complete",
         );
         assert.include(turns[3]?.text ?? "", "Codex current turn complete");
@@ -3771,7 +3790,10 @@ describe("orchestration v2 provider switching", () => {
           (handoff) => handoff.id === projection.runs[1]?.contextHandoffId,
         );
         assert.equal(recoveryHandoff?.strategy, "full_thread_summary");
-        assert.include(recoveryHandoff?.summaryText ?? "", failedPrompt);
+        assert.include(
+          recoveryHandoff?.history?.messages.map((message) => message.text) ?? [],
+          failedPrompt,
+        );
         if (queueBeforeFailure) {
           const handoffItem = projection.turnItems.find(
             (item) => item.type === "handoff" && item.runId === projection.runs[1]?.id,
