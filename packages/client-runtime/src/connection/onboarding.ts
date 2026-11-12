@@ -277,6 +277,9 @@ export const prepareSshRegistration = Effect.fn(
       environmentId: provisioned.environmentId,
       label,
       target: provisioned.bootstrap.target,
+      ...(provisioned.bootstrap.remoteServerKind === undefined
+        ? {}
+        : { remoteServerKind: provisioned.bootstrap.remoteServerKind }),
     }),
     credential: new BearerConnectionCredential({ token: provisioned.bearerToken }),
   });

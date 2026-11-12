@@ -158,6 +158,13 @@ export class EnvironmentRegistry extends Context.Service<
       | PlatformEnvironmentRemovalError
     >;
     readonly retryNow: (environmentId: EnvironmentId) => Effect.Effect<void>;
+    /**
+     * Stops the server a desktop app started over SSH, then reconnects, which
+     * starts this client's version. Agent turns running there stop.
+     */
+    readonly restartSshServer: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<void, EnvironmentNotRegisteredError | ConnectionAttemptError>;
     readonly setEnabled: (
       environmentId: EnvironmentId,
       enabled: boolean,
@@ -381,17 +388,64 @@ export const make = Effect.gen(function* () {
             return next;
           });
           yield* SubscriptionRef.changes(supervisor.state).pipe(
-            Stream.runForEach((state) =>
-              state.phase === "blocked" && state.lastFailure?.reason === "unsupported"
-                ? setCompatibility(environmentId, state.lastFailure)
-                : Effect.void,
-            ),
+            Stream.runForEach((state) => {
+              if (state.phase === "blocked" && state.lastFailure?.reason === "unsupported") {
+                return setCompatibility(environmentId, state.lastFailure).pipe(
+                  Effect.andThen(refreshSshProfile(environmentId)),
+                );
+              }
+              return state.phase === "connected" ? refreshSshProfile(environmentId) : Effect.void;
+            }),
             Effect.forkIn(scope),
           );
           return supervisor;
         }),
       ),
   );
+
+  const savedSshProfile = (entry: ConnectionCatalogEntry) =>
+    entry.target._tag !== "SshConnectionTarget"
+      ? Effect.succeed(null)
+      : profiles.get(entry.target.connectionId).pipe(
+          Effect.map((saved) => {
+            const profile = Option.getOrNull(saved);
+            return profile !== null && isSshConnectionProfile(profile) ? profile : null;
+          }),
+          Effect.orElseSucceed(() => null),
+        );
+
+  /**
+   * Each SSH connect saves which kind of server it reached. Show it without
+   * replacing the supervisor, which `installEntryLocked` would tear down.
+   */
+  const refreshSshProfile = (environmentId: EnvironmentId) =>
+    withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        const entry = (yield* SubscriptionRef.get(entries)).get(environmentId);
+        if (entry === undefined) return;
+        const current = Option.getOrNull(entry.profile);
+        const saved = yield* savedSshProfile(entry);
+        if (
+          saved === null ||
+          current === null ||
+          !isSshConnectionProfile(current) ||
+          saved.remoteServerKind === current.remoteServerKind
+        ) {
+          return;
+        }
+        const next: ConnectionCatalogEntry = { ...entry, profile: Option.some(saved) };
+        const lease = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
+        if (lease !== undefined) {
+          yield* SubscriptionRef.update(serviceScopes, (scopes) =>
+            new Map(scopes).set(environmentId, { ...lease, entry: next }),
+          );
+        }
+        yield* SubscriptionRef.update(entries, (current) =>
+          new Map(current).set(environmentId, next),
+        );
+      }),
+    ).pipe(Effect.withSpan("EnvironmentRegistry.refreshSshProfile"));
 
   const acquireSupervisor = Effect.fn("EnvironmentRegistry.acquireSupervisor")(function* (
     environmentId: EnvironmentId,
@@ -1053,6 +1107,24 @@ export const make = Effect.gen(function* () {
       Effect.catchTags({ EnvironmentNotRegisteredError: () => Effect.void }),
       Effect.withSpan("EnvironmentRegistry.retryNow"),
     );
+  const restartSshServer = Effect.fn("EnvironmentRegistry.restartSshServer")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    yield* withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        const profile = yield* savedSshProfile(yield* getEntry(environmentId));
+        if (profile?.remoteServerKind !== "managed") {
+          return yield* new ConnectionBlockedError({
+            reason: "unsupported",
+            detail: "This app did not start T3 Code on that machine, so it cannot restart it.",
+          });
+        }
+        yield* ssh.disconnect(profile.target);
+      }),
+    );
+    yield* retryNow(environmentId);
+  });
   const setEnabled = Effect.fn("EnvironmentRegistry.setEnabled")(function* (
     environmentId: EnvironmentId,
     enabled: boolean,
@@ -1195,6 +1267,7 @@ export const make = Effect.gen(function* () {
     reorderRoutes,
     removeRelayEnvironments,
     retryNow,
+    restartSshServer,
     setEnabled,
     setCompatibility,
     state,
