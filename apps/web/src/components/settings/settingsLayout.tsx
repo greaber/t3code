@@ -15,7 +15,6 @@ import { createContext, type ComponentPropsWithoutRef, type ReactNode, useContex
 
 import {
   PRIMARY_SETTINGS_UNAVAILABLE_MESSAGE,
-  persistClientSettingsUpdate,
   useClientSettings,
   usePrimarySettingsAvailable,
 } from "../../hooks/useSettings";
@@ -37,7 +36,11 @@ import {
   isServerSettingPreferenceKey,
   serverSettingPreferenceDifferences,
 } from "./serverSettingPreferences";
-import { useClearProjectOverrides, useClearScopedSettings } from "./useScopedSettings";
+import {
+  updateServerSettingPreferences,
+  useClearProjectOverrides,
+  useClearScopedSettings,
+} from "./useScopedSettings";
 import {
   SettingInheritance,
   type SettingInheritanceState,
@@ -547,13 +550,9 @@ export function SettingsRow({
           size="xs"
           variant="link"
           onClick={() =>
-            void persistClientSettingsUpdate((current) => ({
-              ...current,
-              serverSettingPreferences: forgetServerSettingPreferences(
-                current.serverSettingPreferences,
-                preferenceKeys,
-              ),
-            }))
+            updateServerSettingPreferences((current) =>
+              forgetServerSettingPreferences(current, preferenceKeys),
+            )
           }
         >
           Stop applying everywhere

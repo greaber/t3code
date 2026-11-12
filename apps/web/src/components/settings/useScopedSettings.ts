@@ -10,6 +10,7 @@ import { AsyncResult } from "effect/reactivity";
 import {
   DEFAULT_SERVER_SETTINGS,
   type ProjectScopedServerSettingKey,
+  type ServerSettingPreferences,
   type ServerSettings,
   type UnifiedSettings,
 } from "@t3tools/contracts";
@@ -113,15 +114,27 @@ export function useUpdateScopedSettings() {
       plan.unavailableReason === null &&
       recordServerSettingPreferences(getClientSettings().serverSettingPreferences, scope, patch)
     ) {
-      void persistClientSettingsUpdate((current) => ({
-        ...current,
-        serverSettingPreferences:
-          recordServerSettingPreferences(current.serverSettingPreferences, scope, patch) ??
-          current.serverSettingPreferences,
-      }));
+      updateServerSettingPreferences(
+        (current) => recordServerSettingPreferences(current, scope, patch) ?? current,
+      );
     }
     run(plan, options?.onFailed);
   };
+}
+
+export function updateServerSettingPreferences(
+  update: (current: ServerSettingPreferences) => ServerSettingPreferences,
+) {
+  void persistClientSettingsUpdate((current) => ({
+    ...current,
+    serverSettingPreferences: update(current.serverSettingPreferences),
+  })).catch(() =>
+    toastManager.add({
+      type: "error",
+      title: "All-environment setting not saved",
+      description: "This app could not save which settings it applies everywhere. Try again.",
+    }),
+  );
 }
 
 export function useClearScopedSettings() {
