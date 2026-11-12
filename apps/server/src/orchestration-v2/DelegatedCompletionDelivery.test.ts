@@ -1887,7 +1887,7 @@ it.layer(layerContinuationWorkerTest)("interrupted completion wakes", (it) => {
     }),
   );
 
-  it.effect("settling with a queued completion wake disposes its running siblings", () =>
+  it.effect("settling with a queued completion wake keeps it and its running siblings", () =>
     Effect.gen(function* () {
       const { orchestrator, sink, now, threadId, originRunId, sibling, wake, completeSibling } =
         yield* queueCompletionWakeBesideRunningSibling("sibling-settle");
@@ -1918,16 +1918,19 @@ it.layer(layerContinuationWorkerTest)("interrupted completion wakes", (it) => {
         commandId: CommandId.make("sibling-settle-settle"),
         threadId,
       });
+      // Settling only parks the thread; the wake and its siblings keep their delivery.
       assert.deepEqual(
         settled.storedEvents.flatMap(({ event }) =>
           event.type === "run.updated" && event.payload.id === wake.id
             ? [event.payload.status]
             : [],
         ),
-        ["cancelled"],
+        [],
       );
       const afterSettle = yield* orchestrator.getThreadProjection(threadId);
-      assert.equal(
+      assert.equal(afterSettle.thread.settledOverride, "settled");
+      assert.equal(afterSettle.runs.find((run) => run.id === wake.id)?.status, "queued");
+      assert.notEqual(
         afterSettle.subagents.find((task) => task.id === sibling.id)?.completionDelivery?.state,
         "disposed",
       );
@@ -1944,20 +1947,15 @@ it.layer(layerContinuationWorkerTest)("interrupted completion wakes", (it) => {
         Stream.runDrain,
       );
       const afterLateResult = yield* orchestrator.getThreadProjection(threadId);
-      assert.equal(
+      assert.notEqual(
         afterLateResult.subagents.find((task) => task.id === sibling.id)?.completionDelivery?.state,
         "disposed",
       );
-      assert.deepEqual(
-        afterLateResult.runs.map((run) => run.id),
-        afterSettle.runs.map((run) => run.id),
-      );
-      assert.equal(
+      assert.notEqual(
         afterLateResult.runs.find((run) => run.id === originRunId)?.delegatedCompletion
           ?.disposition,
         "disposed",
       );
-      assert.equal(afterLateResult.thread.settledOverride, "settled");
     }),
   );
 });

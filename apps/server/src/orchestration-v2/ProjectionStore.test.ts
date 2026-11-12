@@ -6299,18 +6299,20 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       const [originalRow] = yield* sql<{
         payload_json: string;
       }>`SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ${threadId}`;
-      for (const [field, value] of [
-        ["archivedAt", DateTime.formatIso(now)],
-        ["settledOverride", "settled"],
-      ]) {
+      // Archiving puts the work away; settling only parks the thread, so it still recovers.
+      for (const [field, value, recovers] of [
+        ["archivedAt", DateTime.formatIso(now), false],
+        ["settledOverride", "settled", true],
+      ] as const) {
         yield* sql`UPDATE orchestration_v2_projection_threads
           SET payload_json = json_set(payload_json, ${`$.${field}`}, ${value})
           WHERE thread_id = ${threadId}`;
-        assert.isUndefined(
-          (yield* store.getLimitRecoveryCandidates({ now, autoResume: true, snooze: false })).find(
-            (row) => row.id === threadId,
-          ),
-        );
+        const candidate = (yield* store.getLimitRecoveryCandidates({
+          now,
+          autoResume: true,
+          snooze: false,
+        })).find((row) => row.id === threadId);
+        assert.equal(candidate !== undefined, recovers);
         yield* sql`UPDATE orchestration_v2_projection_threads
           SET payload_json = ${originalRow!.payload_json} WHERE thread_id = ${threadId}`;
       }
@@ -6464,7 +6466,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 
-  it.effect("does not freshly arm limit recovery for a subagent of a put-away parent", () =>
+  it.effect("does not freshly arm limit recovery for a subagent of an archived parent", () =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
       const now = yield* DateTime.now;
@@ -6607,10 +6609,11 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
               )?.type === "thread.metadata.update",
           )
           .map((row) => row.id);
+        // Settling only parks the parent in the sidebar; it still waits on its subagent.
         assert.deepEqual(
           armed,
-          [activeParentChild],
-          `only the child of the open parent is armed (${JSON.stringify(options)})`,
+          [activeParentChild, settledParentChild],
+          `only children of live parents are armed (${JSON.stringify(options)})`,
         );
       }
       // A recovery armed before the parent settled still resumes at its reset.

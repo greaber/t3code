@@ -49,7 +49,6 @@ function restartContinuationBlocked(
   if (
     thread.archivedAt !== null ||
     thread.deletedAt !== null ||
-    thread.settledOverride === "settled" ||
     (thread.snoozedUntil != null && DateTime.isGreaterThan(thread.snoozedUntil, now))
   )
     return true;

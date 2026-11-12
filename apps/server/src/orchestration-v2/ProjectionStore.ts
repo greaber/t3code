@@ -4134,7 +4134,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 AND json_extract(failure.payload_json, '$.failure.class') = 'usage_limit'
             )
             AND json_extract(t.payload_json, '$.archivedAt') IS NULL
-            AND json_extract(t.payload_json, '$.settledOverride') IS NOT 'settled'
             AND json_extract(item.payload_json, '$.failure.class') = 'usage_limit'
             AND json_extract(item.payload_json, '$.failure.resetAt') IS NOT NULL
             AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(COALESCE(r.completed_at, json_extract(t.payload_json, '$.updatedAt')))
@@ -4158,14 +4157,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   ${booleanInt(options.autoResume)}
                   OR (${booleanInt(options.snooze)} AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(${DateTime.formatIso(options.now)}))
                 )
-                -- A subagent of a settled, archived or deleted parent is abandoned work.
+                -- A subagent of an archived or deleted parent is abandoned work.
                 AND NOT EXISTS (
                   SELECT 1 FROM orchestration_v2_projection_threads parent
                   WHERE json_extract(t.payload_json, '$.lineage.relationshipToParent') = 'subagent'
                     AND parent.thread_id = json_extract(t.payload_json, '$.lineage.parentThreadId')
                     AND (
-                      json_extract(parent.payload_json, '$.settledOverride') = 'settled'
-                      OR json_extract(parent.payload_json, '$.archivedAt') IS NOT NULL
+                      json_extract(parent.payload_json, '$.archivedAt') IS NOT NULL
                       OR parent.deleted_at IS NOT NULL
                     )
                 )

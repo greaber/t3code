@@ -642,9 +642,9 @@ export const SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "auto-settle-merged-threads",
-    title: "Auto-settle merged threads",
+    title: "Auto-settle when a pull request merges or closes",
     to: "/settings/threads",
-    searchTerms: ["pull request merge closed automatically sidebar"],
+    searchTerms: ["pull request merged merges closed closes automatically sidebar"],
     requiresThreadAutoSettlement: true,
     scope: "project-defaults",
   },

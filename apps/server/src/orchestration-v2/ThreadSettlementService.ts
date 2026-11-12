@@ -44,6 +44,13 @@ export interface SettlementPullRequest {
 }
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
+const BUSY_SHELL_STATUSES: ReadonlySet<OrchestrationV2ThreadShell["status"]> = new Set([
+  "queued",
+  "preparing",
+  "starting",
+  "running",
+  "waiting",
+]);
 const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
 
 function toMillis(value: DateTime.Utc | null | undefined): number | null {
@@ -129,9 +136,7 @@ function pullRequestSettles(
   pullRequest: SettlementPullRequest,
   autoSettleOnMerge: boolean,
 ): boolean {
-  if (pullRequest.state !== "closed" && (pullRequest.state !== "merged" || !autoSettleOnMerge)) {
-    return false;
-  }
+  if (pullRequest.state === "open" || !autoSettleOnMerge) return false;
   const terminalAt = pullRequest.state === "merged" ? pullRequest.mergedAt : pullRequest.closedAt;
   if (terminalAt == null) return false;
   const userAnchorMs = latestMillis([
@@ -596,17 +601,31 @@ export const make = Effect.gen(function* () {
       return sweepThread(threadId).pipe(FiberSet.run(threadSweeps), Effect.asVoid);
     });
 
+  // An agent can start a turn just as its thread settles (a background task's result), so
+  // settle actions run only on a thread that is still settled and has no run or queued work.
+  const settledAndIdle = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const thread = yield* projections.getThreadShell(threadId);
+    return thread !== null &&
+      thread.settledOverride === "settled" &&
+      thread.activeRunId === null &&
+      (thread.activityRunStatus ?? null) === null &&
+      !BUSY_SHELL_STATUSES.has(thread.status) &&
+      !backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks ?? [])
+      ? thread
+      : null;
+  });
+
   // Skip settle scripts in shared checkouts where other threads may still work.
   const cleanUpSettledThread = Effect.fn("ThreadSettlementServiceV2.cleanUpSettledThread")(
     function* (threadId: ThreadId) {
-      const settled = yield* projections.getThread(threadId);
-      if (settled.settledOverride !== "settled") return;
+      const settled = yield* settledAndIdle(threadId);
+      if (settled === null) return;
       yield* terminals.closeOnSettle({ threadId });
       const worktreePath = settled.worktreePath;
       if (worktreePath === null || !(yield* fileSystem.exists(worktreePath))) return;
       // Recheck after closing and worktree I/O; re-engaged threads must not be cleaned up.
-      const thread = yield* projections.getThread(threadId);
-      if (thread.settledOverride !== "settled") return;
+      const thread = yield* settledAndIdle(threadId);
+      if (thread === null) return;
       const settledAtMs = toMillis(thread.settledAt);
       if (settledAtMs === null || settleActionRunAt.get(threadId) === settledAtMs) return;
       const run = yield* projectScripts.runForThread({
