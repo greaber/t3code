@@ -1,3 +1,4 @@
+import { TERMINAL_VIEW_SCROLLBACK_ROWS } from "@t3tools/contracts";
 import {
   type GhosttyKeyboardLayoutMap,
   ghosttyConsumedMods,
@@ -9,7 +10,7 @@ import { GhosttyRuntime, loadGhosttyRuntime } from "./runtime";
 
 const GHOSTTY_SUCCESS = 0;
 const GHOSTTY_OUT_OF_SPACE = -3;
-const MAX_SCROLLBACK_ROWS = 10_000;
+const MAX_SCROLLBACK_ROWS = TERMINAL_VIEW_SCROLLBACK_ROWS;
 // wasm32 GhosttyTerminalSelectionFormatOptions layout at the pinned libghostty-vt revision.
 const SELECTION_FORMAT_OPTIONS_SIZE = 16;
 const PALETTE_BYTES = 256 * 3;

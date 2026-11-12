@@ -287,7 +287,7 @@ it.layer(layerTest)("ThreadSearch", (it) => {
       for (const match of ['"needle"', null]) {
         const plan = yield* sql<{
           readonly detail: string;
-        }>`EXPLAIN QUERY PLAN ${ThreadSearch.messageHitsQuery(sql, { match, substrings: "[]", shortSpellings: "[]", projectId: null, excludedThreadIds: "[]" })}`;
+        }>`EXPLAIN QUERY PLAN ${ThreadSearch.messageHitsQuery(sql, { match, substrings: "[]", shortSpellings: "[]", projectId: null, excludedThreadIds: "[]", before: 1_000_000, lower: 0 })}`;
         assert.isFalse(
           plan.some((row) => row.detail.includes("TEMP B-TREE")),
           plan.map((row) => row.detail).join("\n"),
@@ -802,7 +802,7 @@ it.layer(layerTest)("ThreadSearch filters before it ranks", (it) => {
     }),
   );
 
-  it.effect("reads at most the newest 10,000 index hits, however many the filters drop", () =>
+  it.effect("reads at most 10,000 index hits per page, however many the filters drop", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const search = yield* ThreadSearch.ThreadSearch;
@@ -834,10 +834,78 @@ it.layer(layerTest)("ThreadSearch filters before it ranks", (it) => {
       assert.deepEqual(yield* threadIds("kestrel ci"), [old]);
       yield* sql`DELETE FROM orchestration_v2_projection_messages WHERE thread_id = ${busy}`;
       yield* insertBusy(10_000);
-      assert.deepEqual(yield* threadIds("kestrel ci"), []);
+      const first = yield* search.search({ query: "kestrel ci" });
+      assert.deepEqual(first.matches, []);
+      assert.isDefined(first.cursor);
+      // The next page continues below the hits the first one passed over.
+      const second = yield* search.search({ query: "kestrel ci", cursor: first.cursor! });
+      assert.deepEqual(
+        second.matches.map((match) => match.threadId),
+        [old],
+      );
+      assert.isUndefined(second.cursor);
     }),
   );
 });
+
+it.effect.each([true, false])(
+  "ThreadSearch pages through every matching thread exactly once (indexed: %s)",
+  (indexed) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const search = yield* ThreadSearch.ThreadSearch;
+      const sql = yield* SqlClient.SqlClient;
+      const project = ProjectId.make("project:osprey");
+      const busy = ThreadId.make("thread:osprey-busy");
+      const quiet = Array.from({ length: 7 }, (_, index) =>
+        ThreadId.make(`thread:osprey-${index}`),
+      );
+      yield* createProject(project);
+      yield* Effect.forEach(
+        [
+          ...quiet.flatMap((threadId, index) => [
+            thread(threadId, project),
+            message(threadId, `osprey-old-${index}`, "user", "an osprey sighting"),
+          ]),
+          thread(busy, project),
+        ],
+        projections.apply,
+        { discard: true },
+      );
+      if (!indexed) {
+        yield* sql`DROP TRIGGER orchestration_v2_message_search_insert`;
+        yield* sql`DROP TRIGGER orchestration_v2_message_search_update`;
+        yield* sql`DROP TRIGGER orchestration_v2_message_search_delete`;
+        yield* sql`DROP TABLE orchestration_v2_message_search`;
+      }
+      // Newer than every quiet thread's match, and more than one page's hits.
+      yield* sql`
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2100)
+        INSERT INTO orchestration_v2_projection_messages
+          (message_id, thread_id, role, streaming, created_at, updated_at, payload_json)
+        SELECT 'osprey-busy-' || i, ${busy}, 'assistant', 0, ${DateTime.formatIso(at(5))},
+          ${DateTime.formatIso(at(5))}, json_object('text', 'osprey nest')
+        FROM n
+      `;
+      const seen: ThreadId[] = [];
+      let cursor: ThreadSearch.ThreadSearchCursor | undefined;
+      for (let page = 0; page < 20; page += 1) {
+        const result = yield* search.search({
+          query: "osprey",
+          limit: 3,
+          excludedThreadIds: seen,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        seen.push(...result.matches.map((match) => match.threadId));
+        cursor = result.cursor;
+        if (cursor === undefined) break;
+      }
+      assert.isUndefined(cursor);
+      assert.strictEqual(seen[0], busy);
+      assert.sameMembers(seen, [busy, ...quiet]);
+      assert.lengthOf(seen, quiet.length + 1);
+    }).pipe(Effect.provide(layerTest)),
+);
 
 it.effect.each([true, false])(
   "ThreadSearch narrows short words outside ASCII before the hit limit (indexed: %s)",

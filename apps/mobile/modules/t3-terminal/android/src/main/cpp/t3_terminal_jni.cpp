@@ -12,7 +12,8 @@ namespace {
 
 constexpr uint32_t kSnapshotMagic = 0x54563354;  // "T3VT" in little endian.
 constexpr uint16_t kSnapshotVersion = 1;
-constexpr size_t kMaxScrollbackRows = 10000;
+// TERMINAL_VIEW_SCROLLBACK_ROWS in packages/contracts.
+constexpr size_t kMaxScrollbackRows = 60000;
 
 enum CellFlag : uint16_t {
   kBold = 1 << 0,

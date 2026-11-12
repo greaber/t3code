@@ -9,6 +9,7 @@ import {
   ProviderInstanceId,
   resolveProviderInstanceEnabled,
   type AgentSessionImportSource,
+  type AgentSessionImportSkipReason,
   type AgentSessionProjectCandidate,
   type AgentSessionProjectGit,
   type AgentSessionScanResult,
@@ -48,6 +49,8 @@ import {
 
 const TRANSCRIPT_PREFIX_BYTES = 32 * 1024;
 
+const isTranscriptJsonLimitError = Schema.is(TranscriptJsonLimitError);
+
 class TranscriptParseError extends Schema.TaggedError<TranscriptParseError>()(
   "TranscriptParseError",
   { filePath: Schema.String, cause: Schema.Defect() },
@@ -70,21 +73,25 @@ const MAX_TRANSCRIPT_SCAN_BYTES = 1024 * 1024;
 const MAX_CODEX_SESSION_INDEX_BYTES = 1024 * 1024;
 const MAX_CODEX_PROJECT_ROOT_ROWS = 100_000;
 
-const MAX_TRANSCRIPTS_PER_SOURCE = 5000;
+const MAX_TRANSCRIPTS_PER_SOURCE = 100_000;
 
+// Metadata budgets scale with the transcript cap, keeping the per-transcript average.
 const MAX_DISCOVERY_OPERATIONS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 4;
-const MAX_METADATA_BYTES_PER_SOURCE = 64 * 1024 * 1024;
+const MAX_METADATA_BYTES_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 13 * 1024;
 const MAX_METADATA_OPERATIONS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 4;
-const MAX_METADATA_RECORDS_PER_SOURCE = 100_000;
+const MAX_METADATA_RECORDS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 20;
 const MAX_METADATA_RECORDS_PER_TRANSCRIPT = 1_000;
-const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 // Screenshot-heavy transcripts can reach GiB; select fields while streaming to avoid allocating payloads.
 const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
-const MAX_IMPORTED_MESSAGES = 200;
-const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
+// A thread is parsed and committed whole; peak heap runs at a few times the kept text.
+const MAX_IMPORT_HISTORY_BYTES = 128 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
-const MAX_IMPORT_TRANSCRIPTS = 100;
-const MAX_IMPORT_RECORDS = 100_000;
+const MAX_IMPORT_RECORDS = 10_000_000;
+/** Records read per transcript; tests lower it to keep fixtures small. */
+export const ImportRecordLimit = Context.Reference<number>(
+  "t3/project/AgentSessionScanner/ImportRecordLimit",
+  { defaultValue: () => MAX_IMPORT_RECORDS },
+);
 
 /**
  * open() of a file under macOS privacy protection waits on a consent prompt
@@ -201,7 +208,12 @@ export interface AgentSessionThread {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
-  readonly omittedMessageCount: number;
+}
+
+export interface AgentSessionSkippedTranscript {
+  readonly provider: AgentSessionSource;
+  readonly filePath: string;
+  readonly reason: AgentSessionImportSkipReason;
 }
 
 export type AgentSessionRecentThread =
@@ -212,7 +224,10 @@ export type AgentSessionRecentThread =
     }
   | { readonly _tag: "AlreadyImported"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
-  | { readonly _tag: "Skipped" };
+  | {
+      readonly _tag: "Skipped";
+      readonly skipped: AgentSessionSkippedTranscript;
+    };
 
 export class AgentSessionScanner extends Context.Service<
   AgentSessionScanner,
@@ -422,10 +437,12 @@ function isPiConversationRecord(
 export function parseAgentSessionTranscript(
   input: AgentSessionTranscriptMetadata & {
     readonly contents: string;
+    readonly maxRecords?: number;
   },
-  lines = splitTranscriptRecords(input.contents, MAX_IMPORT_RECORDS + 1),
 ): AgentSessionThread | null {
-  if (lines.length > MAX_IMPORT_RECORDS) return null;
+  const maxRecords = input.maxRecords ?? MAX_IMPORT_RECORDS;
+  const lines = splitTranscriptRecords(input.contents, maxRecords + 1);
+  if (lines.length > maxRecords) return null;
   const records = lines.flatMap((line) => Option.toArray(decodeTranscriptRecord(line)));
   const claudeFields =
     input.source === "claudeAgent"
@@ -457,9 +474,6 @@ function parseAgentSessionRecords(
   let derivedTitle: string | undefined;
   let hasCodexSessionId = false;
   const messages: Array<AgentSessionThreadMessage & { readonly codexResponseUser: boolean }> = [];
-  let firstUserMessage:
-    | (AgentSessionThreadMessage & { readonly codexResponseUser: boolean })
-    | undefined;
   const canonicalCodexResponseUserIndices = new Set<number>();
   let canonicalUserTextsInTurn = new Set<string>();
   let responseUsersInTurn: Array<{
@@ -513,19 +527,13 @@ function parseAgentSessionRecords(
     finishCodexTurn();
   }
 
-  let conversationMessageCount = 0;
   const retainMessage = (
     message: AgentSessionThreadMessage & { readonly codexResponseUser: boolean },
   ) => {
-    if (firstUserMessage === undefined && message.role === "user") {
-      firstUserMessage = message;
-    }
     if (derivedTitle === undefined && message.role === "user") {
       derivedTitle = deriveTitle(input.source, message.text);
     }
-    conversationMessageCount += 1;
     messages.push(message);
-    if (messages.length > MAX_IMPORTED_MESSAGES) messages.shift();
   };
 
   const hasMatchingCodexEventInTurn = (text: string) => {
@@ -593,9 +601,7 @@ function parseAgentSessionRecords(
         const message = messages[index];
         if (message?.role === "assistant") break;
         if (message?.codexResponseUser === true && message.text.trim() === text.trim()) {
-          if (firstUserMessage === message) firstUserMessage = undefined;
           messages.splice(index, 1);
-          conversationMessageCount -= 1;
           break;
         }
       }
@@ -631,15 +637,15 @@ function parseAgentSessionRecords(
     });
   }
 
-  const visibleMessages = messages.map(
+  if (
+    providerSessionId.trim().length === 0 ||
+    !messages.some((message) => message.role === "user")
+  ) {
+    return null;
+  }
+  const retainedMessages = messages.map(
     ({ codexResponseUser: _codexResponseUser, ...message }) => message,
   );
-  if (providerSessionId.trim().length === 0 || firstUserMessage === undefined) return null;
-  const firstUserMessageRetained = messages.includes(firstUserMessage);
-  const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
-  const retainedMessages = firstUserMessageRetained
-    ? visibleMessages
-    : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
 
   return {
     source: input.source,
@@ -650,7 +656,6 @@ function parseAgentSessionRecords(
     createdAt: retainedMessages[0]?.createdAt ?? fallbackTimestamp,
     updatedAt: fallbackTimestamp,
     messages: retainedMessages,
-    omittedMessageCount: conversationMessageCount - retainedMessages.length,
   };
 }
 
@@ -780,6 +785,7 @@ function sameTranscriptIdentity(left: TranscriptIdentity, right: TranscriptIdent
 
 /** @public */
 export const make = Effect.gen(function* () {
+  const maxImportRecords = yield* ImportRecordLimit;
   const fileSystem = yield* FileSystem.FileSystem;
   const processRunner = yield* ProcessRunner.ProcessRunner;
   // Concurrent client imports must not hold multiple selected-history budgets.
@@ -1046,14 +1052,15 @@ export const make = Effect.gen(function* () {
     prefix?: { readonly endByteOffset: number; readonly historyBytes: number },
   ) {
     const readBytes = prefix?.endByteOffset ?? expected.size;
-    if (readBytes > expected.size || readBytes > MAX_IMPORTED_TRANSCRIPT_BYTES) return null;
+    if (readBytes > expected.size) return "changed_while_reading" as const;
+    if (readBytes > MAX_IMPORTED_TRANSCRIPT_BYTES) return "too_large" as const;
 
     return yield* Effect.scoped(
       fileSystem.open(filePath, { flag: "r" }).pipe(
         Effect.flatMap((file) =>
           Effect.gen(function* () {
             if (!sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))) {
-              return null;
+              return "changed_while_reading" as const;
             }
             const records: Array<DecodedTranscriptRecord> = [];
             let cwd = Option.none<string>();
@@ -1066,7 +1073,7 @@ export const make = Effect.gen(function* () {
               recordBytes += bytes;
               if (historyBytes + recordBytes > MAX_IMPORT_HISTORY_BYTES) {
                 throw new TranscriptJsonLimitError({
-                  message: "Transcript selected history exceeds the 32 MiB memory budget",
+                  message: "Transcript selected history exceeds the 128 MiB memory budget",
                 });
               }
             };
@@ -1077,7 +1084,7 @@ export const make = Effect.gen(function* () {
             const finishRecord = () => {
               reader.write(decoder.decode());
               recordCount += 1;
-              if (recordCount > MAX_IMPORT_RECORDS) return false;
+              if (recordCount > maxImportRecords) return false;
               const value = reader.finish();
               const decoded = decodeTranscriptValue(value);
               if (Option.isNone(decoded) && source === "pi") {
@@ -1115,7 +1122,7 @@ export const make = Effect.gen(function* () {
                 Math.min(TRANSCRIPT_PREFIX_BYTES, readBytes - bytesRead),
               );
               if (Option.isNone(next)) {
-                return null;
+                return "changed_while_reading" as const;
               }
 
               bytesRead += next.value.byteLength;
@@ -1135,7 +1142,7 @@ export const make = Effect.gen(function* () {
                 },
                 catch: (cause) => new TranscriptParseError({ filePath, cause }),
               });
-              if (!withinBudget) return null;
+              if (!withinBudget) return "too_large" as const;
             }
 
             if (
@@ -1145,17 +1152,21 @@ export const make = Effect.gen(function* () {
                 catch: (cause) => new TranscriptParseError({ filePath, cause }),
               }))
             )
-              return null;
+              return "too_large" as const;
             return sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))
               ? { records, cwd, claudeFields, historyBytes }
-              : null;
+              : ("changed_while_reading" as const);
           }),
         ),
       ),
     ).pipe(
       Effect.catch((cause) =>
         Effect.logWarning("Could not read imported transcript", { filePath, cause }).pipe(
-          Effect.as(null),
+          Effect.as<AgentSessionImportSkipReason>(
+            cause._tag === "TranscriptParseError" && isTranscriptJsonLimitError(cause.cause)
+              ? "too_large"
+              : "unreadable",
+          ),
         ),
       ),
     );
@@ -1729,8 +1740,6 @@ export const make = Effect.gen(function* () {
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
     if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
     const rootIdentity = yield* directoryIdentity(root);
-    const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-    const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
 
     const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
     cachedCandidates = candidates;
@@ -1746,13 +1755,7 @@ export const make = Effect.gen(function* () {
       if ((yield* directoryIdentity(resolved)) !== rootIdentity) continue;
 
       for (const transcript of candidate.transcripts) {
-        if (
-          transcript.mtimeMs === null ||
-          transcript.mtimeMs < cutoffMs ||
-          transcript.mtimeMs > nowMs
-        ) {
-          continue;
-        }
+        if (transcript.mtimeMs === null) continue;
         eligibleTranscripts.push({
           candidate,
           transcript: { ...transcript, mtimeMs: transcript.mtimeMs },
@@ -1774,7 +1777,6 @@ export const make = Effect.gen(function* () {
     const importedSessions = new Set<string>();
     const codexThreadNamesByHome = new Map<string, ReadonlyMap<string, string>>();
     let bytesRemaining = MAX_IMPORT_BYTES;
-    let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
     const codexRolloutPaths = new Map<ProviderInstanceId, ReadonlyMap<string, string>>();
     const codexRolloutPath = (providerInstanceId: ProviderInstanceId, rolloutId: string) => {
       let paths = codexRolloutPaths.get(providerInstanceId);
@@ -1818,7 +1820,7 @@ export const make = Effect.gen(function* () {
           "codex",
           { endByteOffset: base.end_byte_offset, historyBytes },
         );
-        if (inherited === null) return null;
+        if (typeof inherited === "string") return null;
         historyBytes = inherited.historyBytes;
         // The rollout's own session_meta names the thread; inherited ones may name a fork parent.
         prefixes.unshift(inherited.records.filter((record) => record.type !== "session_meta"));
@@ -1829,16 +1831,17 @@ export const make = Effect.gen(function* () {
     return Stream.fromIteratorSucceed(eligibleTranscripts.values(), 1).pipe(
       Stream.mapEffect(({ candidate, transcript }) =>
         Effect.gen(function* () {
+          const skip = (reason: AgentSessionImportSkipReason) =>
+            Option.some<AgentSessionRecentThread>({
+              _tag: "Skipped",
+              skipped: { provider: candidate.source, filePath: transcript.filePath, reason },
+            });
           const completed = completedByFile.get(
             `${candidate.providerInstanceId}\0${transcript.filePath}`,
           );
-          if (completed === undefined && (transcriptsRemaining === 0 || bytesRemaining === 0)) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
-          }
+          if (completed === undefined && bytesRemaining === 0) return skip("import_limit");
           const stats = yield* statOption(transcript.filePath);
-          if (Option.isNone(stats) || stats.value.type !== "File") {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
-          }
+          if (Option.isNone(stats) || stats.value.type !== "File") return skip("unreadable");
           const identity = transcriptIdentity(transcript.filePath, stats.value);
           const completedSource = completed?.find(
             (source) =>
@@ -1853,23 +1856,12 @@ export const make = Effect.gen(function* () {
               source: completedSource,
             });
           }
-          if (
-            transcriptsRemaining === 0 ||
-            identity.size > MAX_IMPORTED_TRANSCRIPT_BYTES ||
-            identity.size > bytesRemaining
-          ) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
-          }
-          transcriptsRemaining -= 1;
+          if (identity.size > MAX_IMPORTED_TRANSCRIPT_BYTES) return skip("too_large");
+          if (identity.size > bytesRemaining) return skip("import_limit");
           bytesRemaining -= identity.size;
           const snapshot = yield* readTranscript(transcript.filePath, identity, candidate.source);
-          if (snapshot === null) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
-          }
-
-          if (Option.isNone(snapshot.cwd)) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
-          }
+          if (typeof snapshot === "string") return skip(snapshot);
+          if (Option.isNone(snapshot.cwd)) return skip("outside_project");
           const expandedCwd = expandHomePath(
             projectCwd(snapshot.cwd.value, transcript.projectRoots).trim(),
             homeDir,
@@ -1878,7 +1870,7 @@ export const make = Effect.gen(function* () {
             !path.isAbsolute(expandedCwd) ||
             (yield* directoryIdentity(path.resolve(expandedCwd))) !== rootIdentity
           ) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            return skip("outside_project");
           }
 
           const inheritedRecords =
@@ -1901,9 +1893,7 @@ export const make = Effect.gen(function* () {
               : [...inheritedRecords, ...snapshot.records],
             snapshot.claudeFields,
           );
-          if (parsedThread === null) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
-          }
+          if (parsedThread === null) return skip("no_conversation");
           let savedTitle: string | undefined;
           if (candidate.source === "codex") {
             const names =

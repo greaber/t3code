@@ -91,7 +91,13 @@ import {
 import { create } from "zustand";
 import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 import { useShallow } from "zustand/react/shallow";
-import { createDeferredStorage, createMemoryStorage } from "./lib/storage";
+import {
+  createDeferredStorage,
+  createMemoryStorage,
+  isStorageQuotaError,
+  type DeferredStorageWriteObserver,
+} from "./lib/storage";
+import { toastManager } from "./components/ui/toast";
 import { getDefaultServerModel } from "./providerModels";
 import {
   replaceComposerContextReferences,
@@ -124,6 +130,30 @@ type ComposerPersistState =
   | { capturedState: ComposerDraftStoreState }
   | PersistedComposerDraftStoreState;
 
+// One visible warning per failure streak; drafts keep working in memory meanwhile.
+function draftWriteObserver(): DeferredStorageWriteObserver {
+  let warned = false;
+  return {
+    onWriteError: (error) => {
+      console.error("[COMPOSER-DRAFTS] Could not save drafts.", error);
+      if (warned) return;
+      warned = true;
+      toastManager.add({
+        type: "error",
+        title: "Drafts are not being saved",
+        description: isStorageQuotaError(error)
+          ? "Browser storage is full, so unsent drafts will be lost on reload. Delete stashed prompts you no longer need to make room."
+          : "Browser storage rejected the write, so unsent drafts will be lost on reload.",
+        timeout: 0,
+        data: { hideCopyButton: true },
+      });
+    },
+    onWriteSuccess: () => {
+      warned = false;
+    },
+  };
+}
+
 const composerDebouncedStorage = createDeferredStorage<StorageValue<ComposerPersistState>>(
   typeof localStorage !== "undefined" ? localStorage : createMemoryStorage(),
   (value) =>
@@ -135,6 +165,7 @@ const composerDebouncedStorage = createDeferredStorage<StorageValue<ComposerPers
       version: value.version,
     }),
   COMPOSER_PERSIST_DEBOUNCE_MS,
+  draftWriteObserver(),
 );
 
 const composerPersistStorage: PersistStorage<ComposerPersistState> = {

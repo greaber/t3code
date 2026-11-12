@@ -2595,6 +2595,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const detachReason = freshContext
         ? FRESH_CONTEXT_DETACH_REASON
         : "Provider or model selection changed.";
+      const selectedThread: OrchestrationV2AppThread = selectionChanged
+        ? {
+            ...projection.thread,
+            providerInstanceId: queuedRun.providerInstanceId,
+            modelSelection: queuedRun.modelSelection,
+            updatedAt: now,
+          }
+        : projection.thread;
       yield* writeSystemEvents(
         [
           ...(selectionChanged
@@ -2607,10 +2615,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   threadId,
                   providerInstanceId: queuedRun.providerInstanceId,
                   occurredAt: now,
+                  payload: selectedThread,
+                },
+              ]
+            : []),
+          // Automatic runs can wait in a settled thread's queue; a running thread is not settled.
+          ...(selectedThread.settledOverride === "settled"
+            ? [
+                {
+                  type: "thread.unsettled" as const,
+                  threadId,
+                  providerInstanceId: queuedRun.providerInstanceId,
+                  occurredAt: now,
                   payload: {
-                    ...projection.thread,
-                    providerInstanceId: queuedRun.providerInstanceId,
-                    modelSelection: queuedRun.modelSelection,
+                    ...selectedThread,
+                    settledOverride: null,
+                    settledAt: null,
+                    unsettledAt: now,
                     updatedAt: now,
                   },
                 },
@@ -3403,16 +3424,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (candidate) =>
           candidate.source !== "stack-dismissed" && threadPullRequestKeysEqual(candidate, key),
       );
-      const inactive =
-        thread.archivedAt !== null ||
-        thread.settledOverride === "settled" ||
-        thread.settledAt !== null ||
-        isProviderNativeSubagentThread(thread);
+      const inactive = thread.archivedAt !== null || isProviderNativeSubagentThread(thread);
       if (link?.watch?.startedAt !== command.startedAt || (command.wake && inactive)) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
-          cause: "The pull request watch ended or its thread settled while it was read.",
+          cause: "The pull request watch ended or its thread was archived while it was read.",
         });
       }
       yield* dispatchThreadMutation(command, events, effects);
@@ -3815,32 +3832,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Thread ${command.threadId} ${blocker}`,
         });
       }
-
-      for (const request of pendingRequests) {
-        yield* dispatchRuntimeRequestRespond(
-          {
-            type: "runtime-request.respond",
-            commandId: command.commandId,
-            threadId: command.threadId,
-            requestId: request.id,
-            decision: "cancel",
-          },
-          events,
-          effects,
-        );
-      }
-      for (const run of automaticQueuedRuns) {
-        yield* dispatchQueuedRunCancel(
-          {
-            type: "queued-run.cancel",
-            commandId: command.commandId,
-            threadId: command.threadId,
-            runId: run.id,
-          },
-          events,
-          "cohort",
-        );
-      }
     }
 
     const needsProviderState =
@@ -3848,7 +3839,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.type === "thread.model-selection.set" ||
       command.type === "provider.switch" ||
       command.type === "thread.archive" ||
-      command.type === "thread.settle" ||
       (command.type === "thread.metadata.update" &&
         command.worktreePath !== undefined &&
         command.worktreePath !== thread.worktreePath);
@@ -3916,7 +3906,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         !Number.isFinite(resetMs) ||
         thread.archivedAt !== null ||
-        thread.settledOverride === "settled" ||
         run?.id !== command.limitRecovery.runId ||
         failure?.class !== "usage_limit" ||
         failure.resetAt !== command.limitRecovery.resetAt ||
@@ -4021,7 +4010,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...thread,
             settledOverride: "settled",
             settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
-            pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
             unsettledAt: null,
             pinnedAt: null,
             pinOrderKey: null,
@@ -4647,10 +4635,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       yield* closePendingLinkRequests({ command, events, threadId: command.threadId, now });
     }
 
-    // Archive and settle stop idle background work; serialized commands prevent starts racing detach.
-    // Settlement rejects active or blocked runs.
+    // Archive stops idle background work; serialized commands prevent starts racing detach.
+    // Settling only parks the thread: its agent may still be delivering background results.
     const detachSessionIds = new Set(
-      command.type === "thread.archive" || command.type === "thread.settle"
+      command.type === "thread.archive"
         ? (providerContext?.providerSessions ?? []).map((session) => session.id)
         : command.type === "thread.metadata.update" &&
             command.worktreePath !== undefined &&
@@ -4690,13 +4678,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 reason:
                   command.type === "thread.archive"
                     ? "Thread archived."
-                    : command.type === "thread.settle"
-                      ? "Thread settled."
-                      : command.type === "thread.metadata.update"
-                        ? "Workspace changed."
-                        : command.type === "thread.runtime-mode.set"
-                          ? "Runtime mode changed."
-                          : "Provider or model selection changed.",
+                    : command.type === "thread.metadata.update"
+                      ? "Workspace changed."
+                      : command.type === "thread.runtime-mode.set"
+                        ? "Runtime mode changed."
+                        : "Provider or model selection changed.",
               },
             });
             const pendingEffect = {
@@ -4709,13 +4695,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 detail:
                   command.type === "thread.archive"
                     ? "Thread archived."
-                    : command.type === "thread.settle"
-                      ? "Thread settled."
-                      : command.type === "thread.metadata.update"
-                        ? "Workspace changed."
-                        : command.type === "thread.runtime-mode.set"
-                          ? "Runtime mode changed."
-                          : "Provider or model selection changed.",
+                    : command.type === "thread.metadata.update"
+                      ? "Workspace changed."
+                      : command.type === "thread.runtime-mode.set"
+                        ? "Runtime mode changed."
+                        : "Provider or model selection changed.",
                 // Terminal detaches revoke MCP credentials; reattachments need other detach reasons to preserve them.
                 ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
               },
@@ -5984,7 +5968,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         Date.parse(recovery.resetAt) > DateTime.toEpochMillis(now) ||
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
-        projection.thread.settledOverride === "settled" ||
         projection.thread.providerInstanceId !== run.providerInstanceId ||
         projection.runtimeRequests.some((request) => request.status === "pending") ||
         (projection.thread.snoozedUntil != null &&
@@ -10445,8 +10428,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const dispatchQueuedRunCancel = Effect.fn("Orchestrator.dispatchQueuedRunCancel")(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "queued-run.cancel" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
-    // Settling disposes a cancelled wake's whole cohort, so a sibling's late result cannot unsettle it.
-    disposes: "wake" | "cohort" = "wake",
   ) {
     const projection = yield* loadProjectionForCommand(
       command,
@@ -10474,9 +10455,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         disposition: "disposed",
         now,
         cancelQueuedDelivery: false,
-        ...(disposes === "wake"
-          ? { interruptedWakeTaskIds: queuedMessage.delegatedCompletion.taskIds }
-          : {}),
+        interruptedWakeTaskIds: queuedMessage.delegatedCompletion.taskIds,
       });
     }
     yield* emitQueuedRunCancellation({ command, events, projection, run: queuedRun, now });

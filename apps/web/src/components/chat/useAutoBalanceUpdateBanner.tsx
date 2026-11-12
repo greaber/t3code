@@ -13,6 +13,7 @@ import {
   isVersionMismatchDismissed,
   resolveServerConfigVersionMismatch,
   resolveServerSelfUpdateCapability,
+  sshRestartVersion,
   supportsDesktopAppUpdate,
 } from "~/versionSkew";
 import {
@@ -55,6 +56,8 @@ export function useAutoBalanceUpdateBanner(
       return [];
     const selfUpdate = resolveServerSelfUpdateCapability(environment.serverConfig);
     const desktopAppUpdate = supportsDesktopAppUpdate(environment.serverConfig);
+    const targetVersion = state.status === "idle" ? mismatch!.clientVersion : state.targetVersion;
+    const restartSshServer = sshRestartVersion(environment) === targetVersion;
     return [
       {
         environmentId: environment.environmentId,
@@ -62,9 +65,12 @@ export function useAutoBalanceUpdateBanner(
         selfUpdate,
         installation: environment.serverConfig?.environment.capabilities.serverInstallation,
         desktopAppUpdate,
-        targetVersion: state.status === "idle" ? mismatch!.clientVersion : state.targetVersion,
+        targetVersion,
+        restartSshServer,
         connected: environment.connection.phase === "connected",
-        remoteUpdate: selfUpdate !== null && (selfUpdate !== "desktop-managed" || desktopAppUpdate),
+        remoteUpdate:
+          restartSshServer ||
+          (selfUpdate !== null && (selfUpdate !== "desktop-managed" || desktopAppUpdate)),
         state,
         dismissKey,
       },

@@ -169,8 +169,7 @@ function heldForLimitRecovery(
     thread.status !== "failed" ||
     thread.lastErrorClass !== "usage_limit" ||
     !thread.usageLimitResetAt ||
-    thread.archivedAt !== null ||
-    thread.settledOverride === "settled"
+    thread.archivedAt !== null
   )
     return false;
   const resetMs = Date.parse(thread.usageLimitResetAt);
@@ -328,10 +327,10 @@ const make = Effect.gen(function* () {
       !path.isAbsolute(relative)
     );
   };
-  const hasTerminal = (worktreePath: string) =>
+  const terminalsAt = (worktreePath: string) =>
     [...liveTerminals.values()]
       .flatMap((entries) => [...entries.values()])
-      .some((terminal) => {
+      .filter((terminal) => {
         if (terminal.status !== "starting" && terminal.status !== "running") return false;
         const cwd = path.resolve(terminal.cwd);
         return (
@@ -341,6 +340,15 @@ const make = Effect.gen(function* () {
           inside(worktreePath, cwd)
         );
       });
+  // A shell waiting at its prompt does not hold the worktree; removal closes it first.
+  const hasTerminal = (worktreePath: string) =>
+    terminalsAt(worktreePath).some(
+      (terminal) => terminal.status === "starting" || terminal.hasRunningSubprocess,
+    );
+  const closeIdleTerminals = (worktreePath: string) =>
+    Effect.forEach(terminalsAt(worktreePath), (terminal) =>
+      terminals.closeIdle({ threadId: terminal.threadId, terminalId: terminal.terminalId }),
+    ).pipe(Effect.map((closed) => closed.every(Boolean)));
 
   // pnpm imports packages by clone or reflink when its store shares a device
   // with the worktree. Those files have one link but share blocks with the
@@ -1206,6 +1214,8 @@ const make = Effect.gen(function* () {
               )
             )
               return keep("settings changed since check");
+            if (!(yield* closeIdleTerminals(worktreePath)))
+              return keep(waitForStop("open terminal"));
             // Clean only untracked files. Ordinary worktrees retain Git's final tracked-edit check.
             if (settings.worktreeKeepWhen === "tracked-changes")
               yield* cleanupGit(worktreePath, ["clean", "-ffdx"], "git clean");

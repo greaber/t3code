@@ -1,6 +1,7 @@
 import type {
   EnvironmentId,
   TerminalAttachStreamEvent,
+  TerminalHistoryPage,
   TerminalMetadataStreamEvent,
   TerminalSessionSnapshot,
   TerminalSummary,
@@ -8,13 +9,18 @@ import type {
 } from "@t3tools/contracts";
 import { DEFAULT_MAX_TERMINAL_BUFFER_BYTES } from "@t3tools/contracts";
 import {
+  appendNewerOutput,
   appendOutput,
   EMPTY_TERMINAL_OUTPUT_STATE,
+  prependOutput,
   resetOutput,
+  showLatestOutput,
   type TerminalOutputState,
 } from "./terminalOutput.ts";
 
 export {
+  canLoadNewerTerminalOutput,
+  canLoadOlderTerminalOutput,
   INITIAL_TERMINAL_OUTPUT_CURSOR,
   readTerminalOutputUpdate,
   terminalOutputText,
@@ -113,7 +119,20 @@ function terminalBufferStateFromSnapshot(
   current: TerminalBufferState = EMPTY_TERMINAL_BUFFER_STATE,
 ): TerminalBufferState {
   return {
-    output: resetOutput(current.output, snapshot.history, maxBufferBytes),
+    output: resetOutput(
+      current.output,
+      snapshot.history,
+      maxBufferBytes,
+      snapshot.historyOffset === undefined || snapshot.historyEnd === undefined
+        ? undefined
+        : {
+            offset: snapshot.historyOffset,
+            end: snapshot.historyEnd,
+            older: snapshot.olderHistory ?? false,
+          },
+      // The output must fit the rows of views drawing this grid.
+      nextGrid(current.grid, snapshot)?.cols,
+    ),
     grid: nextGrid(current.grid, snapshot),
     status: snapshot.status,
     error: null,
@@ -156,12 +175,33 @@ export function combineTerminalSessionState(
   };
 }
 
+/** A page of output the client asked for, applied in order with the stream's events. */
+export interface TerminalHistoryPageEvent {
+  /** Older output before what is held, newer output after it, or the newest output. */
+  readonly type: "olderHistory" | "newerHistory" | "latestHistory";
+  readonly page: TerminalHistoryPage;
+}
+
 export function applyTerminalAttachStreamEvent(
   current: TerminalBufferState,
-  event: TerminalAttachStreamEvent,
+  event: TerminalAttachStreamEvent | TerminalHistoryPageEvent,
   maxBufferBytes = DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
 ): TerminalBufferState {
   switch (event.type) {
+    case "olderHistory":
+    case "newerHistory":
+    case "latestHistory": {
+      const apply =
+        event.type === "olderHistory"
+          ? prependOutput
+          : event.type === "newerHistory"
+            ? appendNewerOutput
+            : showLatestOutput;
+      const output = apply(current.output, event.page, maxBufferBytes, current.grid?.cols);
+      return output === current.output
+        ? current
+        : { ...current, output, version: current.version + 1 };
+    }
     case "snapshot": {
       if (current.version === 0) {
         return terminalBufferStateFromSnapshot(event.snapshot, maxBufferBytes, current);
@@ -185,7 +225,13 @@ export function applyTerminalAttachStreamEvent(
     case "output":
       return {
         ...current,
-        output: appendOutput(current.output, event.data, maxBufferBytes),
+        output: appendOutput(
+          current.output,
+          event.data,
+          maxBufferBytes,
+          event.historyEnd,
+          current.grid?.cols,
+        ),
         status: current.status === "closed" ? "running" : current.status,
         error: null,
         version: current.version + 1,

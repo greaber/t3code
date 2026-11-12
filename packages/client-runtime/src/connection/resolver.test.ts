@@ -310,6 +310,7 @@ describe("ConnectionResolver", () => {
                 httpBaseUrl: "http://127.0.0.1:4010",
                 wsBaseUrl: "ws://127.0.0.1:4010",
                 pairingToken: null,
+                remoteServerKind: "managed",
               },
               bearerToken: "ssh-bearer",
             }),
@@ -337,7 +338,11 @@ describe("ConnectionResolver", () => {
           expect(calls).toEqual(["revoke"]);
         } else {
           expect((yield* prepare).socketUrl).toContain("wsTicket=ssh");
-          expect(savedProfile).toMatchObject({ target: preparedTarget });
+          // The Update action restarts only servers this app started.
+          expect(savedProfile).toMatchObject({
+            target: preparedTarget,
+            remoteServerKind: "managed",
+          });
           expect(calls).toEqual(
             scenario === "unchanged"
               ? ["profile", "authorize"]

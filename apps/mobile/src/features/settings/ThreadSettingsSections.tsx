@@ -148,7 +148,7 @@ export function AutoSettleSettingsRows(props: {
       <SettingsSection title="Auto-settle">
         <SettingsSwitchRow
           icon="arrow.triangle.branch"
-          label="Auto-settle merged threads"
+          label="Auto-settle when a pull request merges or closes"
           value={referenceSettings.sidebarAutoSettleOnMerge}
           disabled={disabledFor("sidebarAutoSettleOnMerge")}
           onValueChange={(value) => writeToAll({ sidebarAutoSettleOnMerge: value })}

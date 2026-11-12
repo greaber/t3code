@@ -2169,6 +2169,13 @@ export const layerWsRpc = (
                         message: cause.message,
                         cause,
                       }),
+                    ProviderInputTooLongError: (cause) =>
+                      new OrchestrationV2ThreadLaunchError({
+                        commandId: input.commandId,
+                        projectId: input.projectId,
+                        message: cause.message,
+                        cause,
+                      }),
                     ThreadLaunchError: (cause) =>
                       new OrchestrationV2ThreadLaunchError({
                         commandId: input.commandId,
@@ -3090,6 +3097,7 @@ export const layerWsRpc = (
         [WS_METHODS.terminalResize]: (input, metadata) =>
           terminalManager.resize(input, terminalViewerId(metadata)),
         [WS_METHODS.terminalClear]: (input) => terminalManager.clear(input),
+        [WS_METHODS.terminalHistory]: (input) => terminalManager.historyPage(input),
         [WS_METHODS.terminalClose]: (input) => terminalManager.close(input),
         [WS_METHODS.terminalObserve]: (input) =>
           terminalOutputStream(

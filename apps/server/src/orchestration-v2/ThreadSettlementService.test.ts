@@ -369,14 +369,15 @@ describe("resolveAutoSettlementAt", () => {
         pullRequest: { state: "merged", mergedAt: DateTime.formatIso(at(-3 * 60 * 60 * 1_000)) },
       }),
     ).toBeNull();
+    const closed = {
+      ...input,
+      thread: shell(),
+      pullRequest: { state: "closed" as const, closedAt: DateTime.formatIso(at(-1)) },
+    };
+    expect(ThreadSettlementService.resolveAutoSettlementAt(closed)).toEqual(shell().createdAt);
     expect(
-      ThreadSettlementService.resolveAutoSettlementAt({
-        ...input,
-        thread: shell(),
-        pullRequest: { state: "closed", closedAt: DateTime.formatIso(at(-1)) },
-        autoSettleOnMerge: false,
-      }),
-    ).toEqual(shell().createdAt);
+      ThreadSettlementService.resolveAutoSettlementAt({ ...closed, autoSettleOnMerge: false }),
+    ).toBeNull();
   });
 
   it("settles on merge after agent-started runs, but not after the user writes again", () => {
@@ -562,8 +563,17 @@ interface HarnessOptions {
     input: ProjectSetupScriptRunner.ProjectSetupScriptRunnerInput,
   ) => Effect.Effect<void>;
   readonly onCloseIdle?: () => Effect.Effect<void>;
-  readonly currentThreads?: ReadonlyArray<OrchestrationV2AppThread>;
+  readonly currentThreads?: ReadonlyArray<
+    OrchestrationV2AppThread & Partial<Pick<OrchestrationV2ThreadShell, "status" | "activeRunId">>
+  >;
 }
+
+// Auto-settlement is off by default; these tests exercise the rules with both turned on.
+const ENABLED_SETTINGS: ContractServerSettings = {
+  ...DEFAULT_SERVER_SETTINGS,
+  sidebarAutoSettleOnMerge: true,
+  sidebarAutoSettleAfterDays: 7,
+};
 
 const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options: HarnessOptions) {
   const activation = yield* Deferred.make<void>();
@@ -571,7 +581,7 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
   const snapshotReadCount = yield* Ref.make(0);
   const snapshotReads = yield* Queue.unbounded<number>();
   const candidateReads = yield* Ref.make<ReadonlyArray<string | undefined>>([]);
-  const settings = yield* Ref.make(options.settings ?? DEFAULT_SERVER_SETTINGS);
+  const settings = yield* Ref.make(options.settings ?? ENABLED_SETTINGS);
   const settingsReadCount = yield* Ref.make(0);
   const settingsChanges = yield* PubSub.unbounded<ContractServerSettings>();
   const mergedPullRequests = yield* PubSub.unbounded<PullRequestService.PullRequestMergeEvent>();
@@ -670,10 +680,16 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
               : snapshot.threads.filter((thread) => thread.id === threadId),
           ),
         ),
-      getThread: (threadId) => {
+      getThreadShell: (threadId) => {
         const thread = options.currentThreads?.find((candidate) => candidate.id === threadId);
         return thread
-          ? Effect.succeed(thread)
+          ? Effect.succeed({
+              status: "idle",
+              activeRunId: null,
+              activityRunStatus: null,
+              pendingBackgroundTasks: [],
+              ...thread,
+            } as unknown as OrchestrationV2ThreadShell)
           : Effect.die(new Error(`Unexpected thread read: ${threadId}`));
       },
     }),
@@ -774,7 +790,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
         );
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot(threads),
-          settings: { ...DEFAULT_SERVER_SETTINGS, sidebarAutoSettleAfterDays: 3 },
+          settings: { ...ENABLED_SETTINGS, sidebarAutoSettleAfterDays: 3 },
         });
         yield* Effect.gen(function* () {
           const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
@@ -822,7 +838,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
         });
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([thread]),
-          settings: { ...DEFAULT_SERVER_SETTINGS, sidebarAutoSettleAfterDays: null },
+          settings: { ...ENABLED_SETTINGS, sidebarAutoSettleAfterDays: null },
         });
 
         yield* Effect.gen(function* () {
@@ -898,7 +914,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
         let disable: Effect.Effect<unknown> = Effect.void;
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot(threads),
-          settings: { ...DEFAULT_SERVER_SETTINGS, sidebarAutoSettleAfterDays: 3 },
+          settings: { ...ENABLED_SETTINGS, sidebarAutoSettleAfterDays: 3 },
           onDispatch: () => disable,
         });
         disable = fixture.updateSettings({ sidebarAutoSettleAfterDays: null });
@@ -1456,21 +1472,28 @@ describe("ThreadSettlementServiceV2 terminals", () => {
     payload: thread,
   });
 
-  it.effect("keeps the terminals of a thread re-engaged before the event ran", () =>
+  it.effect("keeps the terminals of a thread re-engaged or busy before the event ran", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const settled = appThread("reengaged-thread", "settled");
         const reengaged = appThread("reengaged-thread", "active");
+        // Still settled, but its agent already started a turn, e.g. for a background result.
+        const busy = appThread("busy-thread", "settled");
         const marker = appThread("marker-thread", "settled");
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([]),
-          currentThreads: [reengaged, marker],
+          currentThreads: [
+            reengaged,
+            { ...busy, status: "running", activeRunId: RunId.make("busy-run") },
+            marker,
+          ],
         });
 
         yield* Effect.gen(function* () {
           const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
           yield* startHarness(service, fixture.activation, fixture.snapshotReads);
           yield* fixture.publishEvent(settledEvent(settled));
+          yield* fixture.publishEvent(settledEvent(busy));
           yield* fixture.publishEvent(settledEvent(marker));
           assert.deepStrictEqual(yield* Queue.take(fixture.closedIdle), { threadId: marker.id });
         }).pipe(Effect.provide(fixture.layer));

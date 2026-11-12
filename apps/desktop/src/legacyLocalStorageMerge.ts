@@ -10,8 +10,6 @@ const NOT_IMPORTED_KEYS = new Set([
   "t3.backgroundActivity.clientId",
   "t3code:snap-shot-setup-resume:v1",
 ]);
-/** Matches MAX_STASH_ENTRIES in apps/web/src/promptStashStore.ts. */
-const MAX_STASH_ENTRIES = 20;
 const DRAFT_RECORD_FIELDS = [
   "draftsByThreadKey",
   "draftThreadsByThreadKey",
@@ -42,7 +40,7 @@ function mergePromptStash(current: JsonObject, legacy: JsonObject): JsonObject |
   const state = isObject(current.state) ? current.state : {};
   return {
     ...current,
-    state: { ...state, entries: [...currentEntries, ...added].slice(0, MAX_STASH_ENTRIES) },
+    state: { ...state, entries: [...currentEntries, ...added] },
   };
 }
 

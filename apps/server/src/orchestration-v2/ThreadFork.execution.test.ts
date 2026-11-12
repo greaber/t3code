@@ -30,6 +30,7 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { MAX_HANDOFF_TOKEN_CAP } from "@t3tools/provider-core/server/handoffBudget";
 
 const forkCases = (
   [
@@ -558,7 +559,7 @@ it.effect.each([
               contextHandoffId: null,
             },
           },
-          // Each message alone exceeds the default 16k handoff budget, so a
+          // Each message alone exceeds the largest handoff budget, so a
           // portable handoff omits both whole items.
           {
             id: EventId.make("fork-compact-user-item"),
@@ -575,7 +576,7 @@ it.effect.each([
               creationSource: "web",
               inputIntent: "turn_start",
               messageId: userMessageId,
-              text: "u".repeat(17_000),
+              text: "u".repeat(MAX_HANDOFF_TOKEN_CAP),
               attachments: [],
             },
           },
@@ -591,7 +592,7 @@ it.effect.each([
               ordinal: 2,
               type: "assistant_message",
               messageId: MessageId.make("fork-compact-assistant-message"),
-              text: "a".repeat(17_000),
+              text: "a".repeat(MAX_HANDOFF_TOKEN_CAP),
               streaming: false,
             },
           },

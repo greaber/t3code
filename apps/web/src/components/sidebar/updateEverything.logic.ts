@@ -27,6 +27,8 @@ export interface UpdateEverythingMachine {
   } | null;
   readonly connected: boolean;
   readonly hostedByThisApp: boolean;
+  /** Set when this app started the server over SSH: the version restarting it starts. */
+  readonly sshRestartVersion?: string | null;
   readonly canMaintain: boolean;
   readonly updateState: ServerUpdateState;
 }
@@ -104,6 +106,22 @@ export function collectServerUpdateTargets(
       continue;
     }
     const desktopAppUpdate = supportsDesktopAppUpdate(config);
+    if (selfUpdate === null && machine.sshRestartVersion != null) {
+      // The restart starts this app's own version, so a pending app update comes first.
+      if (machine.sshRestartVersion !== targetVersion) {
+        skip("updates after this app restarts");
+        continue;
+      }
+      targets.push({
+        environmentId: machine.environmentId,
+        serverLabel: machine.label,
+        selfUpdate,
+        desktopAppUpdate,
+        targetVersion,
+        restartSshServer: true,
+      });
+      continue;
+    }
     if (selfUpdate === null) {
       skip("needs a manual update");
       continue;

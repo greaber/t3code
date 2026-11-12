@@ -788,6 +788,8 @@ const make = Effect.gen(function* () {
     let legacyProviders: Readonly<Record<string, unknown>> | undefined;
     let legacySourceControl: Parameters<typeof migrateLegacySourceControlSettings>[1] = {};
     let parseFailure = Option.none<unknown>();
+    // Whether the file records an idle compaction choice, in either field.
+    let savedIdleCompaction = false;
 
     if (yield* readConfigExists) {
       const raw = yield* readRawConfig;
@@ -817,12 +819,22 @@ const make = Effect.gen(function* () {
         }
       } else {
         settings = decoded.value;
+        const file: unknown = parsed._tag === "Success" ? parsed.value : undefined;
+        savedIdleCompaction =
+          typeof file === "object" &&
+          file !== null &&
+          ("idleCompaction" in file || "compactIdleThreads" in file);
       }
     }
-    // Settings saved by a server that kept the mode in `compactIdleThreads` move
-    // it to `idleCompaction`, so that switch goes to clients as a boolean. The
-    // defaults gain the field too, which tells clients this server reads modes.
-    settings = withIdleCompaction(settings, globalIdleCompaction(settings));
+    // Move a legacy `compactIdleThreads` mode to `idleCompaction` (clients read the
+    // switch as a boolean). The field's presence tells clients this server reads modes.
+    // Without a saved or policy choice, never compact idle threads.
+    settings = withIdleCompaction(
+      settings,
+      savedIdleCompaction || settings.idleCompaction !== undefined
+        ? globalIdleCompaction(settings)
+        : "off",
+    );
 
     // A file that failed to decode must stay on disk for the user to repair.
     const settingsFileTrusted = Option.isNone(parseFailure);

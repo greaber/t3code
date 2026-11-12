@@ -215,7 +215,7 @@ describe("SettingsServerControlsRouteScreen", () => {
       )!;
 
     act(() => toggle("Agent browser access").click());
-    act(() => toggle("Auto-settle merged threads").click());
+    act(() => toggle("Auto-settle when a pull request merges or closes").click());
 
     // Both rewrite the whole project override, so a second write planned now would drop the first.
     expect(mocks.updateSettings).toHaveBeenCalledOnce();
@@ -231,7 +231,7 @@ describe("SettingsServerControlsRouteScreen", () => {
     act(() => root.render(<SettingsThreadsRouteScreen />));
 
     const autoSettle = [...container.querySelectorAll<HTMLButtonElement>('[role="switch"]')].find(
-      (button) => button.textContent === "Auto-settle merged threads",
+      (button) => button.textContent === "Auto-settle when a pull request merges or closes",
     )!;
     expect(autoSettle.disabled).toBe(true);
   });

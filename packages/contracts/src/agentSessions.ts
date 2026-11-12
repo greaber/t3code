@@ -72,9 +72,56 @@ export class AgentSessionImportProjectChangedError extends Schema.TaggedError<Ag
   }
 }
 
+export const AgentSessionImportSkipReason = Schema.Literals([
+  /** Over the per-file size, the kept-history memory budget, or the record count. */
+  "too_large",
+  /** This import reached its total read budget; importing again continues. */
+  "import_limit",
+  "changed_while_reading",
+  "unreadable",
+  "outside_project",
+  "no_conversation",
+  "unresumable",
+  "import_failed",
+]);
+export type AgentSessionImportSkipReason = typeof AgentSessionImportSkipReason.Type;
+
+export const AGENT_SESSION_IMPORT_SKIPPED_EXAMPLES = 50;
+
+/** Skipped transcripts with one reason: the full count and up to 50 of their paths. */
+export const AgentSessionImportSkippedGroup = Schema.Struct({
+  reason: AgentSessionImportSkipReason,
+  count: NonNegativeInt,
+  examples: Schema.Array(
+    Schema.Struct({ provider: AgentSessionSource, filePath: TrimmedNonEmptyString }),
+  ),
+});
+export type AgentSessionImportSkippedGroup = typeof AgentSessionImportSkippedGroup.Type;
+
+/** Merges groups by reason, summing counts and keeping the first 50 example paths. */
+export function mergeSkippedImportGroups(
+  groups: ReadonlyArray<AgentSessionImportSkippedGroup>,
+): Array<AgentSessionImportSkippedGroup> {
+  const merged = new Map<AgentSessionImportSkipReason, AgentSessionImportSkippedGroup>();
+  for (const group of groups) {
+    const previous = merged.get(group.reason);
+    merged.set(group.reason, {
+      reason: group.reason,
+      count: (previous?.count ?? 0) + group.count,
+      examples: [...(previous?.examples ?? []), ...group.examples].slice(
+        0,
+        AGENT_SESSION_IMPORT_SKIPPED_EXAMPLES,
+      ),
+    });
+  }
+  return Array.from(merged.values());
+}
+
 export const AgentSessionImportResult = Schema.Struct({
   importedCount: NonNegativeInt,
   skippedCount: NonNegativeInt,
+  /** Older servers omit it. */
+  skipped: Schema.optional(Schema.Array(AgentSessionImportSkippedGroup)),
 });
 export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
 

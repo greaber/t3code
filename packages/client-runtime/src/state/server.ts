@@ -83,6 +83,8 @@ export type ServerUpdateState =
 export interface ServerUpdateTarget {
   readonly environmentId: EnvironmentId;
   readonly input: EnvironmentRpcInput<typeof WS_METHODS.serverUpdateServer>;
+  /** This desktop app started the server over SSH; a restart starts the app's own version. */
+  readonly restartSshServer?: boolean;
 }
 
 const IDLE_SERVER_UPDATE_STATE: ServerUpdateState = { status: "idle" };
@@ -152,6 +154,23 @@ export function matchesServerUpdateResumeEvent(
     (result.method === "desktop-app" && result.desktopUpdateToken !== undefined) ||
     matchesServerUpdateReadyEvent(result, event)
   );
+}
+
+/** A server this app did not start survives the SSH restart on its old version. */
+function validateSshRestartReadyEvent(
+  targetVersion: string,
+  event: ServerLifecycleStreamReadyEvent,
+): Effect.Effect<void, ServerUpdateTerminalError> {
+  const serverVersion = event.payload.environment.serverVersion;
+  return serverVersion === targetVersion
+    ? Effect.void
+    : Effect.fail(
+        new ServerUpdateTerminalError({
+          targetVersion,
+          status: "failed",
+          reason: `The server is still on t3@${serverVersion} because this app did not start it. Update it on that machine.`,
+        }),
+      );
 }
 
 export function validateServerUpdateReadyEvent(
@@ -886,6 +905,18 @@ export function createServerEnvironmentAtoms<R, E>(
               targetVersion,
             });
 
+            if (target.restartSshServer === true) {
+              currentStage = "resuming";
+              atomRegistry.set(stateAtom, {
+                status: "running",
+                stage: currentStage,
+                fromVersion,
+                targetVersion,
+              });
+              yield* environmentRegistry.restartSshServer(target.environmentId);
+              return { targetVersion, method: "respawn" } satisfies ServerSelfUpdateResult;
+            }
+
             const supportsProgress =
               currentConfig?.environment.capabilities.serverSelfUpdateProgress === true;
             const updateResult: ServerSelfUpdateResult = supportsProgress
@@ -1014,7 +1045,9 @@ export function createServerEnvironmentAtoms<R, E>(
           .pipe(
             Stream.filter(
               (event): event is ServerLifecycleStreamReadyEvent =>
-                event.type === "ready" && matchesServerUpdateResumeEvent(result, event),
+                event.type === "ready" &&
+                // The stopped server sends nothing more, so the first ready names the restart's version.
+                (target.restartSshServer === true || matchesServerUpdateResumeEvent(result, event)),
             ),
             Stream.runHead,
             Effect.timeoutOption(SERVER_UPDATE_RESUME_TIMEOUT),
@@ -1051,7 +1084,9 @@ export function createServerEnvironmentAtoms<R, E>(
                 ),
               )
             : yield* nextReady;
-        yield* validateServerUpdateReadyEvent(result, resumed);
+        yield* target.restartSshServer === true
+          ? validateSshRestartReadyEvent(targetVersion, resumed)
+          : validateServerUpdateReadyEvent(result, resumed);
 
         atomRegistry.set(stateAtom, IDLE_SERVER_UPDATE_STATE);
         return result;

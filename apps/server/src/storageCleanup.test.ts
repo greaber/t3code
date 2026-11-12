@@ -195,7 +195,7 @@ describe("V2 storage cleanup eligibility", () => {
       autoResume: true,
       settled: true,
       resetIn: -1_000,
-      idle: true,
+      idle: false,
     },
     { name: "not yet armed by the recovery worker", armed: false, resetIn: DAY_MS, idle: false },
     {
@@ -354,6 +354,7 @@ const cleanupFixture = (
     let gitInspections = 0;
     let snapshotReads = 0;
     let terminalListener: ((event: TerminalMetadataStreamEvent) => Effect.Effect<void>) | undefined;
+    const closedIdleTerminals: Array<{ threadId: string; terminalId?: string }> = [];
     let events: Stream.Stream<OrchestrationV2DomainEvent> = Stream.empty;
     const activated = yield* Deferred.make<void>();
     const context = yield* Layer.build(StorageCleanup.layer).pipe(
@@ -473,6 +474,11 @@ const cleanupFixture = (
             terminalListener = listener;
             return () => {};
           }),
+        closeIdle: (input: { threadId: string; terminalId?: string }) =>
+          Effect.suspend(() => {
+            closedIdleTerminals.push(input);
+            return terminalListener?.({ type: "remove", ...input } as never) ?? Effect.void;
+          }).pipe(Effect.as(true)),
       } as unknown as TerminalManager.TerminalManager["Service"]),
       Effect.provideService(ServerActivation, Deferred.await(activated)),
     );
@@ -541,7 +547,11 @@ const cleanupFixture = (
       setOpenSessionCwd: (cwd: string | null) => {
         openSessionCwd = cwd;
       },
-      openTerminal: (paths: { cwd: string; worktreePath: string | null }) =>
+      closedIdleTerminals: () => closedIdleTerminals,
+      openTerminal: (
+        paths: { cwd: string; worktreePath: string | null },
+        hasRunningSubprocess = true,
+      ) =>
         terminalListener?.({
           type: "upsert",
           terminal: {
@@ -551,7 +561,7 @@ const cleanupFixture = (
             pid: 1,
             exitCode: null,
             exitSignal: null,
-            hasRunningSubprocess: false,
+            hasRunningSubprocess,
             label: "Terminal",
             updatedAt: "2026-06-10T12:00:00.000Z",
             ...paths,
@@ -1346,7 +1356,7 @@ describe("deleted thread worktrees", () => {
             pid: 1,
             exitCode: null,
             exitSignal: null,
-            hasRunningSubprocess: false,
+            hasRunningSubprocess: true,
             label: "Terminal",
             updatedAt: DateTime.formatIso(at(0)),
           },
@@ -1949,6 +1959,20 @@ describe("orphan worktree reports", () => {
           );
         }),
       ),
+  );
+
+  it.live("closes a shell idle at its prompt when it removes the worktree", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture();
+        yield* fixture.openTerminal({ cwd: fixture.worktree, worktreePath: null }, false);
+        const report = yield* fixture.service.runNow;
+        expect(report.entries[0]).toMatchObject({ outcome: "removed" });
+        expect(fixture.closedIdleTerminals()).toEqual([
+          { threadId: "thread-1", terminalId: "terminal-1" },
+        ]);
+      }),
+    ),
   );
 
   it.live.each(["win32", "linux"] as const)(

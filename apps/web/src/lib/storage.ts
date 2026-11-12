@@ -42,15 +42,37 @@ export function resolveStorage(storage: Partial<StateStorage> | null | undefined
   return isStateStorage(storage) ? storage : createMemoryStorage();
 }
 
+/** Browsers name a full quota differently; Firefox used NS_ERROR_DOM_QUOTA_REACHED. */
+export function isStorageQuotaError(error: unknown): boolean {
+  return (
+    error instanceof DOMException &&
+    (error.name === "QuotaExceededError" || error.name === "NS_ERROR_DOM_QUOTA_REACHED")
+  );
+}
+
+export interface DeferredStorageWriteObserver {
+  /** A debounced write threw; the previous saved value is still in storage. */
+  readonly onWriteError: (error: unknown) => void;
+  readonly onWriteSuccess: () => void;
+}
+
 export function createDeferredStorage<TValue>(
   baseStorage: Partial<StateStorage> | null | undefined,
   serialize: (value: TValue) => string,
   debounceMs: number = 300,
+  observer?: DeferredStorageWriteObserver,
 ): DeferredStorage<TValue> {
   const resolvedStorage = resolveStorage(baseStorage);
   const debouncedSetItem = new Debouncer(
     (name: string, value: TValue) => {
-      resolvedStorage.setItem(name, serialize(value));
+      try {
+        resolvedStorage.setItem(name, serialize(value));
+      } catch (error) {
+        if (observer === undefined) throw error;
+        observer.onWriteError(error);
+        return;
+      }
+      observer?.onWriteSuccess();
     },
     { wait: debounceMs },
   );

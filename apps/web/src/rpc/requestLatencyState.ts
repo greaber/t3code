@@ -35,6 +35,8 @@ const untrackedRpcAckMethods = new Set<string>([
   WS_METHODS.sourceControlSignInWait,
 ]);
 const longRunningRpcAckMethods = new Set<string>([
+  // One request imports a whole project's history; the Welcome page shows it is busy.
+  WS_METHODS.agentSessionsImport,
   WS_METHODS.serverUpdateProvider,
   WS_METHODS.serverRefreshProviders,
   WS_METHODS.serverUpdateServer,

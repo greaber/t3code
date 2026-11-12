@@ -2,7 +2,7 @@ package expo.modules.t3terminal
 
 import java.util.ArrayDeque
 
-private const val REPLAY_LIMIT = 512 * 1024
+private const val REPLAY_LIMIT = 4 * 1024 * 1024
 private const val REPLAY_CHUNK_SIZE = 16 * 1024
 
 // Keep only replay history for intentional terminal recreation.

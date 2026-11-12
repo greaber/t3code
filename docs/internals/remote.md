@@ -168,10 +168,13 @@ every route. See [environment authentication](./environment-auth.md) and the
 SSH can launch a server as well as forward a port. Desktop main owns that
 lifecycle because it can spawn SSH and handle authentication prompts. The
 renderer uses the forwarded endpoint through the shared connection runtime.
-[SSH cleanup](../../packages/ssh/src/tunnel.ts) stops a remote server only if the
-launcher owns it; a server it discovered already running must survive a client
-disconnect. Reconnection restores the forward before opening the application
-transport.
+[SSH cleanup](../../packages/ssh/src/tunnel.ts) stops a remote server only on an
+explicit disconnect (removing or switching off the environment, or updating it)
+and only if the launcher owns it; a server it discovered already running must
+survive a client disconnect. Quitting the app or reconnecting with a newer
+runner never stops a server, since agent turns may be running there; an update
+stops it and the next connect starts the client's version. Reconnection restores
+the forward before opening the application transport.
 
 Remote servers can outlive several client releases. Clients must use advertised
 capabilities and handle their absence, rather than assume their own version

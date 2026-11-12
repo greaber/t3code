@@ -248,7 +248,12 @@ export const provisionDesktopSshEnvironment = Effect.fn(
       }
       return new ConnectionBlockedError({
         reason: "configuration",
-        detail: `${descriptor.label} runs T3 Code ${descriptor.serverVersion}, but this desktop is ${APP_VERSION}, and that server could not accept its pairing. Restart the T3 server on ${descriptor.label} so it runs ${APP_VERSION}, then retry.`,
+        detail: `${descriptor.label} runs T3 Code ${descriptor.serverVersion}, but this desktop is ${APP_VERSION}, and that server could not accept its pairing. ${
+          bootstrap.remoteServerKind === "managed"
+            ? // Without a session the Update button is unavailable; switching off stops the server.
+              `Switch ${descriptor.label} off and on in Settings → Connections to restart it on ${APP_VERSION}.`
+            : `Restart the T3 server on ${descriptor.label} so it runs ${APP_VERSION}, then retry.`
+        }`,
       });
     },
   });

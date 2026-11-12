@@ -81,30 +81,29 @@ offered.
 A large or malformed history can reach the scan limit. T3 Code keeps the
 projects it found and warns when projects or conversations may be missing.
 
-Imported projects include Claude, Codex and Pi conversations active within the last
-30 days. You can continue those conversations in T3 Code. Pi is off by default:
+Imported projects include all of their Claude, Codex and Pi conversations. You can
+continue those conversations in T3 Code. Pi is off by default:
 open **Add more agents** and select **Turn on** next to Pi, and the page looks for
 its sessions too. Pi sessions
 are read from each enabled Pi provider's session directory, which follows
 `PI_CODING_AGENT_SESSION_DIR` and `PI_CODING_AGENT_DIR` in its environment. A
 Pi conversation imports its active branch, the one Pi reopens.
 
-Conversation import is best effort. T3 Code keeps the first user prompt and the
-newest remaining visible user and assistant messages, with 200 messages total.
-It omits tool activity and attachments. For Codex, it omits generated setup
-context only when a canonical user event and a valid shared turn ID identify the
-same user turn. Ambiguous legacy or response-only context stays in the imported
-conversation so T3 Code does not remove user text. It reads one conversation at
-a time and skips files larger than 4 GiB. It also skips a conversation when the
-message text and metadata it keeps need more than 32 MiB of memory. Tool output
-does not count toward that limit. It skips a conversation with more than 100,000
-records every time, so opening the page again does not import it. It ignores
-malformed records and skips unreadable or unparseable conversations.
+Conversation import is best effort. T3 Code imports every visible user and
+assistant message. It omits tool activity and attachments. For Codex, it omits
+generated setup context only when a canonical user event and a valid shared turn
+ID identify the same user turn. Ambiguous legacy or response-only context stays
+in the imported conversation so T3 Code does not remove user text. It reads one
+conversation at a time and ignores malformed records.
 
-Each import attempt reads up to 100 conversation files and 4 GiB per project. To
-continue a large batch, open the Welcome page again and pick the project in
-**Review all**. Completed conversations are not imported again. You can continue
-without the remaining history.
+Some conversations are skipped: files larger than 4 GiB, conversations whose
+message text and metadata need more than 128 MiB of memory (tool output does not
+count), conversations with more than 10 million records, unreadable files, and
+sessions with no user messages. Each import attempt reads up to 4 GiB per
+project; open the Welcome page again and pick the project in **Review all** to
+continue past that. Completed conversations are not imported again. When anything
+is skipped, the warning after setup groups the files by reason, with up to 50
+paths per reason. Sessions with no user messages never count against a project.
 
 You can start without importing. While an import runs, T3 Code stays on the
 Welcome page. If you quit, open the Welcome page again from **Settings → About**; the

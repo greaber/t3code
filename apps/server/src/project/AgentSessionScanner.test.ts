@@ -62,6 +62,9 @@ interface ScannerTestInput {
   readonly processRunner?: Layer.Layer<ProcessRunner.ProcessRunner>;
 }
 
+// The real limit is 10M records; the same boundaries hold at a fixture-sized one.
+const TEST_RECORD_LIMIT = 100_000;
+
 const layerScannerTest = (input: ScannerTestInput) =>
   (input.processRunner === undefined
     ? AgentSessionScanner.layer
@@ -103,6 +106,7 @@ const layerScannerTest = (input: ScannerTestInput) =>
           input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
         ),
         layerProjectStore(input.importedWorkspaceRoots ?? []),
+        Layer.succeed(AgentSessionScanner.ImportRecordLimit, TEST_RECORD_LIMIT),
       ),
     ),
   );
@@ -170,7 +174,7 @@ function makeRecordLimitTranscript(cwd: string, overflow: boolean): string {
       }),
     ].join("\n") +
     "\n" +
-    "{}\n".repeat(99_998);
+    "{}\n".repeat(TEST_RECORD_LIMIT - 2);
   return overflow
     ? records +
         "\n" +
@@ -1123,168 +1127,172 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
   });
 
   describe("recentThreads", () => {
-    it.effect("imports recent Claude, Codex, and Pi sessions for the selected project only", () =>
-      Effect.gen(function* () {
-        const path = yield* Path.Path;
-        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
-        yield* TestClock.setTime(nowMs);
-        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
-        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
-        const piAgentDir = yield* makeTempDir("t3code-pi-agent-");
-        const workspace = yield* makeTempDir("t3code-workspace-");
-        const otherWorkspace = yield* makeTempDir("t3code-workspace-other-");
+    it.effect(
+      "imports Claude, Codex, and Pi sessions of any age for the selected project only",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+          yield* TestClock.setTime(nowMs);
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const piAgentDir = yield* makeTempDir("t3code-pi-agent-");
+          const workspace = yield* makeTempDir("t3code-workspace-");
+          const otherWorkspace = yield* makeTempDir("t3code-workspace-other-");
 
-        const claudeTranscript = (cwd: string, sessionId: string) =>
-          `${JSON.stringify({
-            type: "user",
-            cwd,
-            sessionId,
-            timestamp: "2026-08-23T12:00:00.000Z",
-            message: { role: "user", content: "Fix the project" },
-          })}\n${JSON.stringify({
-            type: "assistant",
-            sessionId,
-            timestamp: "2026-08-23T12:01:00.000Z",
-            message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
-          })}\n`;
+          const claudeTranscript = (cwd: string, sessionId: string) =>
+            `${JSON.stringify({
+              type: "user",
+              cwd,
+              sessionId,
+              timestamp: "2026-08-23T12:00:00.000Z",
+              message: { role: "user", content: "Fix the project" },
+            })}\n${JSON.stringify({
+              type: "assistant",
+              sessionId,
+              timestamp: "2026-08-23T12:01:00.000Z",
+              message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
+            })}\n`;
 
-        yield* writeTranscript({
-          filePath: path.join(claudeHomePath, "projects", "-selected", "claude-recent.jsonl"),
-          contents: claudeTranscript(workspace, "claude-recent"),
-          mtimeMs: nowMs - 24 * 60 * 60 * 1000,
-        });
-        yield* writeTranscript({
-          filePath: path.join(claudeHomePath, "projects", "-selected", "claude-old.jsonl"),
-          contents: claudeTranscript(workspace, "claude-old"),
-          mtimeMs: nowMs - 31 * 24 * 60 * 60 * 1000,
-        });
-        yield* writeTranscript({
-          filePath: path.join(claudeHomePath, "projects", "-other", "claude-other.jsonl"),
-          contents: claudeTranscript(otherWorkspace, "claude-other"),
-          mtimeMs: nowMs - 24 * 60 * 60 * 1000,
-        });
-        yield* writeTranscript({
-          filePath: path.join(
-            codexHomePath,
-            "sessions",
-            "2026",
-            "08",
-            "24",
-            "rollout-codex-recent.jsonl",
-          ),
-          contents: [
-            encodeTranscriptRecord({
-              type: "session_meta",
-              payload: { id: "codex-recent", cwd: workspace },
-            }),
-            encodeTranscriptRecord({
-              type: "event_msg",
-              timestamp: "2026-08-24T10:00:00.000Z",
-              payload: { type: "user_message", message: "Review this code" },
-            }),
-            encodeTranscriptRecord({
-              type: "response_item",
-              timestamp: "2026-08-24T10:01:00.000Z",
-              payload: {
-                type: "message",
-                role: "assistant",
-                content: [{ type: "output_text", text: "Looks good" }],
-              },
-            }),
-          ].join("\n"),
-          mtimeMs: nowMs - 60 * 60 * 1000,
-        });
-        const piMessage = (
-          id: string,
-          parentId: string | null,
-          message: { readonly role: string; readonly content: unknown },
-        ) =>
-          encodeTranscriptRecord({
-            type: "message",
-            id,
-            parentId,
-            timestamp: "2026-08-24T11:00:00.000Z",
-            message,
+          yield* writeTranscript({
+            filePath: path.join(claudeHomePath, "projects", "-selected", "claude-recent.jsonl"),
+            contents: claudeTranscript(workspace, "claude-recent"),
+            mtimeMs: nowMs - 24 * 60 * 60 * 1000,
           });
-        // The user rewound to the first prompt; the abandoned branch stays in the file.
-        yield* writeTranscript({
-          filePath: path.join(piAgentDir, "sessions", "--selected--", "2026-08-24_pi.jsonl"),
-          contents: [
-            encodeTranscriptRecord({
-              type: "session",
-              version: 3,
-              id: "pi-recent",
-              cwd: workspace,
-            }),
-            piMessage("a1", null, { role: "user", content: "Plan the change" }),
-            piMessage("a2", "a1", {
-              role: "assistant",
-              content: [{ type: "text", text: "Abandoned answer" }],
-            }),
-            piMessage("a3", "a2", { role: "user", content: "Abandoned follow-up" }),
-            piMessage("b1", "a1", {
-              role: "assistant",
-              content: [
-                { type: "thinking", thinking: "Hidden reasoning" },
-                { type: "toolCall", id: "call-1", name: "bash", arguments: {} },
-              ],
-            }),
-            piMessage("bn", "b1", { role: "toolResult", content: null }),
-            piMessage("b2", "bn", {
-              role: "toolResult",
-              content: [{ type: "text", text: "Tool output" }],
-            }),
-            piMessage("b3", "b2", {
-              role: "assistant",
-              content: [{ type: "text", text: "Active answer" }],
-            }),
-            encodeTranscriptRecord({
-              type: "session_info",
-              id: "b4",
-              parentId: "b3",
-              name: "Pi refactor",
-            }),
-          ].join("\n"),
-          mtimeMs: nowMs - 30 * 60 * 1000,
-        });
-        // Version 1 sessions predate the entry tree.
-        yield* writeTranscript({
-          filePath: path.join(piAgentDir, "sessions", "--selected--", "2025-01-01_pi-v1.jsonl"),
-          contents: [
-            encodeTranscriptRecord({ type: "session", id: "pi-v1", cwd: workspace }),
-            encodeTranscriptRecord({
-              type: "message",
-              message: { role: "user", content: "Legacy prompt" },
-            }),
+          yield* writeTranscript({
+            filePath: path.join(claudeHomePath, "projects", "-selected", "claude-old.jsonl"),
+            contents: claudeTranscript(workspace, "claude-old"),
+            mtimeMs: nowMs - 31 * 24 * 60 * 60 * 1000,
+          });
+          yield* writeTranscript({
+            filePath: path.join(claudeHomePath, "projects", "-other", "claude-other.jsonl"),
+            contents: claudeTranscript(otherWorkspace, "claude-other"),
+            mtimeMs: nowMs - 24 * 60 * 60 * 1000,
+          });
+          yield* writeTranscript({
+            filePath: path.join(
+              codexHomePath,
+              "sessions",
+              "2026",
+              "08",
+              "24",
+              "rollout-codex-recent.jsonl",
+            ),
+            contents: [
+              encodeTranscriptRecord({
+                type: "session_meta",
+                payload: { id: "codex-recent", cwd: workspace },
+              }),
+              encodeTranscriptRecord({
+                type: "event_msg",
+                timestamp: "2026-08-24T10:00:00.000Z",
+                payload: { type: "user_message", message: "Review this code" },
+              }),
+              encodeTranscriptRecord({
+                type: "response_item",
+                timestamp: "2026-08-24T10:01:00.000Z",
+                payload: {
+                  type: "message",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: "Looks good" }],
+                },
+              }),
+            ].join("\n"),
+            mtimeMs: nowMs - 60 * 60 * 1000,
+          });
+          const piMessage = (
+            id: string,
+            parentId: string | null,
+            message: { readonly role: string; readonly content: unknown },
+          ) =>
             encodeTranscriptRecord({
               type: "message",
-              message: { role: "assistant", content: [{ type: "text", text: "Legacy answer" }] },
-            }),
-          ].join("\n"),
-          mtimeMs: nowMs - 2 * 24 * 60 * 60 * 1000,
-        });
+              id,
+              parentId,
+              timestamp: "2026-08-24T11:00:00.000Z",
+              message,
+            });
+          // The user rewound to the first prompt; the abandoned branch stays in the file.
+          yield* writeTranscript({
+            filePath: path.join(piAgentDir, "sessions", "--selected--", "2026-08-24_pi.jsonl"),
+            contents: [
+              encodeTranscriptRecord({
+                type: "session",
+                version: 3,
+                id: "pi-recent",
+                cwd: workspace,
+              }),
+              piMessage("a1", null, { role: "user", content: "Plan the change" }),
+              piMessage("a2", "a1", {
+                role: "assistant",
+                content: [{ type: "text", text: "Abandoned answer" }],
+              }),
+              piMessage("a3", "a2", { role: "user", content: "Abandoned follow-up" }),
+              piMessage("b1", "a1", {
+                role: "assistant",
+                content: [
+                  { type: "thinking", thinking: "Hidden reasoning" },
+                  { type: "toolCall", id: "call-1", name: "bash", arguments: {} },
+                ],
+              }),
+              piMessage("bn", "b1", { role: "toolResult", content: null }),
+              piMessage("b2", "bn", {
+                role: "toolResult",
+                content: [{ type: "text", text: "Tool output" }],
+              }),
+              piMessage("b3", "b2", {
+                role: "assistant",
+                content: [{ type: "text", text: "Active answer" }],
+              }),
+              encodeTranscriptRecord({
+                type: "session_info",
+                id: "b4",
+                parentId: "b3",
+                name: "Pi refactor",
+              }),
+            ].join("\n"),
+            mtimeMs: nowMs - 30 * 60 * 1000,
+          });
+          // Version 1 sessions predate the entry tree.
+          yield* writeTranscript({
+            filePath: path.join(piAgentDir, "sessions", "--selected--", "2025-01-01_pi-v1.jsonl"),
+            contents: [
+              encodeTranscriptRecord({ type: "session", id: "pi-v1", cwd: workspace }),
+              encodeTranscriptRecord({
+                type: "message",
+                message: { role: "user", content: "Legacy prompt" },
+              }),
+              encodeTranscriptRecord({
+                type: "message",
+                message: { role: "assistant", content: [{ type: "text", text: "Legacy answer" }] },
+              }),
+            ].join("\n"),
+            mtimeMs: nowMs - 2 * 24 * 60 * 60 * 1000,
+          });
 
-        const threads = yield* runRecentThreads({
-          claudeHomePath,
-          codexHomePath,
-          piAgentDir,
-          workspaceRoot: workspace,
-        });
+          const threads = yield* runRecentThreads({
+            claudeHomePath,
+            codexHomePath,
+            piAgentDir,
+            workspaceRoot: workspace,
+          });
 
-        expect(threads.map((thread) => thread.providerSessionId)).toEqual([
-          "pi-recent",
-          "codex-recent",
-          "claude-recent",
-          "pi-v1",
-        ]);
-        expect(threads.map((thread) => thread.messages.map((message) => message.text))).toEqual([
-          ["Plan the change", "Active answer"],
-          ["Review this code", "Looks good"],
-          ["Fix the project", "Done"],
-          ["Legacy prompt", "Legacy answer"],
-        ]);
-        expect(threads[0]).toMatchObject({ source: "pi", title: "Pi refactor" });
-      }),
+          expect(threads.map((thread) => thread.providerSessionId)).toEqual([
+            "pi-recent",
+            "codex-recent",
+            "claude-recent",
+            "pi-v1",
+            "claude-old",
+          ]);
+          expect(threads.map((thread) => thread.messages.map((message) => message.text))).toEqual([
+            ["Plan the change", "Active answer"],
+            ["Review this code", "Looks good"],
+            ["Fix the project", "Done"],
+            ["Legacy prompt", "Legacy answer"],
+            ["Fix the project", "Done"],
+          ]);
+          expect(threads[0]).toMatchObject({ source: "pi", title: "Pi refactor" });
+        }),
     );
 
     it.effect("keeps the provider instance that owns a custom session home", () =>
@@ -1611,7 +1619,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           { subagent: { other: "guardian" } },
           { subAgent: "compact" },
         ];
-        // Newer subagents would exhaust the 100-transcript import budget before any parent.
+        // Subagent rollouts are excluded, however many come before their parents.
         const sources = [
           ...Array.from({ length: 100 }, (_, index) => subagentSources[index % 4]),
           "vscode",
@@ -1735,6 +1743,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           workspaceRoot: workspace,
         });
         expect(outcomes.map((outcome) => outcome._tag)).toEqual(["Skipped", "Importable"]);
+        expect(outcomes[0]).toMatchObject({ skipped: { reason: "too_large" } });
         expect(outcomes[1]).toMatchObject({
           thread: { providerSessionId: "record-limit-session" },
         });
@@ -1878,7 +1887,12 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
                     thread: { messages: [{ text: "Replacement prompt" }] },
                   });
                 } else {
-                  expect(outcomes).toEqual([{ _tag: "Skipped" }]);
+                  expect(outcomes).toEqual([
+                    {
+                      _tag: "Skipped",
+                      skipped: { provider: source, filePath, reason: "outside_project" },
+                    },
+                  ]);
                 }
               }).pipe(Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })));
             }),
@@ -1995,7 +2009,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
               type: "assistant",
               message: { role: "assistant", model: "claude-opus-5-5", content: "First reply" },
             }),
-            // Small tool records exceed the real 32 MiB selected-history budget in aggregate.
+            // Tool records do not count toward the selected-history budget.
             ...Array.from({ length: 20_000 }, () => toolResult),
             record({ type: "user", message: { role: "user", content: "Latest prompt" } }),
             record({
@@ -2101,7 +2115,16 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
 
         expect(transcriptOpenCount).toBe(2);
         expect(fullReadBytes).toBe(new TextEncoder().encode(contents).byteLength);
-        expect(outcomes).toEqual([{ _tag: "Skipped" }]);
+        expect(outcomes).toEqual([
+          {
+            _tag: "Skipped",
+            skipped: {
+              provider: "codex",
+              filePath: transcriptPath,
+              reason: "changed_while_reading",
+            },
+          },
+        ]);
       }),
     );
 
@@ -2434,6 +2457,7 @@ describe("parseAgentSessionTranscript", () => {
     (overflow) => {
       const thread = AgentSessionScanner.parseAgentSessionTranscript({
         contents: makeRecordLimitTranscript("/project", overflow),
+        maxRecords: TEST_RECORD_LIMIT,
         source: "codex",
         providerInstanceId: ProviderInstanceId.make("codex"),
         fallbackSessionId: "unused",
@@ -2445,7 +2469,7 @@ describe("parseAgentSessionTranscript", () => {
   );
 
   it.each([199, 200, 201, 205])(
-    "counts only omitted conversation messages for a %s-message Claude transcript",
+    "keeps every conversation message of a %s-message Claude transcript",
     (count) => {
       const thread = AgentSessionScanner.parseAgentSessionTranscript({
         contents: [
@@ -2479,8 +2503,7 @@ describe("parseAgentSessionTranscript", () => {
         lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
       });
 
-      expect(thread?.omittedMessageCount).toBe(Math.max(0, count - 200));
-      expect(thread?.messages).toHaveLength(Math.min(200, count));
+      expect(thread?.messages).toHaveLength(count);
       expect(thread?.messages[0]?.text).toBe("Message 0");
       expect(thread?.messages.at(-1)?.text).toBe(`Message ${count - 1}`);
     },
@@ -2676,8 +2699,7 @@ describe("parseAgentSessionTranscript", () => {
       lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
     });
 
-    expect(thread?.omittedMessageCount).toBe(count - 199);
-    expect(thread?.messages).toHaveLength(200);
+    expect(thread?.messages).toHaveLength(count + 1);
     expect(thread?.messages[0]).toMatchObject({
       role: "user",
       text: canonicalPrompt,
@@ -2739,8 +2761,7 @@ describe("parseAgentSessionTranscript", () => {
       lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
     });
 
-    expect(thread?.omittedMessageCount).toBe(1);
-    expect(thread?.messages).toHaveLength(200);
+    expect(thread?.messages).toHaveLength(201);
     expect(thread?.messages[0]).toMatchObject({
       role: "user",
       text: canonicalPrompt,

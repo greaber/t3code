@@ -37,6 +37,8 @@ export class SshConnectionProfile extends Schema.TaggedClass<SshConnectionProfil
   {
     ...ConnectionProfileBase,
     target: DesktopSshEnvironmentTargetSchema,
+    /** "managed" when this desktop app started the server, as of its last connect. */
+    remoteServerKind: Schema.optionalKey(Schema.Literals(["external", "managed"])),
   },
 ) {}
 
