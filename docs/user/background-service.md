@@ -68,6 +68,11 @@ T3CODE_PORT=3773
 T3CODE_HOST=127.0.0.1
 ```
 
+`T3CODE_PROVIDER_IDLE_TIMEOUT_MS` sets how long an agent's process may sit
+idle before T3 Code stops it (default `1800000`, 30 minutes). A process whose
+agent still has background work running, such as a watcher, is never stopped
+for being idle. The next message resumes a stopped conversation.
+
 Use `KEY=VALUE` entries, quoting values that contain spaces or `#`. Values are
 literal: shell commands and variable expansion are not evaluated. Entries
 override the inherited service environment, except for `PATH`, `T3CODE_HOME`,
