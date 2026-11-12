@@ -95,6 +95,14 @@ export const SidebarAutoSettleAfterDays = Schema.Number.check(
 );
 export type SidebarAutoSettleAfterDays = typeof SidebarAutoSettleAfterDays.Type;
 
+export const IDLE_COMPACTION_MODES = [
+  { value: "onReturn", label: "When you return" },
+  { value: "beforeCacheExpires", label: "Before the cache expires (beta)" },
+  { value: "off", label: "Never" },
+] as const;
+export const IdleCompactionMode = Schema.Literals(IDLE_COMPACTION_MODES.map((mode) => mode.value));
+export type IdleCompactionMode = typeof IdleCompactionMode.Type;
+
 export const MAX_SNOOZE_PRESET_MINUTES = 30 * 24 * 60;
 export const MAX_SNOOZE_PRESETS = 8;
 export const SnoozePresetDay = Schema.Literals([
@@ -389,7 +397,21 @@ export const VoiceTranscriptionDestination = Schema.Union([
 ]);
 export type VoiceTranscriptionDestination = typeof VoiceTranscriptionDestination.Type;
 
+/**
+ * Server settings this client applies to every environment it connects to. Each key is recorded
+ * when the setting is changed for all environments; an absent key is not applied.
+ */
+export const ServerSettingPreferences = Schema.Struct({
+  idleCompaction: Schema.optionalKey(IdleCompactionMode),
+  sidebarAutoSettleOnMerge: Schema.optionalKey(Schema.Boolean),
+  sidebarAutoSettleAfterDays: Schema.optionalKey(Schema.NullOr(SidebarAutoSettleAfterDays)),
+});
+export type ServerSettingPreferences = typeof ServerSettingPreferences.Type;
+
 export const ClientSettingsSchema = Schema.Struct({
+  serverSettingPreferences: ServerSettingPreferences.pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
+  ),
   notificationMode: NotificationMode.pipe(
     Schema.withDecodingDefault(Effect.succeed("off" as const)),
   ),
@@ -740,14 +762,6 @@ export const CodexSettings = makeProviderSettingsSchema(
 export type CodexSettings = typeof CodexSettings.Type;
 
 const CLAUDE_AUTO_COMPACT_WINDOW_PATTERN = /^(?:|[1-9]\d{5}|1000000)$/;
-
-export const IDLE_COMPACTION_MODES = [
-  { value: "onReturn", label: "When you return" },
-  { value: "beforeCacheExpires", label: "Before the cache expires (beta)" },
-  { value: "off", label: "Never" },
-] as const;
-export const IdleCompactionMode = Schema.Literals(IDLE_COMPACTION_MODES.map((mode) => mode.value));
-export type IdleCompactionMode = typeof IdleCompactionMode.Type;
 
 // Shipped clients reject the whole server config unless `compactIdleThreads` is boolean.
 // Keep the mode in `idleCompaction`, but accept strings from older servers.

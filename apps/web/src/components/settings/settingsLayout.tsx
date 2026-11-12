@@ -15,6 +15,8 @@ import { createContext, type ComponentPropsWithoutRef, type ReactNode, useContex
 
 import {
   PRIMARY_SETTINGS_UNAVAILABLE_MESSAGE,
+  persistClientSettingsUpdate,
+  useClientSettings,
   usePrimarySettingsAvailable,
 } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
@@ -30,6 +32,11 @@ import {
   scopedSettingsAreMixed,
   scopedSettingsSource,
 } from "./scopedSettings";
+import {
+  forgetServerSettingPreferences,
+  isServerSettingPreferenceKey,
+  serverSettingPreferenceDifferences,
+} from "./serverSettingPreferences";
 import { useClearProjectOverrides, useClearScopedSettings } from "./useScopedSettings";
 import {
   SettingInheritance,
@@ -314,6 +321,7 @@ export function SettingsRow({
   managedPaths = EMPTY_MANAGED_PATHS,
   mixed: mixedOverride,
   managed,
+  preferenceStatus = true,
   children,
   className,
   ...rowProps
@@ -331,6 +339,8 @@ export function SettingsRow({
   mixed?: boolean;
   /** Why an administrator's policy turns this row's control off, from the contract's denial helpers. */
   managed?: string | undefined;
+  /** False on a row that repeats another row's setting, so its all-environments status shows once. */
+  preferenceStatus?: boolean;
   children?: ReactNode;
 }) {
   const targetRef = useSettingsSearchTarget<HTMLDivElement>(rowProps.id);
@@ -363,6 +373,14 @@ export function SettingsRow({
               policy !== undefined &&
               lockablePaths.some((path) => isManagedSettingPath(policy, path)),
           )?.organization;
+  const preferences = useClientSettings((settings) => settings.serverSettingPreferences);
+  const preferenceKeys = serverScoped
+    ? settingKeys
+        .filter(isServerSettingPreferenceKey)
+        .filter((key) => preferences[key] !== undefined)
+    : [];
+  const environmentScopeFollows =
+    context?.scope.kind === "environment" && preferenceKeys.length > 0;
   const clearOverrides = useClearScopedSettings();
   const clearProjectOverrides = useClearProjectOverrides();
   const isProjectScope =
@@ -392,8 +410,10 @@ export function SettingsRow({
   );
   const overridingProjects = isProjectScope ? [] : projectOverrides(context, scopedKeys);
   const renderedReset =
-    unavailable || managedBy !== undefined || managed !== undefined ? null : isProjectScope &&
-      scopedKeys.length > 0 ? (
+    unavailable ||
+    managedBy !== undefined ||
+    managed !== undefined ||
+    environmentScopeFollows ? null : isProjectScope && scopedKeys.length > 0 ? (
       source === "project" || source === "mixed" ? (
         <SettingResetButton
           label={typeof title === "string" ? title : "override"}
@@ -446,7 +466,11 @@ export function SettingsRow({
             )
           : environmentWide && control
             ? inertControl("Environment-wide setting. Select an environment to change it.")
-            : control;
+            : environmentScopeFollows && control
+              ? inertControl(
+                  "This app applies this setting to every environment. Change it under All environments.",
+                )
+              : control;
   const customized =
     context !== null &&
     settingKeys.some((key) =>
@@ -486,7 +510,65 @@ export function SettingsRow({
           : {})}
       />
     ) : null;
-  const renderedStatus = status;
+  const preferenceDifferences =
+    context === null || preferenceKeys.length === 0
+      ? []
+      : serverSettingPreferenceDifferences(
+          preferences,
+          preferenceKeys,
+          context.connectedEnvironments.flatMap((environment) =>
+            environment.serverConfig
+              ? [
+                  {
+                    environmentId: environment.environmentId,
+                    label: environment.label,
+                    settings: environment.serverConfig.settings,
+                    managedPolicy: environment.serverConfig.managedPolicy,
+                  },
+                ]
+              : [],
+          ),
+        );
+  const listLabels = (locked: boolean) =>
+    preferenceDifferences
+      .filter((difference) => difference.locked === locked)
+      .map((difference) => difference.label)
+      .join(", ");
+  const renderedPreferenceStatus =
+    preferenceStatus &&
+    context !== null &&
+    (context.scope.kind === "all" || context.scope.kind === "environment") &&
+    preferenceKeys.length > 0 ? (
+      <>
+        Applied to every environment this app connects to, including new ones.
+        {listLabels(false) ? ` Different on ${listLabels(false)}.` : null}
+        {listLabels(true) ? ` Not applied on ${listLabels(true)}: managed there.` : null}{" "}
+        <Button
+          size="xs"
+          variant="link"
+          onClick={() =>
+            void persistClientSettingsUpdate((current) => ({
+              ...current,
+              serverSettingPreferences: forgetServerSettingPreferences(
+                current.serverSettingPreferences,
+                preferenceKeys,
+              ),
+            }))
+          }
+        >
+          Stop applying everywhere
+        </Button>
+      </>
+    ) : null;
+  const renderedStatus =
+    status && renderedPreferenceStatus ? (
+      <>
+        {status}
+        <div className="pt-1">{renderedPreferenceStatus}</div>
+      </>
+    ) : (
+      (status ?? renderedPreferenceStatus)
+    );
 
   return (
     <div

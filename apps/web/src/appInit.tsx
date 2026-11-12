@@ -16,6 +16,7 @@ import { startKeybindingsUpdateToasts } from "./components/KeybindingsUpdateToas
 import { startLegacyThreadMigrationToast } from "./components/LegacyThreadMigrationToast";
 import { startPermissionUpdateNotices } from "./components/PermissionUpdateNotice";
 import { startAgentOpenedPreviews } from "./components/preview/agentOpenedPreviews";
+import { startServerSettingPreferencesSync } from "./components/settings/serverSettingPreferencesSync";
 import { startMainAppLocationTracking } from "./components/sidebar/mainAppLocation";
 import { startDesktopUpdateLaunchNotice } from "./components/sidebar/updateEverythingRun";
 import { startSlowRpcRequestToasts } from "./components/SlowRpcRequestToastCoordinator";
@@ -188,6 +189,7 @@ export function startAppServices(): AppRouter {
   startBrowserChromeThemeSync(router);
   startDefaultThemeAdoption();
   startModelPreferencesMigration();
+  startServerSettingPreferencesSync();
   startAgentOpenedPreviews();
   if (isElectron) startElectronBrowserHost();
   startPreviewTitleRecording();

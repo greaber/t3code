@@ -14,7 +14,12 @@ import {
   type UnifiedSettings,
 } from "@t3tools/contracts";
 
-import { persistClientSettingsPatch, useMergedSettings } from "../../hooks/useSettings";
+import {
+  getClientSettings,
+  persistClientSettingsPatch,
+  persistClientSettingsUpdate,
+  useMergedSettings,
+} from "../../hooks/useSettings";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { toastManager } from "../ui/toast";
@@ -29,6 +34,7 @@ import {
   type ProjectOverrideEntry,
   type ScopedSettingsPatch,
 } from "./scopedSettings";
+import { recordServerSettingPreferences } from "./serverSettingPreferences";
 
 export function useScopedSettings<T = UnifiedSettings>(
   selector?: (settings: UnifiedSettings) => T,
@@ -101,8 +107,21 @@ export function useUpdateScopedSettings() {
   const { scope, environments } = useSettingsScope();
   const run = useRunScopedPlan();
   /** `onFailed` runs when any target rejects or drops the patch, so a draft can fall back. */
-  return (patch: ScopedSettingsPatch, options?: { readonly onFailed?: () => void }) =>
-    run(planScopedSettingsPatch(scope, environments, patch), options?.onFailed);
+  return (patch: ScopedSettingsPatch, options?: { readonly onFailed?: () => void }) => {
+    const plan = planScopedSettingsPatch(scope, environments, patch);
+    if (
+      plan.unavailableReason === null &&
+      recordServerSettingPreferences(getClientSettings().serverSettingPreferences, scope, patch)
+    ) {
+      void persistClientSettingsUpdate((current) => ({
+        ...current,
+        serverSettingPreferences:
+          recordServerSettingPreferences(current.serverSettingPreferences, scope, patch) ??
+          current.serverSettingPreferences,
+      }));
+    }
+    run(plan, options?.onFailed);
+  };
 }
 
 export function useClearScopedSettings() {

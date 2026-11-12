@@ -1818,6 +1818,7 @@ export function ThreadsSettingsPanel() {
             <SettingsRow
               serverScoped
               settingKeys={["sidebarAutoSettleAfterDays"]}
+              preferenceStatus={false}
               title={searchableSetting("days-before-auto-settle").title}
               description="Any new activity un-settles a thread automatically."
               control={
