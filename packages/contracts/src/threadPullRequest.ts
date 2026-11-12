@@ -104,6 +104,10 @@ export const ThreadPullRequestWatch = Schema.Struct({
    * none did. Null once either happened; absent on watches saved before it existed.
    */
   checksAwaitedSince: Schema.optional(Schema.NullOr(IsoDateTime)),
+  /** The agent was told host reads keep failing, and is told again once one succeeds. */
+  unreadableNotified: Schema.optional(Schema.Boolean),
+  /** When the host first reported the pull request missing in the current run of failed reads. */
+  notFoundSince: Schema.optional(IsoDateTime),
 });
 export type ThreadPullRequestWatch = typeof ThreadPullRequestWatch.Type;
 

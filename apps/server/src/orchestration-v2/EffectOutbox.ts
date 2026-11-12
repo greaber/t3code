@@ -122,6 +122,18 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
 ]);
 export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.Type;
 
+/**
+ * Cleanup no user waits on. It retries for minutes, and while it waits to retry it must not
+ * hold up the thread's later effects, such as the turn start queued behind a session detach.
+ */
+export const BACKGROUND_EFFECT_TYPES = [
+  "provider-session.detach",
+  "scheduled-tasks.cleanup",
+  "terminal.cleanup",
+  "preview.cleanup",
+  "attachment.cleanup",
+] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-runtime.continue",
   "provider-session.detach",
@@ -310,7 +322,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         available,
         Array.from({ length: Math.min(64, Math.max(0, Math.floor(count))) }, () => undefined),
       ).pipe(Effect.asVoid);
-    // Retry backoff must block later effects so turns cannot race a pending rollback.
+    // Retry backoff must block later effects so turns cannot race a pending rollback;
+    // background cleanup that already failed once waits without blocking.
+    const backgroundEffectTypes = sql.in(BACKGROUND_EFFECT_TYPES);
     const claimableCandidatePredicate = (
       availableBefore?: string,
       excludeRestartContinuations = false,
@@ -331,6 +345,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               OR (
                 active.status = 'pending'
                 AND active.rowid < candidate.rowid
+                AND NOT (
+                  active.attempt_count > 0 AND active.effect_type IN ${backgroundEffectTypes}
+                )
                 AND ${
                   excludeRestartContinuations
                     ? sql`active.effect_type != 'provider-runtime.continue'`

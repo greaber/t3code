@@ -2786,6 +2786,50 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
     }).pipe(Effect.provide(Layer.fresh(layerEffectOutboxProvided))),
   );
 
+  it.effect("lets a queued turn start pass a session detach waiting to retry", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const workerId = "retry-detach-worker";
+      const commandId = CommandId.make("command:foundation-retry-detach");
+      const threadId = ThreadId.make("thread:foundation-retry-detach");
+      // A provider switch queues the old session's detach ahead of the new turn's start.
+      yield* outbox.enqueue([
+        {
+          id: "effect:foundation-retry-detach:detach",
+          commandId,
+          threadId,
+          request: {
+            type: "provider-session.detach",
+            providerSessionId: ProviderSessionId.make("provider-session:foundation-retry-detach"),
+          },
+        },
+        {
+          id: "effect:foundation-retry-detach:start",
+          commandId,
+          threadId,
+          request: {
+            type: "provider-turn.start",
+            runId: RunId.make("run:foundation-retry-detach"),
+          },
+        },
+      ]);
+      const detach = yield* outbox.claimNext({ workerId });
+      assert.equal(Option.getOrUndefined(detach)?.id, "effect:foundation-retry-detach:detach");
+      // Before its first attempt the detach still runs first.
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId })));
+      yield* outbox.retry({
+        effectId: "effect:foundation-retry-detach:detach",
+        workerId,
+        error: "detach failed once",
+        delayMs: 30_000,
+      });
+
+      const start = yield* outbox.claimNext({ workerId });
+      assert.equal(Option.getOrUndefined(start)?.id, "effect:foundation-retry-detach:start");
+      yield* outbox.succeed({ effectId: "effect:foundation-retry-detach:start", workerId });
+    }).pipe(Effect.provide(Layer.fresh(layerEffectOutboxProvided))),
+  );
+
   it.effect("runs distinct threads concurrently while serializing effects within a thread", () =>
     Effect.gen(function* () {
       const outbox = yield* EffectOutbox.EffectOutboxV2;

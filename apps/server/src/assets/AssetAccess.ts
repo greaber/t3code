@@ -38,6 +38,7 @@ import {
 import { isNetworkPath } from "@t3tools/shared/path";
 import { MAX_TOOL_OUTPUT_IMAGE_BASE64_LENGTH, toolOutputImages } from "@t3tools/shared/toolOutput";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
@@ -50,7 +51,12 @@ import * as Stream from "effect/Stream";
 import { base64UrlDecodeUtf8, base64UrlEncode } from "../auth/utils.ts";
 import * as AssetSigner from "./AssetSigner.ts";
 import { makeIsServerInternalPath } from "../auth/serverInternalPaths.ts";
-import { parseAttachmentFileExtension, resolveAttachmentPathById } from "../attachmentStore.ts";
+import {
+  parseAttachmentFileExtension,
+  parseThreadSegmentFromAttachmentId,
+  PENDING_ATTACHMENT_THREAD_SEGMENT,
+  resolveAttachmentPathById,
+} from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -650,6 +656,16 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         return yield* new AssetAttachmentNotFoundError({
           resource: input.resource,
         });
+      }
+      if (
+        parseThreadSegmentFromAttachmentId(input.resource.attachmentId) ===
+        PENDING_ATTACHMENT_THREAD_SEGMENT
+      ) {
+        const touchedAt = DateTime.toDateUtc(yield* DateTime.now);
+        // Keeps the stale-upload sweep away from uploads an unsent draft still uses.
+        for (const target of [attachmentPath, `${attachmentPath}.txt`]) {
+          yield* fileSystem.utimes(target, touchedAt, touchedAt).pipe(Effect.ignore);
+        }
       }
       const extension = parseAttachmentFileExtension(input.resource.attachmentId);
       const isGenericFile = extension !== null;

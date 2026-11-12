@@ -3251,6 +3251,17 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         );
         assert.isNull(woken.thread.settledOverride);
         assert.isNull(woken.thread.settledAt);
+        // Later tests sweep every watch in this shared database, and failing reads keep one alive.
+        for (const number of [7, 8]) {
+          yield* orchestrator.dispatch({
+            type: "thread.pull-request.watch",
+            commandId: CommandId.make(`pr-watch-settle-stop-${mode}-${number}`),
+            threadId,
+            ...key,
+            number,
+            watching: false,
+          });
+        }
       }),
   );
 
@@ -3360,6 +3371,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         let disconnected = false;
         let passed = false;
         let genericFailure = false;
+        let currentPass = -1;
+        const passesRead = new Set<number>();
         const activityFailures = yield* Queue.unbounded<void>();
         const readFailure = (operation: string, failure: "failed" | "not-found" | "forbidden") =>
           new PullRequestOperationError({
@@ -3372,7 +3385,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
               detail: "host read failed",
             }),
           });
-        const reactor = yield* PullRequestWatchReactor.make.pipe(
+        const makeReactor = PullRequestWatchReactor.make.pipe(
           Effect.provide(
             Layer.mergeAll(
               NodeServices.layer,
@@ -3380,29 +3393,35 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
               Layer.mock(PullRequestService.PullRequestService)({
                 watchFingerprint: () => Effect.succeed(null),
                 detail: () =>
-                  genericFailure
-                    ? Effect.die("host read failed")
-                    : disconnected
-                      ? (activityFails ? Queue.take(activityFailures) : Effect.void).pipe(
-                          Effect.andThen(Effect.fail(readFailure("detail", reason))),
-                        )
-                      : Effect.succeed({
-                          ...watchedPullRequestDetail({
-                            projectId,
-                            number: 8,
-                            at: "2026-10-02T12:00:00.000Z",
-                          }),
-                          headSha: "abc1234def",
-                          checks: [
-                            {
-                              name: "test",
-                              status: passed ? ("success" as const) : ("pending" as const),
-                              description: null,
-                              url: null,
-                              required: true,
-                            },
-                          ],
-                        }),
+                  Effect.sync(() => {
+                    passesRead.add(currentPass);
+                  }).pipe(
+                    Effect.andThen(() =>
+                      genericFailure
+                        ? Effect.die("host read failed")
+                        : disconnected
+                          ? (activityFails ? Queue.take(activityFailures) : Effect.void).pipe(
+                              Effect.andThen(Effect.fail(readFailure("detail", reason))),
+                            )
+                          : Effect.succeed({
+                              ...watchedPullRequestDetail({
+                                projectId,
+                                number: 8,
+                                at: "2026-10-02T12:00:00.000Z",
+                              }),
+                              headSha: "abc1234def",
+                              checks: [
+                                {
+                                  name: "test",
+                                  status: passed ? ("success" as const) : ("pending" as const),
+                                  description: null,
+                                  url: null,
+                                  required: true,
+                                },
+                              ],
+                            }),
+                    ),
+                  ),
                 activity: () =>
                   disconnected && activityFails
                     ? Queue.offer(activityFailures, undefined).pipe(
@@ -3420,36 +3439,64 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           ),
         );
         const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
-        const sweep = reactor.sweep.pipe(Effect.andThen(worker.drain()));
+        let reactor = yield* makeReactor;
+        const sweep = Effect.suspend(() => reactor.sweep).pipe(Effect.andThen(worker.drain()));
+        // Notices from one pass carry random ids, so compare them in sorted order.
         const summaries = Effect.map(
           orchestrator.getThreadRecords(threadId, ["messages"]),
-          ({ messages }) => messages.flatMap((message) => message.notification?.summary ?? []),
+          ({ messages }) =>
+            messages.flatMap((message) => message.notification?.summary ?? []).toSorted(),
         );
         yield* sweep;
         assert.deepEqual(yield* summaries, []);
         disconnected = true;
-        for (let pass = 0; pass < 15; pass += 1) {
+        passesRead.clear();
+        for (let pass = 0; pass < 37; pass += 1) {
+          currentPass = pass;
           genericFailure = reason === "failed" && (pass === 0 || (pass >= 2 && pass <= 8));
           yield* TestClock.adjust("2 minutes");
           yield* sweep;
         }
 
-        const thread = yield* orchestrator.getThreadShell(threadId);
-        if (reason !== "failed") {
-          assert.isUndefined(thread?.pullRequests?.[0]?.watch);
-          assert.deepEqual(yield* summaries, ["#8: stopped watching, could not read it"]);
+        const watchOf = Effect.map(
+          orchestrator.getThreadShell(threadId),
+          (thread) => thread?.pullRequests?.[0]?.watch,
+        );
+        assert.isDefined(yield* watchOf);
+        const unreadable = reason === "failed" ? [] : ["#8: cannot read it, still watching"];
+        assert.deepEqual(yield* summaries, unreadable);
+        // After 8 failures in a row, reads wait 4, 8, 16, then at most 30 minutes.
+        assert.equal(passesRead.size, reason === "failed" ? 37 : 12);
+
+        // A restart neither repeats the notice nor forgets it is owed a recovery notice.
+        reactor = yield* makeReactor;
+        yield* TestClock.adjust("2 minutes");
+        yield* sweep;
+        assert.deepEqual(yield* summaries, unreadable);
+        if (reason === "not-found") {
+          yield* TestClock.adjust("7 days");
+          yield* sweep;
+          assert.isUndefined(yield* watchOf);
+          assert.deepEqual(
+            yield* summaries,
+            [...unreadable, "#8: stopped watching, not found"].toSorted(),
+          );
           return;
         }
-        assert.isDefined(thread?.pullRequests?.[0]?.watch);
-        assert.deepEqual(yield* summaries, []);
         disconnected = false;
         genericFailure = false;
         passed = true;
+        yield* TestClock.adjust("30 minutes");
         yield* sweep;
-        assert.deepEqual(yield* summaries, ["#8: checks passed"]);
+        const recovered = [
+          ...unreadable,
+          ...(reason === "failed" ? [] : ["#8: readable again"]),
+          "#8: checks passed",
+        ].toSorted();
+        assert.deepEqual(yield* summaries, recovered);
         yield* TestClock.adjust("10 minutes");
         yield* sweep;
-        assert.deepEqual(yield* summaries, ["#8: checks passed"]);
+        assert.deepEqual(yield* summaries, recovered);
         yield* orchestrator.dispatch({
           type: "thread.pull-request.watch",
           commandId: CommandId.make(`pr-watch-unreadable-stop-${reason}-${activityFails}`),
