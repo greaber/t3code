@@ -10,11 +10,17 @@ import { AsyncResult } from "effect/reactivity";
 import {
   DEFAULT_SERVER_SETTINGS,
   type ProjectScopedServerSettingKey,
+  type ServerSettingPreferences,
   type ServerSettings,
   type UnifiedSettings,
 } from "@t3tools/contracts";
 
-import { persistClientSettingsPatch, useMergedSettings } from "../../hooks/useSettings";
+import {
+  getClientSettings,
+  persistClientSettingsPatch,
+  persistClientSettingsUpdate,
+  useMergedSettings,
+} from "../../hooks/useSettings";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { toastManager } from "../ui/toast";
@@ -29,6 +35,12 @@ import {
   type ProjectOverrideEntry,
   type ScopedSettingsPatch,
 } from "./scopedSettings";
+import {
+  recordServerSettingPreferences,
+  skipBlockedPreferenceWrites,
+  withoutPreferredFields,
+} from "./serverSettingPreferences";
+import { canWriteServerSettings } from "./serverSettingPreferencesSync";
 
 export function useScopedSettings<T = UnifiedSettings>(
   selector?: (settings: UnifiedSettings) => T,
@@ -101,8 +113,58 @@ export function useUpdateScopedSettings() {
   const { scope, environments } = useSettingsScope();
   const run = useRunScopedPlan();
   /** `onFailed` runs when any target rejects or drops the patch, so a draft can fall back. */
-  return (patch: ScopedSettingsPatch, options?: { readonly onFailed?: () => void }) =>
-    run(planScopedSettingsPatch(scope, environments, patch), options?.onFailed);
+  return (
+    requested: ScopedSettingsPatch,
+    options?: {
+      readonly onFailed?: () => void;
+      /** Update only all-environment settings already applied everywhere, as Restore defaults does. */
+      readonly onlyExistingPreferences?: boolean;
+    },
+  ) => {
+    const preferences = getClientSettings().serverSettingPreferences;
+    // A setting applied everywhere is changed under All environments, not on one environment.
+    const patch =
+      scope.kind === "environment" ? withoutPreferredFields(requested, preferences) : requested;
+    const planned = planScopedSettingsPatch(scope, environments, patch);
+    const plan =
+      scope.kind === "all"
+        ? {
+            ...planned,
+            serverWrites: skipBlockedPreferenceWrites(planned.serverWrites, {
+              policyOf: (environmentId) =>
+                environments.find((environment) => environment.environmentId === environmentId)
+                  ?.serverConfig?.managedPolicy,
+              canWrite: canWriteServerSettings,
+            }),
+          }
+        : planned;
+    const recordOptions = { onlyExisting: options?.onlyExistingPreferences === true };
+    if (
+      plan.unavailableReason === null &&
+      recordServerSettingPreferences(preferences, scope, patch, recordOptions)
+    ) {
+      updateServerSettingPreferences(
+        (current) =>
+          recordServerSettingPreferences(current, scope, patch, recordOptions) ?? current,
+      );
+    }
+    run(plan, options?.onFailed);
+  };
+}
+
+export function updateServerSettingPreferences(
+  update: (current: ServerSettingPreferences) => ServerSettingPreferences,
+) {
+  void persistClientSettingsUpdate((current) => ({
+    ...current,
+    serverSettingPreferences: update(current.serverSettingPreferences),
+  })).catch(() =>
+    toastManager.add({
+      type: "error",
+      title: "All-environment setting not saved",
+      description: "This app could not save which settings it applies everywhere. Try again.",
+    }),
+  );
 }
 
 export function useClearScopedSettings() {

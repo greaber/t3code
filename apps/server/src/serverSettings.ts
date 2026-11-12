@@ -1,4 +1,5 @@
 import {
+  DEFAULT_IDLE_COMPACTION,
   DEFAULT_SERVER_SETTINGS,
   ModelSelection,
   ProjectId,
@@ -833,7 +834,7 @@ const make = Effect.gen(function* () {
       settings,
       savedIdleCompaction || settings.idleCompaction !== undefined
         ? globalIdleCompaction(settings)
-        : "off",
+        : DEFAULT_IDLE_COMPACTION,
     );
 
     // A file that failed to decode must stay on disk for the user to repair.
