@@ -367,6 +367,16 @@ ends, as for any delegated task. It keeps following the task across restarts.
 If the other machine revokes the link, or the link is removed here, the task
 fails with that reason.
 
+When the other machine sleeps or goes offline, its link shows as unreachable
+and an agent's calls there fail at once. This machine keeps checking it, every
+few seconds at first and then every two minutes, and when it answers again,
+each thread whose call failed gets a message so its agent carries on. Each check
+tries every address the link was made with, so a machine whose T3 Connect
+address is slow to come back is still reached at its Tailscale or LAN address.
+Linking a machine this app knows only through T3 Connect stores just that
+address; to add others, link again from a terminal with `--url <address>` for
+each one.
+
 ## Manage or revoke access
 
 On the host, **Settings → Sharing & access** lets authorized administrators create

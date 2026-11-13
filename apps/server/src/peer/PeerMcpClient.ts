@@ -73,7 +73,9 @@ const fromLinkError = (error: PeerLinkError) =>
         ? "invalid_request"
         : error.reason === "expired" || error.reason === "incompatible"
           ? "capability_denied"
-          : "orchestration_error",
+          : error.reason === "unreachable"
+            ? "environment_unreachable"
+            : "orchestration_error",
     message: error.message,
   });
 
@@ -263,7 +265,7 @@ const make = Effect.gen(function* () {
           HttpClientError: () =>
             Effect.fail(
               new OrchestratorMcpFailure({
-                code: "orchestration_error",
+                code: "environment_unreachable",
                 message: "The linked environment stopped answering.",
               }),
             ),
