@@ -5,6 +5,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   EnvironmentId,
   type OrchestrationV2Run,
+  type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadShell,
   type SourceControlCloneRepositoryInput,
   ProjectId,
@@ -16,7 +17,9 @@ import { expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schedule from "effect/Schedule";
 import { McpSchema, McpServer } from "effect/ai";
 
 import * as ServerConfig from "../config.ts";
@@ -255,105 +258,119 @@ const mcpClient = McpSchema.McpServerClient.of({
 
 /**
  * Environment A: its own orchestrator toolkit with forwarding, and a thread
- * caller whose modes the test picks. Its local threads never matter here.
+ * caller whose modes the test picks. Its local threads never matter here,
+ * except for the commands dispatched to them, which `dispatched` receives.
  */
-const makeLaptop = Effect.gen(function* () {
-  const linking = yield* layerLinkingEnvironment(laptop).pipe(Layer.build);
-  const layerHere = Layer.mergeAll(
-    McpHttpServer.layerOrchestratorToolkit,
-    McpHttpServer.layerProjectRegistration,
-    McpHttpServer.layerThreadToolkit,
-  ).pipe(
-    Layer.provide(DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer))),
-    Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
-    Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
-    Layer.provide(Layer.mock(ThreadLaunch.ThreadLaunchService)({})),
-    Layer.provide(
-      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/projects" }),
-    ),
-    Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
-    Layer.provide(Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({})),
-    Layer.provide(
-      ServerConfig.layerTest(process.cwd(), { prefix: "t3-peer-forwarding-laptop-" }).pipe(
-        Layer.provide(NodeServices.layer),
+const makeLaptop = (reconnect?: Schedule.Schedule<unknown>) =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<OrchestrationV2ServerCommand>();
+    const linking = yield* layerLinkingEnvironment(laptop).pipe(
+      Layer.provide(
+        reconnect === undefined
+          ? Layer.empty
+          : Layer.succeed(PeerLinks.ReconnectSchedule, reconnect),
       ),
-    ),
-    Layer.provide(NodeServices.layer),
-    Layer.provide(PeerForwarding.layer),
-    Layer.provide(Layer.succeedContext(linking)),
-    Layer.provide(NodeCrypto.layer),
-    Layer.provideMerge(
-      Layer.mock(ThreadManagement.ThreadManagementService)({
-        getThreadShell: (threadId) =>
-          Effect.succeed(
-            threadId === ThreadId.make("thread:laptop-from-desk")
-              ? {
-                  ...liveThreadShell(threadId, { runtimeMode: "full-access" }),
-                  // Work another environment's link started on this laptop.
-                  linkOrigin: { sessionId: "session:desk", label: "T3 Code · Desk" },
-                }
-              : liveThreadShell(
-                  threadId,
-                  threadId === ThreadId.make("thread:laptop-plan")
-                    ? { runtimeMode: "full-access", interactionMode: "plan" }
-                    : { runtimeMode: "full-access" },
-                ),
-          ),
-        getProjectThreadRecords: ({ threadId }) =>
-          Effect.succeed({
-            thread: liveThreadShell(threadId, { runtimeMode: "full-access" }),
-          } as never),
-      }),
-    ),
-    Layer.provide(
-      Layer.mergeAll(
-        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
-        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
-        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
-        Layer.mock(ProjectService.ProjectService)({}),
-        Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({}),
-        Layer.mock(SecretRequests.SecretRequests)({}),
-        ServerSettings.layerTest(),
-        Layer.mock(RemoteDelegation.RemoteDelegation)({}),
-        Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
+      Layer.build,
+    );
+    const layerHere = Layer.mergeAll(
+      McpHttpServer.layerOrchestratorToolkit,
+      McpHttpServer.layerProjectRegistration,
+      McpHttpServer.layerThreadToolkit,
+    ).pipe(
+      Layer.provide(DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer))),
+      Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+      Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
+      Layer.provide(Layer.mock(ThreadLaunch.ThreadLaunchService)({})),
+      Layer.provide(
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/projects" }),
       ),
-    ),
-    Layer.fresh,
-  );
-  const here = yield* Layer.build(layerHere);
-  const server = Context.get(here, McpServer.McpServer);
-  const scopeOf = (
-    caller: string,
-    capabilities: ReadonlySet<McpInvocationContext.McpCapability> = new Set(["orchestration"]),
-  ): McpInvocationContext.McpInvocationScope => ({
-    environmentId: laptop.environmentId,
-    requestNamespace: `provider-session:${caller}`,
-    thread: {
-      threadId: ThreadId.make(caller),
-      providerSessionId: `provider-session:${caller}`,
-      providerInstanceId: ProviderInstanceId.make("codex"),
-    },
-    client: undefined,
-    capabilities,
-    issuedAt: 1,
-  });
-  const call = (
-    caller: string,
-    name: string,
-    args: Record<string, unknown>,
-    capabilities?: ReadonlySet<McpInvocationContext.McpCapability>,
-  ) =>
-    server
-      .callTool({ name, arguments: args })
-      .pipe(
-        Effect.provideService(
-          McpInvocationContext.McpInvocationContext,
-          scopeOf(caller, capabilities),
+      Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
+      Layer.provide(Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({})),
+      Layer.provide(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-peer-forwarding-laptop-" }).pipe(
+          Layer.provide(NodeServices.layer),
         ),
-        Effect.provideService(McpSchema.McpServerClient, mcpClient),
-      );
-  return { links: Context.get(linking, PeerLinks.PeerLinks), call };
-});
+      ),
+      Layer.provide(NodeServices.layer),
+      Layer.provide(PeerForwarding.layer),
+      Layer.provide(Layer.succeedContext(linking)),
+      Layer.provide(NodeCrypto.layer),
+      Layer.provideMerge(
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          getThreadShell: (threadId) =>
+            Effect.succeed(
+              threadId === ThreadId.make("thread:laptop-from-desk")
+                ? {
+                    ...liveThreadShell(threadId, { runtimeMode: "full-access" }),
+                    // Work another environment's link started on this laptop.
+                    linkOrigin: { sessionId: "session:desk", label: "T3 Code · Desk" },
+                  }
+                : liveThreadShell(
+                    threadId,
+                    threadId === ThreadId.make("thread:laptop-plan")
+                      ? { runtimeMode: "full-access", interactionMode: "plan" }
+                      : { runtimeMode: "full-access" },
+                  ),
+            ),
+          getProjectThreadRecords: ({ threadId }) =>
+            Effect.succeed({
+              thread: liveThreadShell(threadId, { runtimeMode: "full-access" }),
+            } as never),
+          dispatch: (command) =>
+            Queue.offer(dispatched, command).pipe(
+              Effect.as({ sequence: 0, storedEvents: [] } as never),
+            ),
+        }),
+      ),
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          ServerSettings.layerTest(),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
+        ),
+      ),
+      Layer.fresh,
+    );
+    const here = yield* Layer.build(layerHere);
+    const server = Context.get(here, McpServer.McpServer);
+    const scopeOf = (
+      caller: string,
+      capabilities: ReadonlySet<McpInvocationContext.McpCapability> = new Set(["orchestration"]),
+    ): McpInvocationContext.McpInvocationScope => ({
+      environmentId: laptop.environmentId,
+      requestNamespace: `provider-session:${caller}`,
+      thread: {
+        threadId: ThreadId.make(caller),
+        providerSessionId: `provider-session:${caller}`,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      },
+      client: undefined,
+      capabilities,
+      issuedAt: 1,
+    });
+    const call = (
+      caller: string,
+      name: string,
+      args: Record<string, unknown>,
+      capabilities?: ReadonlySet<McpInvocationContext.McpCapability>,
+    ) =>
+      server
+        .callTool({ name, arguments: args })
+        .pipe(
+          Effect.provideService(
+            McpInvocationContext.McpInvocationContext,
+            scopeOf(caller, capabilities),
+          ),
+          Effect.provideService(McpSchema.McpServerClient, mcpClient),
+        );
+    return { links: Context.get(linking, PeerLinks.PeerLinks), call, dispatched };
+  });
 
 const failureOf = (result: McpSchema.CallToolResult) => {
   const text = result.content[0];
@@ -366,7 +383,7 @@ it.effect("an agent here works on a linked environment's threads within its own 
       const seen = yield* Ref.make<Seen>(nothingSeen);
       const linkSession = yield* Ref.make("");
       const b = yield* serveBox(seen, linkSession);
-      const a = yield* makeLaptop;
+      const a = yield* makeLaptop();
       yield* linkTo(a.links, b, "auto");
       yield* Ref.set(linkSession, (yield* b.linkedSessions)[0]!.sessionId);
 
@@ -436,7 +453,7 @@ it.effect("keeps a forwarded wait short and its retries scoped to the caller", (
       const seen = yield* Ref.make<Seen>(nothingSeen);
       const linkSession = yield* Ref.make("");
       const b = yield* serveBox(seen, linkSession);
-      const a = yield* makeLaptop;
+      const a = yield* makeLaptop();
       yield* linkTo(a.links, b, "auto");
       yield* Ref.set(linkSession, (yield* b.linkedSessions)[0]!.sessionId);
 
@@ -488,7 +505,7 @@ it.effect("launches in a linked environment with the caller's modes, retry-safe"
       const seen = yield* Ref.make<Seen>(nothingSeen);
       const linkSession = yield* Ref.make("");
       const b = yield* serveBox(seen, linkSession);
-      const a = yield* makeLaptop;
+      const a = yield* makeLaptop();
       yield* linkTo(a.links, b, "full-access");
       yield* Ref.set(linkSession, (yield* b.linkedSessions)[0]!.sessionId);
       const codex = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" };
@@ -540,7 +557,7 @@ it.effect("brings a repository to a linked environment, only through full access
     Effect.gen(function* () {
       const seen = yield* Ref.make<Seen>(nothingSeen);
       const b = yield* serveBox(seen, yield* Ref.make(""));
-      const a = yield* makeLaptop;
+      const a = yield* makeLaptop();
       const clone = { repository: "pingdotgg/t3code", destinationPath: "/home/box/t3code" };
       const register = { title: "t3code", workspaceRoot: "/home/box/t3code" };
 
@@ -591,7 +608,7 @@ it.effect("runs any tool that takes a linked environment there", () =>
       const seen = yield* Ref.make<Seen>(nothingSeen);
       const linkSession = yield* Ref.make("");
       const b = yield* serveBox(seen, linkSession);
-      const a = yield* makeLaptop;
+      const a = yield* makeLaptop();
       yield* linkTo(a.links, b, "auto");
       yield* Ref.set(linkSession, (yield* b.linkedSessions)[0]!.sessionId);
 
@@ -626,7 +643,7 @@ it.effect("refuses what a linked environment cannot take before anything leaves"
       const seen = yield* Ref.make<Seen>(nothingSeen);
       const linkSession = yield* Ref.make("");
       const b = yield* serveBox(seen, linkSession);
-      const a = yield* makeLaptop;
+      const a = yield* makeLaptop();
       yield* linkTo(a.links, b, "auto");
       yield* Ref.set(linkSession, (yield* b.linkedSessions)[0]!.sessionId);
       yield* Ref.set(b.bearers, []);
@@ -688,6 +705,67 @@ it.effect("refuses what a linked environment cannot take before anything leaves"
         expect(failureOf(relayed), name).toMatchObject({ code: "capability_denied" });
       }
       expect(yield* Ref.get(b.bearers)).toEqual([]);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("wakes the threads a sleeping environment failed once it answers again", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const seen = yield* Ref.make<Seen>(nothingSeen);
+      const linkSession = yield* Ref.make("");
+      const b = yield* serveBox(seen, linkSession);
+      // Each failed re-check is offered, then waits for the test to allow the next.
+      const failedChecks = yield* Queue.unbounded<void>();
+      const nextCheck = yield* Queue.unbounded<void>();
+      const a = yield* makeLaptop(
+        Schedule.forever.pipe(
+          Schedule.tap(() =>
+            Queue.offer(failedChecks, undefined).pipe(Effect.andThen(Queue.take(nextCheck))),
+          ),
+        ),
+      );
+      yield* linkTo(a.links, b, "auto");
+      yield* Ref.set(linkSession, (yield* b.linkedSessions)[0]!.sessionId);
+
+      // The box sleeps: its address no longer answers as it.
+      yield* Ref.set(b.descriptor, descriptorOf("environment-elsewhere", "Elsewhere"));
+      const read = yield* a.call("thread:laptop-full", "t3_thread_read", {
+        environmentId: box.environmentId,
+        threadId: boxThread,
+      });
+      expect(failureOf(read)).toMatchObject({ code: "environment_unreachable" });
+      expect(failureOf(read).message).toContain("gets a message when it answers again");
+      for (const caller of ["thread:laptop-full", "thread:laptop-other"]) {
+        const sent = yield* a.call(caller, "t3_thread_send", {
+          environmentId: box.environmentId,
+          threadId: boxThread,
+          message: "Carry on there.",
+        });
+        expect(failureOf(sent)).toMatchObject({ code: "environment_unreachable" });
+      }
+      yield* Queue.take(failedChecks);
+      expect(yield* Queue.size(a.dispatched)).toBe(0);
+
+      // It wakes, and the next check wakes each thread that hit it, once.
+      yield* Ref.set(b.descriptor, box);
+      yield* Queue.offer(nextCheck, undefined);
+      const woken = [yield* Queue.take(a.dispatched), yield* Queue.take(a.dispatched)];
+      expect(
+        woken.map((command) =>
+          command.type === "message.dispatch" ? [command.threadId, command.notification] : command,
+        ),
+      ).toEqual(
+        ["thread:laptop-full", "thread:laptop-other"].map((threadId) => [
+          threadId,
+          { source: { kind: "background_task" }, outcome: "completed", summary: "Box is back" },
+        ]),
+      );
+      expect((yield* a.links.list).map((link) => [link.status, link.lastError])).toEqual([
+        ["reachable", null],
+      ]);
+      expect(yield* Queue.size(failedChecks)).toBe(0);
+      expect(yield* Queue.size(a.dispatched)).toBe(0);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

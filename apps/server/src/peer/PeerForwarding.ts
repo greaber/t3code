@@ -1,5 +1,7 @@
 import {
+  CommandId,
   type EnvironmentId,
+  MessageId,
   OrchestratorMcpFailure,
   type OrchestratorMcpEnvironmentLinksResult,
   OrchestratorMcpThreadInterruptInput,
@@ -8,14 +10,18 @@ import {
   OrchestratorMcpThreadReadResult,
   OrchestratorMcpThreadWaitInput,
   OrchestratorMcpThreadWaitResult,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
 import * as Layer from "effect/Layer";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as EffectScope from "effect/Scope";
 import type * as Tool from "effect/ai/Tool";
 
 import { assertNotLinked } from "../mcp/linkOrigin.ts";
@@ -47,7 +53,9 @@ export class PeerForwarding extends Context.Service<
   {
     /**
      * Runs `tool` in the linked environment `environmentId` with `params`. A
-     * `t3_thread_wait` goes in pieces short enough to survive any route.
+     * `t3_thread_wait` goes in pieces short enough to survive any route. When
+     * the environment does not answer, the calling thread gets a message once
+     * it answers again.
      */
     readonly call: <T extends Tool.Any>(
       scope: Scope,
@@ -96,6 +104,75 @@ const make = Effect.gen(function* () {
   const links = yield* PeerLinks.PeerLinks;
   const crypto = yield* Digest.Digest;
   const threads = yield* ThreadManagement.ThreadManagementService;
+  const random = yield* SecureRandom.SecureRandom;
+  // Reconnect watchers live as long as this service.
+  const watchers = yield* EffectScope.Scope;
+
+  /** Threads to wake once each unreachable environment answers; one watcher per environment. */
+  const waiting = new Map<EnvironmentId, Set<ThreadId>>();
+
+  const wake = Effect.fn("PeerForwarding.wake")(function* (
+    threadId: ThreadId,
+    environmentId: EnvironmentId,
+    outcome: Result.Result<{ readonly label: string }, { readonly message: string }>,
+  ) {
+    const shell = yield* threads.getThreadShell(threadId);
+    if (shell === null || shell.archivedAt !== null || shell.deletedAt !== null) return;
+    const id = yield* random.uuidV4();
+    const reached = Result.isSuccess(outcome);
+    yield* threads.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make(`command:peer-reconnect:${id}`),
+      threadId,
+      messageId: MessageId.make(`message:peer-reconnect:${id}`),
+      text: reached
+        ? `${outcome.success.label} (environmentId ${environmentId}) answers again. Carry on with what you were doing there; retry a call that failed with the same clientRequestId.`
+        : `Stopped waiting for environmentId ${environmentId}: ${outcome.failure.message}`,
+      notification: {
+        source: { kind: "background_task" },
+        outcome: reached ? "completed" : "failed",
+        summary: reached
+          ? `${outcome.success.label} is back`
+          : `Stopped waiting for a linked environment`,
+      },
+      attachments: [],
+      dispatchMode: { type: "queue_after_active" },
+      createdBy: "agent",
+      creationSource: "server",
+    });
+  });
+
+  /** Wakes `threadId` when `environmentId` answers again, or when waiting can no longer help. */
+  const wakeOnReconnect = (environmentId: EnvironmentId, threadId: ThreadId) =>
+    Effect.suspend(() => {
+      const already = waiting.get(environmentId);
+      if (already !== undefined) {
+        already.add(threadId);
+        return Effect.void;
+      }
+      const waiters = new Set([threadId]);
+      waiting.set(environmentId, waiters);
+      return links.whenReachable(environmentId).pipe(
+        Effect.result,
+        Effect.flatMap((outcome) => {
+          // Taken in the same step that ends the watch, so no thread is left behind.
+          waiting.delete(environmentId);
+          return Effect.forEach(
+            waiters,
+            (waiter) =>
+              wake(waiter, environmentId, outcome).pipe(Effect.ignoreCause({ log: true })),
+            { discard: true },
+          );
+        }),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (waiting.get(environmentId) === waiters) waiting.delete(environmentId);
+          }),
+        ),
+        Effect.forkIn(watchers),
+        Effect.asVoid,
+      );
+    });
 
   /**
    * The caller's own limits, which travel with every forwarded call: the peer sees only the
@@ -228,7 +305,23 @@ const make = Effect.gen(function* () {
           params as OrchestratorMcpThreadWaitInput,
         ) as Effect.Effect<Tool.Success<typeof tool>, OrchestratorMcpFailure>)
       : forward(scope, tool.name, tool.parametersSchema, tool.successSchema, environmentId, params);
-    return Effect.andThen(requireEnabled, forwarded);
+    const threadId = scope.thread?.threadId;
+    return Effect.andThen(requireEnabled, forwarded).pipe(
+      Effect.catchIf(
+        (error) => error.code === "environment_unreachable" && threadId !== undefined,
+        (error) =>
+          wakeOnReconnect(environmentId, threadId!).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new OrchestratorMcpFailure({
+                  code: error.code,
+                  message: `${error.message} It may be asleep or offline. This thread gets a message when it answers again, so end your turn instead of retrying or polling.`,
+                }),
+              ),
+            ),
+          ),
+      ),
+    );
   };
 
   /**

@@ -26,6 +26,7 @@ import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
@@ -103,6 +104,14 @@ export class PeerLinks extends Context.Service<
     readonly resolve: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<ResolvedPeerLink, PeerLinkError>;
+    /**
+     * Waits for an unreachable link to answer again, checking it on
+     * `ReconnectSchedule`. Fails when the link is forgotten, expires or can
+     * no longer be used, which no amount of waiting fixes.
+     */
+    readonly whenReachable: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<PeerLink, PeerLinkError>;
     /** Records the outcome of a call, so listing shows whether the peer answered last time. */
     readonly recordOutcome: (
       environmentId: EnvironmentId,
@@ -179,6 +188,21 @@ export const LoopbackHost = Context.Reference<(host: string) => boolean>(
   { defaultValue: () => isLocalLoopbackHost },
 );
 
+/** The longest a sleeping machine waits between checks once it stops answering. */
+const RECONNECT_MAX_BACKOFF = Duration.minutes(2);
+/** How `whenReachable` re-checks a link; tests step it by hand. */
+export const ReconnectSchedule = Context.Reference<Schedule.Schedule<unknown>>(
+  "t3/peer/PeerLinks/ReconnectSchedule",
+  {
+    defaultValue: () =>
+      Schedule.exponential(Duration.seconds(3)).pipe(
+        Schedule.modifyDelay(({ duration }) =>
+          Effect.succeed(Duration.min(duration, RECONNECT_MAX_BACKOFF)),
+        ),
+      ),
+  },
+);
+
 /** Whether a peer holds a linked agent to its limits and keeps its work within its link. */
 const linkLimitsHold = (peer: { readonly capabilities: ExecutionEnvironmentCapabilities }) =>
   peer.capabilities.mcpModeLimitHeader === true && peer.capabilities.linkFence === true;
@@ -192,6 +216,7 @@ const make = Effect.gen(function* () {
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const isOwnLoopback = yield* LoopbackHost;
+  const reconnectSchedule = yield* ReconnectSchedule;
   const enabled = serverSettings.getSettings.pipe(
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
     Effect.orElseSucceed(() => false),
@@ -689,6 +714,20 @@ const make = Effect.gen(function* () {
       Effect.ignoreCause({ log: true }),
     );
 
+  const whenReachable: PeerLinks["Service"]["whenReachable"] = Effect.fn("PeerLinks.whenReachable")(
+    function* (environmentId) {
+      // `resolve` tries every address the link has, so whichever wakes first answers.
+      const resolved = yield* resolve(environmentId).pipe(
+        Effect.retry({
+          schedule: reconnectSchedule,
+          while: (error) => error.reason === "unreachable",
+        }),
+      );
+      yield* recordOutcome(environmentId, { error: null });
+      return resolved.link;
+    },
+  );
+
   return PeerLinks.of({
     enabled,
     link,
@@ -696,6 +735,7 @@ const make = Effect.gen(function* () {
     get,
     unlink,
     resolve,
+    whenReachable,
     recordOutcome,
   });
 });
