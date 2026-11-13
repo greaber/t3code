@@ -524,7 +524,8 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       });
       yield* probe(a);
 
-      yield* TestClock.adjust(Duration.days(31));
+      // Past a link session's 100-year lifetime.
+      yield* TestClock.adjust(Duration.days(101 * 365));
       expect((yield* a.links.list).map((link) => link.status)).toEqual(["expired"]);
       yield* Ref.set(b.bearers, []);
       const expired = yield* probe(a).pipe(Effect.flip);

@@ -426,11 +426,11 @@ const errorOf = (result: McpSchema.CallToolResult) => {
   return result.isError === true && text?.type === "text" ? JSON.parse(text.text) : undefined;
 };
 
-/** Runs `effect` a year from now, when every link made today has expired. */
+/** Runs `effect` past a link session's 100-year lifetime, when every link made today has expired. */
 const afterLinksExpire = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
     const clock = yield* Clock.Clock;
-    const ahead = Duration.days(365);
+    const ahead = Duration.days(101 * 365);
     const later = () => clock.currentTimeMillisUnsafe() + Duration.toMillis(ahead);
     const laterNanos = () => clock.currentTimeNanosUnsafe() + Duration.toNanosUnsafe(ahead);
     return yield* effect.pipe(
