@@ -622,6 +622,27 @@ it.live("an app approval code approves only an app sign-in, at its own level", (
   ),
 );
 
+it.live("a link between environments does not expire, while an outside agent's sign-in does", () =>
+  withRoutes((_handler, auth) =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const issue = (peerLink: boolean) =>
+        auth.issueMcpClientSession({
+          label: peerLink ? "Laptop" : "Outside agent",
+          access: "full-access",
+          peerLink,
+          client: { deviceType: "bot" },
+        });
+      const day = 24 * 60 * 60 * 1000;
+      const link = yield* issue(true);
+      expect(link.expiresAt.epochMilliseconds - now).toBeGreaterThan(99 * 365 * day);
+      const agent = yield* issue(false);
+      expect(agent.expiresAt.epochMilliseconds - now).toBeLessThanOrEqual(30 * day + 60_000);
+      expect(agent.expiresAt.epochMilliseconds - now).toBeGreaterThan(29 * day);
+    }),
+  ),
+);
+
 it.live(
   "sends an app sign-in on the linked tunnel to the hosted app, and a link to its own page",
   () =>
