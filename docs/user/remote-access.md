@@ -358,7 +358,9 @@ an address you trust: the code is sent there.
 - The link shows up in that machine's **Settings → Sharing & access** like any
   outside agent. Revoke it there to end it. **Forget** on this machine only
   removes it here.
-- Links last 30 days. Link again with a new pairing code to renew one.
+- Links do not expire. They last until you revoke them on that machine or forget
+  them here. Links made by earlier versions keep their 30-day expiry; link again
+  to replace one.
 
 An agent can also hand a task to a linked machine with `delegate_task`: it runs
 there as an ordinary thread, in the project with the same repository (or the
