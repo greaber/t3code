@@ -36,6 +36,7 @@ import {
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
 import * as Schema from "effect/Schema";
+import { DraftId } from "./draftId";
 import * as Equal from "effect/Equal";
 import * as Effect from "effect/Effect";
 import { DeepMutable } from "effect/Types";
@@ -121,8 +122,7 @@ const COMPOSER_DRAFT_STORAGE_VERSION = 9;
 const DraftThreadEnvModeSchema = Schema.Literals(["local", "worktree"]);
 export type DraftThreadEnvMode = typeof DraftThreadEnvModeSchema.Type;
 
-export const DraftId = Schema.String.pipe(Schema.brand("DraftId"));
-export type DraftId = typeof DraftId.Type;
+export { DraftId } from "./draftId";
 
 const COMPOSER_PERSIST_DEBOUNCE_MS = 300;
 
