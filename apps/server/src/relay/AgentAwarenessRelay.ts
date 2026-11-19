@@ -758,7 +758,7 @@ export const make = Effect.gen(function* () {
       if (requestId !== entry.requestId) subagentRequests.set(childId, { ...entry, requestId });
       // The newest wait is the one to announce.
       if (pending === null || DateTime.isGreaterThan(child.updatedAt, pending.updatedAt)) {
-        pending = { requestId, updatedAt: child.updatedAt };
+        pending = { threadId: childId, title: child.title, requestId, updatedAt: child.updatedAt };
       }
     }
     return pending;

@@ -287,7 +287,9 @@ Stop on a thread also stops the subagents it delegated to.
 
 Subagent threads started by the agent can't take messages; message the parent
 thread instead. When such a subagent needs an approval or an answer, the parent
-thread asks for it.
+thread asks for it, and an approval notification names the subagent and opens it.
+Subagents don't notify you when they finish. The parent notifies you once it
+finishes with no delegated work left running.
 
 Expand a tool call in the conversation to see its full command and output.
 Summaries shorten shell wrappers and can still describe the latest call after it

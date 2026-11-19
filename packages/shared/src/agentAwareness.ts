@@ -24,6 +24,9 @@ export type AgentAwarenessPhase =
   | "stale";
 
 export interface SubagentRequestAwareness {
+  /** The asking subagent, which the alert names and opens. */
+  readonly threadId: ThreadId;
+  readonly title: string;
   readonly requestId: RuntimeRequestId;
   /** The child's own update time, which moves whenever its request changes. */
   readonly updatedAt: DateTime.Utc;
@@ -112,12 +115,18 @@ export function projectThreadAwarenessV2(
   ) {
     return null;
   }
+  const asking =
+    subagentRequest !== null && resolveThreadAwarenessPhaseV2(thread, false) !== phase
+      ? subagentRequest
+      : null;
   const detail =
-    phase === "completed"
-      ? "Review the completed task."
-      : phase === "failed"
-        ? "The agent run failed."
-        : undefined;
+    asking !== null
+      ? `${asking.title} needs approval.`
+      : phase === "completed"
+        ? "Review the completed task."
+        : phase === "failed"
+          ? "The agent run failed."
+          : undefined;
   return {
     environmentId,
     threadId: thread.id,
@@ -134,7 +143,10 @@ export function projectThreadAwarenessV2(
         ? thread.updatedAt
         : DateTime.max(thread.updatedAt, subagentRequest.updatedAt),
     ),
-    deepLink: buildAgentAwarenessDeepLink({ environmentId, threadId: thread.id }),
+    deepLink: buildAgentAwarenessDeepLink({
+      environmentId,
+      threadId: asking?.threadId ?? thread.id,
+    }),
   };
 }
 

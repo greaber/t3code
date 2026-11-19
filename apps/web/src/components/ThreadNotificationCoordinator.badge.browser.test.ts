@@ -51,7 +51,8 @@ vi.mock(import("../state/threads"), async (original) => {
     ...actual,
     environmentThreadShells: {
       ...actual.environmentThreadShells,
-      pendingSubagentRequestsAtom: (() => noRequestsAtom) as never,
+      pendingSubagentRequestsAtom: (() => requestsAtom) as never,
+      childThreadInputsAtom: (() => childInputsAtom) as never,
       get delegatedUnderParentAtom() {
         return noDelegatedAtom as never;
       },
@@ -81,7 +82,8 @@ import { startThreadNotifications } from "./ThreadNotificationCoordinator";
 let registry: AtomRegistry.AtomRegistry;
 const shellAtom = Atom.family((_id: string) => Atom.make<unknown>(null));
 const environmentIdsAtom = Atom.make<ReadonlyArray<string>>([]);
-const noRequestsAtom = Atom.make(new Map());
+const requestsAtom = Atom.make<ReadonlyMap<string, string>>(new Map());
+const childInputsAtom = Atom.make<ReadonlyArray<unknown>>([]);
 const noDelegatedAtom = Atom.make<ReadonlySet<string>>(new Set<string>());
 state.shells = { set: (id, value) => registry.set(shellAtom(id), value) };
 
@@ -253,6 +255,31 @@ it.each(["hasPendingApprovals", "hasPendingUserInput"] as const)(
     expect(TestNotification.sent.map(({ title }) => title)).toEqual([title, title]);
   },
 );
+
+it("names a subagent asking for approval through its parent and opens it", async () => {
+  await using app = setup();
+  app.start();
+  registry.set(childInputsAtom, [
+    {
+      environmentId: "two",
+      id: "child",
+      title: "Fix flaky test",
+      hasPendingApprovals: true,
+      lineage: { sideChat: false },
+    },
+  ]);
+  registry.set(requestsAtom, new Map([["thread", "approval"]]));
+  const [notification] = TestNotification.sent;
+  expect([notification?.title, notification?.options.body]).toEqual([
+    "Approval needed",
+    "Fix flaky test (in Test thread)",
+  ]);
+  notification!.dispatchEvent(new Event("click"));
+  expect(state.navigate).toHaveBeenCalledWith({
+    to: "/$environmentId/$threadId",
+    params: { environmentId: "two", threadId: "child" },
+  });
+});
 
 it("presents completion notifications and sound as soon as the shell completes", async () => {
   await using app = setup();
