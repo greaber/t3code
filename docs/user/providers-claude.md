@@ -86,6 +86,13 @@ Claude Code holds the turn until that window reopens, so it can keep showing as
 working. Wait for the reset, or stop the turn and continue later. The warning's
 timestamp shows when the displayed wait started.
 
+Some API gateways and proxies that pool accounts reject requests without passing
+on Claude's reset time. The thread then shows **Waiting for Claude capacity** and
+picks its own retry time: 5 minutes at first, doubling up to 30 minutes while the
+limit persists, and never sooner than the wait the gateway suggests. With
+**Resume after usage limits** on in **Settings → Threads**, or after you choose
+**Resume at reset**, the turn continues at that time, including in delegated tasks.
+
 ## Skills
 
 Claude skills come from the config directory's `skills` folder and the project's
