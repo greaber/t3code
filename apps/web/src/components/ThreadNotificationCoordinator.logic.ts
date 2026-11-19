@@ -11,9 +11,11 @@ export interface ThreadNotificationObservation {
   readonly completedAt: number | null;
   /** The latest run answers a background-work progress wake, like a Monitor line. */
   readonly backgroundWake: boolean;
+  /** When the latest run completed, while background work such as a delegated task holds it. */
+  readonly heldCompletedAt: number | null;
 }
 
-/** Matches the push relay's completion confirmation: a final wake can start right after a progress wake. */
+/** Matches the push relay's completion confirmation: a wake can start right after held work ends. */
 export const RELEASED_COMPLETION_GRACE_MS = 5_000;
 
 export function createThreadNotificationGate<Key>(
@@ -83,7 +85,8 @@ export function createThreadNotificationGate<Key>(
       }
       const at = next.completedAt;
       if (!next.settled || at === null || at <= (handled.get(key) ?? -Infinity)) return;
-      if (next.backgroundWake) {
+      // Held work that ends wakes the agent, and its result commits before that wake run exists.
+      if (next.backgroundWake || prior.heldCompletedAt === at) {
         release(key, at);
         return;
       }

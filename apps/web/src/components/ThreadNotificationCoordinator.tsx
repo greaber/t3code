@@ -142,6 +142,26 @@ export function startThreadNotifications(
               : status === "request"
                 ? "Guest request"
                 : "Input needed";
+    // A subagent or side chat asking through its parent is named and opened directly.
+    const requester =
+      kind === "input" &&
+      state.subagentRequest !== null &&
+      !thread.hasPendingApprovals &&
+      !thread.hasPendingUserInput
+        ? (registry
+            .get(
+              environmentThreadShells.childThreadInputsAtom({ environmentId, threadId: thread.id }),
+            )
+            .find((child) =>
+              state.subagentRequest === "approval"
+                ? child.hasPendingApprovals
+                : child.lineage.sideChat === true,
+            ) ?? null)
+        : null;
+    const body = requester ? `${requester.title} (in ${thread.title})` : thread.title;
+    const target = requester
+      ? { environmentId: requester.environmentId, threadId: requester.id }
+      : { environmentId, threadId: thread.id };
     if (hasNotificationSound(mode)) {
       void playNotificationSound(kind, () =>
         hasNotificationSound(getClientSettings().notificationMode),
@@ -158,7 +178,7 @@ export function startThreadNotifications(
         onRemove: (): void => forgetToast(toastKey, toastId),
         type: kind === "completion" ? "success" : status === "failed" ? "error" : "warning",
         title,
-        description: thread.title,
+        description: body,
         data: {
           hideCopyButton: true,
           leadingIcon:
@@ -178,10 +198,7 @@ export function startThreadNotifications(
           children: "Open thread",
           onClick: () => {
             toastManager.close(toastId);
-            void router.navigate({
-              to: "/$environmentId/$threadId",
-              params: { environmentId, threadId: thread.id },
-            });
+            void router.navigate({ to: "/$environmentId/$threadId", params: target });
           },
         },
       });
@@ -197,7 +214,7 @@ export function startThreadNotifications(
       return;
     try {
       const notification = new Notification(title, {
-        body: thread.title,
+        body,
         tag: threadNotificationTag(environmentId, thread.id),
         silent: true,
         // Windows drops clicks after a toast moves into Notification Center.
@@ -208,10 +225,7 @@ export function startThreadNotifications(
         notification.close();
         window.focus();
         void window.desktopBridge?.revealWindow().catch(() => undefined);
-        void router.navigate({
-          to: "/$environmentId/$threadId",
-          params: { environmentId, threadId: thread.id },
-        });
+        void router.navigate({ to: "/$environmentId/$threadId", params: target });
       });
     } catch {
       // Some browsers expose Notification but reject desktop presentation.
@@ -264,8 +278,8 @@ export function startThreadNotifications(
       const attention = needsAttention
         ? `${thread.latestRun?.runId ?? ""}:${status}:${requestId ?? ""}`
         : null;
-      const completed = status === "ready" && thread.latestRun?.status === "completed";
-      const settled = completed && !monitorHoldsWakeCompletion(rawThread);
+      const runCompleted = thread.latestRun?.status === "completed";
+      const settled = status === "ready" && runCompleted && !monitorHoldsWakeCompletion(rawThread);
       const parsedCompletedAt = Date.parse(thread.latestRun?.completedAt ?? "");
       const completedAt = Number.isFinite(parsedCompletedAt) ? parsedCompletedAt : null;
       const state = {
@@ -278,6 +292,7 @@ export function startThreadNotifications(
         settled,
         completedAt: settled ? completedAt : null,
         backgroundWake: rawThread.latestRunBackgroundWake === true,
+        heldCompletedAt: runCompleted && !settled ? completedAt : null,
       };
       next.set(thread.id, state);
       changed.push([prior, state]);

@@ -12,6 +12,7 @@ const working: ThreadNotificationObservation = {
   settled: false,
   completedAt: null,
   backgroundWake: false,
+  heldCompletedAt: null,
 };
 const completed = (at: number): ThreadNotificationObservation => ({
   attention: null,
@@ -19,12 +20,14 @@ const completed = (at: number): ThreadNotificationObservation => ({
   settled: true,
   completedAt: at,
   backgroundWake: false,
+  heldCompletedAt: null,
 });
 const waking: ThreadNotificationObservation = { ...working, backgroundWake: true };
 const woke = (at: number): ThreadNotificationObservation => ({
   ...completed(at),
   backgroundWake: true,
 });
+const held = (at: number): ThreadNotificationObservation => ({ ...working, heldCompletedAt: at });
 const visible = { archived: false, quiet: false };
 
 function fakeTimers(): Disposable {
@@ -159,6 +162,26 @@ describe("createThreadNotificationGate", () => {
       ["thread", "completion"],
       ["thread", "completion"],
     ]);
+  });
+
+  it("waits out the grace when held work ends, so the wake it starts replaces the completion", () => {
+    using _timers = fakeTimers();
+    const { notify, observe } = harness();
+    observe(working);
+    // The run ended while a delegated task still ran, then the task finished before its wake.
+    observe(held(1));
+    observe(completed(1));
+    expect(notify).not.toHaveBeenCalled();
+    observe(working);
+    vi.advanceTimersByTime(RELEASED_COMPLETION_GRACE_MS);
+    expect(notify).not.toHaveBeenCalled();
+    observe(held(2));
+    observe(completed(2));
+    vi.advanceTimersByTime(RELEASED_COMPLETION_GRACE_MS - 1);
+    observe({ ...completed(2) });
+    expect(notify).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(notify.mock.calls).toEqual([["thread", "completion"]]);
   });
 
   it("notifies a wake's completion once after the grace when no run follows, even across a pause", () => {

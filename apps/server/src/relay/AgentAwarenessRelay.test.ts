@@ -354,6 +354,8 @@ describe("AgentAwarenessRelay", () => {
       assert.equal(publications.length, 2);
       assert.isTrue(publications[1]?.url.includes(`/threads/${THREAD_ID}/`) ?? false);
       assert.equal(publications[1]?.state?.phase, "waiting_for_approval");
+      assert.equal(publications[1]?.state?.detail, "Child needs approval.");
+      assert.isTrue(publications[1]?.state?.deepLink.endsWith(`/${CHILD_THREAD_ID}`) ?? false);
 
       // A rename keeps the same request's alert time, so the phone doesn't re-alert.
       yield* setShell(
