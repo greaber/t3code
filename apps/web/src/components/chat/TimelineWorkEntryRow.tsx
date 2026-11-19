@@ -24,6 +24,7 @@ import {
   turnItemNeedsDetailFetch,
 } from "@t3tools/client-runtime/work-log/item-detail";
 import { claudeSkillInvocation } from "@t3tools/shared/toolActivity";
+import { CLAUDE_CAPACITY_RETRY_CODE } from "@t3tools/shared/usageLimits";
 import { memo, use, useState, type KeyboardEvent } from "react";
 import {
   workEntryDisplayIndicatesToolFailure,
@@ -248,7 +249,11 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
       ? `${formatUpcomingTimestamp(resetAt, timestampFormat, undefined, timeZone)} (${timeZone})`
       : null;
     const label = warning
-      ? `Usage limit reached.${resetTime ? ` Retry after ${resetTime}.` : ""}`
+      ? `${
+          failureItem.failure.code === CLAUDE_CAPACITY_RETRY_CODE
+            ? "Waiting for Claude capacity."
+            : "Usage limit reached."
+        }${resetTime ? ` Retry after ${resetTime}.` : ""}`
       : workEntry.label;
     const retryRunId =
       failureItem.runId !== null &&

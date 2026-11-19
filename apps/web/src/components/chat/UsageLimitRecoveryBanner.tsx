@@ -9,6 +9,7 @@ import { limitRecoveryOwnsSnooze } from "@t3tools/client-runtime/state/thread-ex
 import {
   CHATGPT_USAGE_LIMIT_CODE,
   CHATGPT_WORKSPACE_USAGE_LIMIT_CODE,
+  CLAUDE_CAPACITY_RETRY_CODE,
 } from "@t3tools/shared/usageLimits";
 import { GaugeIcon } from "lucide-react";
 import { useState } from "react";
@@ -58,8 +59,17 @@ export function usageLimitRecoveryBannerItem(props: RecoveryProps): ComposerBann
     resumes && resetAt && snoozedUntil && Date.parse(snoozedUntil) > Date.parse(resetAt)
       ? snoozedUntil
       : resetAt;
+  // Claude reported no reset, so resetAt is when T3 Code next retries.
+  const capacityRetry = errorCode === CLAUDE_CAPACITY_RETRY_CODE;
+  const resetVerb = capacityRetry
+    ? resumes
+      ? "Retries"
+      : "Retry after"
+    : resumes
+      ? "Resumes"
+      : "Resets";
   const resetDescription = displayAt
-    ? `${resumes ? "Resumes" : "Resets"} ${formatUpcomingTimestamp(displayAt, timestampFormat)}`
+    ? `${resetVerb} ${formatUpcomingTimestamp(displayAt, timestampFormat)}`
     : "Reset time unavailable; retry manually";
   if (!chatGptLimit) {
     return {
@@ -67,7 +77,7 @@ export function usageLimitRecoveryBannerItem(props: RecoveryProps): ComposerBann
       variant: "warning",
       group: "environment",
       icon: <GaugeIcon />,
-      title: "Usage limit reached",
+      title: capacityRetry ? "Waiting for Claude capacity" : "Usage limit reached",
       description: resetDescription,
       actions: recoveryActions,
     };

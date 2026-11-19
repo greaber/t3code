@@ -102,6 +102,8 @@ export function resolveNewThreadModelSelection(input: {
   };
 }
 
+/** Claude hit a limit without reporting its reset; the failure's resetAt is T3's next retry. */
+export const CLAUDE_CAPACITY_RETRY_CODE = "claude_capacity_retry";
 export const CHATGPT_USAGE_URL = "https://chatgpt.com/#settings/Usage";
 export const CHATGPT_USAGE_LIMIT_CODE = "subscription_sharing_usage_limit_exceeded";
 /** A ChatGPT Business admin caps plan use in other apps; only the admin can raise it. */

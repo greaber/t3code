@@ -41,6 +41,7 @@ import {
   NodeId,
   type OrchestrationV2AppThread,
   type OrchestrationV2PendingBackgroundTask,
+  type OrchestrationV2ProviderFailure,
   OrchestrationV2ProviderThread,
   ProjectId,
   ProviderInstanceId,
@@ -78,6 +79,7 @@ import { Tool } from "effect/ai";
 import { formatClaudeResumeCompactionQuestion } from "@t3tools/shared/claudeCompaction";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+import { CLAUDE_CAPACITY_RETRY_CODE } from "@t3tools/shared/usageLimits";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 
 import * as PortScanner from "../../preview/PortScanner.ts";
@@ -3081,6 +3083,20 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       uuid: input.uuid,
       session_id: WAKE_NATIVE_SESSION,
     });
+  // A gateway's guessed cooldown only bounds the capacity backoff from below.
+  const assertCapacityRetryAt = (
+    failure: OrchestrationV2ProviderFailure,
+    from: DateTime.Utc,
+    attempt: number,
+    hintSeconds = 0,
+  ) => {
+    assert.equal(failure.code, CLAUDE_CAPACITY_RETRY_CODE);
+    const backoffMs = Math.min(5 * 2 ** (attempt - 1), 30) * 60_000;
+    const waitMs = Date.parse(failure.resetAt ?? "") - DateTime.toEpochMillis(from);
+    assert.isAtLeast(waitMs, Math.max(hintSeconds * 1_000, backoffMs));
+    assert.isAtMost(waitMs, Math.max(hintSeconds * 1_000, backoffMs * 1.2));
+  };
+
   const makeResultFrame = (input: {
     readonly uuid: string;
     readonly result: string;
@@ -6710,7 +6726,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       assert.equal(terminal.status, "failed");
       if (terminal.status !== "failed") return;
       assert.equal(terminal.failure.message, input.expected);
-      assert.equal(terminal.failure.code, `api_error_${apiErrorStatus}`);
+      assert.equal(
+        terminal.failure.code,
+        apiErrorStatus === 429 ? CLAUDE_CAPACITY_RETRY_CODE : `api_error_${apiErrorStatus}`,
+      );
       assert.equal(
         terminal.failure.class,
         apiErrorStatus === 429 ? "usage_limit" : "provider_error",
@@ -7682,12 +7701,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       assert.equal(terminal.failure.class, input.seconds > 0 ? "usage_limit" : "provider_error");
       if (input.seconds > 0) {
         assert.equal(terminal.failure.retryable, true);
-        assert.equal(
-          terminal.failure.resetAt,
-          DateTime.formatIso(
-            DateTime.makeUnsafe(DateTime.toEpochMillis(now) + input.seconds * 1_000),
-          ),
-        );
+        assertCapacityRetryAt(terminal.failure, now, 1, input.seconds);
       } else {
         assert.isUndefined(terminal.failure.resetAt);
       }
@@ -7707,7 +7721,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     { cooldown: " (reset after 1h2m3s)", seconds: 3723 },
     { cooldown: " (reset after 4m 6s) (last error: rate limited)", seconds: 246 },
     { cooldown: "", seconds: 0 },
-  ])("keeps a gateway's reset on a direct 429 with cooldown '$cooldown'", (input) =>
+  ])("retries a gateway's direct 429 no sooner than its cooldown '$cooldown'", (input) =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;
       const now = yield* DateTime.now;
@@ -7741,14 +7755,66 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       assert.equal(terminal.status, "failed");
       if (terminal.status !== "failed") return;
       assert.equal(terminal.failure.class, "usage_limit");
-      assert.equal(
-        terminal.failure.resetAt,
-        input.seconds > 0
-          ? DateTime.formatIso(
-              DateTime.makeUnsafe(DateTime.toEpochMillis(now) + input.seconds * 1_000),
-            )
-          : null,
-      );
+      assertCapacityRetryAt(terminal.failure, now, 1, input.seconds);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
+  it.effect("backs off repeated capacity retries until a turn succeeds", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      const limitedTurn = Effect.fn(function* (index: number, outcome: "limited" | "completed") {
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make(`attempt-capacity-retry-${index}`),
+            text: "Continue.",
+            attachments: [],
+          }),
+        );
+        const uuid = (suffix: number) =>
+          `00000000-0000-4000-8000-0000000017${String(index * 2 + suffix).padStart(2, "0")}`;
+        const result = "API Error: Request rejected (429) · All credentials are cooling down";
+        yield* Queue.offerAll(
+          harness.sdkMessages,
+          outcome === "limited"
+            ? [
+                makeAssistantErrorFrame({ uuid: uuid(0), error: "rate_limit", text: result }),
+                makeResultFrame({
+                  uuid: uuid(1),
+                  result,
+                  terminalReason: "api_error",
+                  isError: true,
+                  apiErrorStatus: 429,
+                }),
+              ]
+            : [makeResultFrame({ uuid: uuid(1), result: "Done." })],
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        return { now, terminal };
+      });
+      for (const [index, attempt] of [1, 2, 3, 4, 5].entries()) {
+        const { now, terminal } = yield* limitedTurn(index, "limited");
+        assert(terminal.status === "failed");
+        assertCapacityRetryAt(terminal.failure, now, attempt);
+        yield* TestClock.adjust("1 hour");
+      }
+      const completed = yield* limitedTurn(5, "completed");
+      assert.equal(completed.terminal.status, "completed");
+      const { now, terminal } = yield* limitedTurn(6, "limited");
+      assert(terminal.status === "failed");
+      assertCapacityRetryAt(terminal.failure, now, 1);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -10180,7 +10246,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         if (terminal.status !== "failed") return;
         assert.equal(terminal.failure.class, expectedClass);
         assert.include(terminal.failure.message, expectedMessage);
-        assert.equal(terminal.failure.code, "blocking_limit");
+        assert.equal(
+          terminal.failure.code,
+          expectedClass === "usage_limit" ? CLAUDE_CAPACITY_RETRY_CODE : "blocking_limit",
+        );
         if (expectedClass === "provider_error") {
           assert.include(terminal.failure.message, "/compact");
         }

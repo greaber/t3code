@@ -84,6 +84,7 @@ import {
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { applyClaudePromptEffortPrefix } from "@t3tools/shared/model";
+import { CLAUDE_CAPACITY_RETRY_CODE } from "@t3tools/shared/usageLimits";
 import { compareSemverVersions } from "@t3tools/shared/semver";
 import {
   CLAUDE_RESUME_COMPACTION_COMPACT_ANSWER,
@@ -150,6 +151,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
+import * as Random from "effect/Random";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -4319,6 +4321,17 @@ const CLAUDE_USAGE_LIMIT_WINDOWS = {
 
 const CLAUDE_USAGE_LIMIT_MAX_WAIT_MS = 30 * 24 * 60 * 60 * 1000;
 
+const CLAUDE_CAPACITY_RETRY_BASE_MS = 5 * 60_000;
+const CLAUDE_CAPACITY_RETRY_MAX_MS = 30 * 60_000;
+
+/** Backoff before retrying a limit with no reset Claude reported; up to 20% jitter spreads pooled retries. */
+function claudeCapacityRetryDelayMs(attempt: number, jitter: number): number {
+  return (
+    Math.min(CLAUDE_CAPACITY_RETRY_BASE_MS * 2 ** (attempt - 1), CLAUDE_CAPACITY_RETRY_MAX_MS) *
+    (1 + jitter)
+  );
+}
+
 function describeClaudeUsageLimit(
   info: SDKRateLimitInfo,
   nowMs: number,
@@ -4951,6 +4964,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
   let modelCatalog = yield* loadModelCatalog;
   // Results report the window Claude Code compacts against; outside the catalog it is the only source.
   const reportedContextWindows = new Map<string, number>();
+  // Consecutive limit failures without a reported reset, so capacity retries back off per thread.
+  const capacityRetryAttempts = new Map<ThreadId, number>();
   const claudeContextWindow = (modelSelection: ModelSelection): number | null =>
     resolveClaudeCatalogContextWindowTokens(modelCatalog, modelSelection) ??
     reportedContextWindows.get(
@@ -10224,10 +10239,30 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     failureHint,
                     usageLimited,
                   );
-            const terminalFailure =
-              resultFailure?.class === "usage_limit"
-                ? { ...resultFailure, resetAt: resetAt ?? resultFailure.resetAt ?? null }
-                : resultFailure;
+            const completedMs = DateTime.toEpochMillis(completedAt);
+            let terminalFailure = resultFailure;
+            if (resultFailure?.class === "usage_limit") {
+              if (resetAt !== null && Date.parse(resetAt) > completedMs) {
+                terminalFailure = { ...resultFailure, resetAt };
+              } else {
+                // A pooling gateway's "(reset after …)" is a guess, so it only bounds the wait from below.
+                const attempt = (capacityRetryAttempts.get(context.input.threadId) ?? 0) + 1;
+                capacityRetryAttempts.set(context.input.threadId, attempt);
+                const hintMs = resultFailure.resetAt ? Date.parse(resultFailure.resetAt) : 0;
+                const retryMs = Math.max(
+                  completedMs +
+                    claudeCapacityRetryDelayMs(attempt, yield* Random.nextBetween(0, 0.2)),
+                  Number.isFinite(hintMs) ? hintMs : 0,
+                );
+                terminalFailure = {
+                  ...resultFailure,
+                  code: CLAUDE_CAPACITY_RETRY_CODE,
+                  resetAt: DateTime.formatIso(DateTime.makeUnsafe(Math.round(retryMs))),
+                };
+              }
+            } else if (!interrupted && resultFailure === null) {
+              capacityRetryAttempts.delete(context.input.threadId);
+            }
             yield* finalizeActiveTurn({
               context,
               status: interrupted

@@ -8,6 +8,7 @@ import {
   CHATGPT_USAGE_URL,
   CHATGPT_WORKSPACE_ADMIN_REQUEST,
   CHATGPT_WORKSPACE_USAGE_LIMIT_CODE,
+  CLAUDE_CAPACITY_RETRY_CODE,
 } from "@t3tools/shared/usageLimits";
 import * as Clipboard from "expo-clipboard";
 import { useState } from "react";
@@ -58,11 +59,18 @@ export function UsageLimitRecoveryCard({
     !runId
   )
     return null;
+  // Claude reported no reset, so resetAt is when T3 Code next retries.
+  const capacityRetry = code === CLAUDE_CAPACITY_RETRY_CODE;
+  const resumes = canSchedule && scheduled;
   const resetText = displayAt
-    ? `${canSchedule && scheduled ? "Resumes" : "Resets"} ${new Date(displayAt).toLocaleString(
-        undefined,
-        { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" },
-      )}.`
+    ? `${
+        capacityRetry ? (resumes ? "Retries" : "Retry after") : resumes ? "Resumes" : "Resets"
+      } ${new Date(displayAt).toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      })}.`
     : null;
   const snoozed =
     limitRecoveryOwnsSnooze({
@@ -151,7 +159,7 @@ export function UsageLimitRecoveryCard({
             : chatGptLimit
               ? (resetText ?? "Review your usage settings in ChatGPT.")
               : resetText
-                ? `Usage limit reached. ${resetText}`
+                ? `${capacityRetry ? "Waiting for Claude capacity." : "Usage limit reached."} ${resetText}`
                 : "Usage limit reached. The provider did not report a reset time. Retry manually when your limit is available."}
         </Text>
         {chatGptLimit || canSchedule ? (
