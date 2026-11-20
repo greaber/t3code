@@ -300,6 +300,156 @@ describe("ssh tunnel scripts", () => {
     }),
   );
 
+  // The first tunnel listens on 41773 and each replacement on the next port.
+  const slowLinkHarness = Effect.fn("slowLinkHarness")(function* () {
+    const spawned: Array<{ port: number; killed: boolean; liveAtSpawn: number }> = [];
+    const unanswered = new Set<number>();
+    const refused = new Set<number>();
+    let nextPort = 41_773;
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.sync(() => {
+        const args = commandArgs(command);
+        if (args.includes("-N")) {
+          const port = Number(args[args.indexOf("-L") + 1]!.split(":")[0]);
+          const liveAtSpawn = spawned.filter((tunnel) => !tunnel.killed).length;
+          const record = { port, killed: false, liveAtSpawn };
+          spawned.push(record);
+          return makeRunningProcess(() => {
+            record.killed = true;
+          });
+        }
+        return makeSuccessfulProcess('{"remotePort":3773,"serverKind":"managed"}\n');
+      }),
+    );
+    const requests = yield* Queue.unbounded<number>();
+    const httpClient = HttpClient.make((request) => {
+      const port = Number(new URL(request.url).port);
+      return unanswered.has(port)
+        ? Queue.offer(requests, port).pipe(Effect.andThen(Effect.never))
+        : Effect.succeed(HttpClientResponse.fromWeb(request, new Response("", { status: 200 })));
+    });
+    const layer = Layer.mergeAll(
+      NodeServices.layer,
+      NodeCrypto.layer,
+      Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      Layer.succeed(HttpClient.HttpClient, httpClient),
+      Layer.succeed(
+        NetService.NetService,
+        NetService.NetService.of({
+          ...testNetService,
+          reserveLoopbackPort: () => Effect.sync(() => nextPort++),
+          hasListenerOnHost: (port) => Effect.sync(() => !refused.has(port)),
+        }),
+      ),
+      SshAuth.SshPasswordPrompt.disabledLayer,
+      SshTunnel.SshEnvironmentManager.layer({ resolveCliRunner: Effect.succeed(ARCHIVE) }),
+    );
+    const target = { alias: "devbox", hostname: "devbox", username: null, port: null };
+    // Starts an ensure whose reuse probe of the current tunnel goes unanswered.
+    const ensureAfterSlowProbe = Effect.gen(function* () {
+      const manager = yield* SshTunnel.SshEnvironmentManager;
+      yield* Queue.clear(requests);
+      const connection = yield* Effect.forkChild(Effect.result(manager.ensureEnvironment(target)));
+      yield* Queue.take(requests);
+      yield* TestClock.adjust("10 seconds");
+      return connection;
+    });
+    // The replacement launches through real file and process setup before it probes.
+    const replacementProbed = Queue.take(requests).pipe(
+      Effect.repeat({ until: (port) => port === 41_774 }),
+    );
+    return { spawned, unanswered, refused, layer, target, ensureAfterSlowProbe, replacementProbed };
+  });
+
+  it.effect("switches to a replacement tunnel that answers before the slow one", () =>
+    Effect.gen(function* () {
+      const harness = yield* slowLinkHarness();
+      yield* Effect.gen(function* () {
+        const manager = yield* SshTunnel.SshEnvironmentManager;
+        yield* manager.ensureEnvironment(harness.target);
+        harness.unanswered.add(41_773);
+        const result = yield* Fiber.join(yield* harness.ensureAfterSlowProbe);
+        assert.isTrue(Result.isSuccess(result));
+        if (Result.isSuccess(result)) {
+          assert.equal(result.success.httpBaseUrl, "http://127.0.0.1:41774/");
+        }
+        // The slow tunnel stayed up until its replacement answered.
+        assert.deepEqual(harness.spawned, [
+          { port: 41_773, killed: true, liveAtSpawn: 0 },
+          { port: 41_774, killed: false, liveAtSpawn: 1 },
+        ]);
+        const again = yield* manager.ensureEnvironment(harness.target);
+        assert.equal(again.httpBaseUrl, "http://127.0.0.1:41774/");
+        assert.equal(harness.spawned.length, 2);
+
+        // A tunnel whose forward refuses connections is dead: replaced without a race.
+        harness.unanswered.add(41_774);
+        harness.refused.add(41_774);
+        const replaced = yield* Fiber.join(yield* harness.ensureAfterSlowProbe);
+        assert.isTrue(Result.isSuccess(replaced));
+        assert.deepEqual(harness.spawned.slice(1), [
+          { port: 41_774, killed: true, liveAtSpawn: 1 },
+          { port: 41_775, killed: false, liveAtSpawn: 0 },
+        ]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("keeps the slow tunnel and stops the replacement when the slow one answers first", () =>
+    Effect.gen(function* () {
+      const harness = yield* slowLinkHarness();
+      yield* Effect.gen(function* () {
+        const manager = yield* SshTunnel.SshEnvironmentManager;
+        yield* manager.ensureEnvironment(harness.target);
+        harness.unanswered.add(41_773);
+        harness.unanswered.add(41_774);
+        const connection = yield* harness.ensureAfterSlowProbe;
+        // The replacement is waiting on its readiness probe; the old link recovers.
+        yield* harness.replacementProbed;
+        harness.unanswered.delete(41_773);
+        yield* TestClock.adjust("9 seconds");
+        const result = yield* Fiber.join(connection);
+        assert.isTrue(Result.isSuccess(result));
+        if (Result.isSuccess(result)) {
+          assert.equal(result.success.httpBaseUrl, "http://127.0.0.1:41773/");
+        }
+        assert.deepEqual(harness.spawned, [
+          { port: 41_773, killed: false, liveAtSpawn: 0 },
+          { port: 41_774, killed: true, liveAtSpawn: 1 },
+        ]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("keeps a live tunnel when neither it nor the replacement answers", () =>
+    Effect.gen(function* () {
+      const harness = yield* slowLinkHarness();
+      yield* Effect.gen(function* () {
+        const manager = yield* SshTunnel.SshEnvironmentManager;
+        yield* manager.ensureEnvironment(harness.target);
+        harness.unanswered.add(41_773);
+        harness.unanswered.add(41_774);
+        const connection = yield* harness.ensureAfterSlowProbe;
+        yield* harness.replacementProbed;
+        yield* TestClock.adjust("30 seconds");
+        const result = yield* Fiber.join(connection);
+        assert.isTrue(Result.isFailure(result));
+        if (Result.isFailure(result)) {
+          assert.instanceOf(result.failure, SshReadinessError);
+          assert.include(result.failure.message, "Keeping the current one");
+        }
+        assert.deepEqual(harness.spawned, [
+          { port: 41_773, killed: false, liveAtSpawn: 0 },
+          { port: 41_774, killed: true, liveAtSpawn: 1 },
+        ]);
+        // Once it answers again, the kept tunnel is reused.
+        harness.unanswered.delete(41_773);
+        const again = yield* manager.ensureEnvironment(harness.target);
+        assert.equal(again.httpBaseUrl, "http://127.0.0.1:41773/");
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it("rejects archive versions that are not a single exact version segment", () => {
     for (const archiveVersion of [
       "../other",
