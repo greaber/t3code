@@ -190,7 +190,7 @@ import { isModelPickerOpen } from "../modelPickerVisibility";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { threadOutboxStore } from "../threadOutboxDelivery";
-import type { OutboxMessage } from "../threadOutbox.logic";
+import { environmentWillConnect, type OutboxMessage } from "../threadOutbox.logic";
 import { projectScriptIdFromCommand } from "~/projectScripts";
 import { newMessageId } from "~/lib/utils";
 import { isInSideChatPane, type SideChatParentPanel } from "~/lib/sideChatPane";
@@ -1161,11 +1161,12 @@ export default function ChatView(props: ChatViewProps) {
   const activeEnvironmentUnavailable =
     activeEnvironment !== null && activeEnvironment.connection.phase !== "connected";
   const activeEnvironmentUnavailableLabel = activeEnvironment?.label ?? null;
-  const activeEnvironmentPhase = activeEnvironment?.connection.phase;
-  const activeEnvironmentReconnecting =
-    activeEnvironmentPhase === "connecting" ||
-    activeEnvironmentPhase === "reconnecting" ||
-    activeEnvironmentPhase === "offline";
+  const activeEnvironmentWillConnect =
+    activeEnvironment !== null &&
+    environmentWillConnect({
+      phase: activeEnvironment.connection.phase,
+      enabled: activeEnvironment.entry.enabled,
+    });
   const activeEnvironmentUnavailableState = (() => {
     if (!activeEnvironmentUnavailable || !activeEnvironmentUnavailableLabel || !activeEnvironment) {
       return null;
@@ -2895,7 +2896,7 @@ export default function ChatView(props: ChatViewProps) {
     isRevertingCheckpoint,
     threadDetailLoading,
     activeEnvironmentUnavailable,
-    activeEnvironmentReconnecting,
+    activeEnvironmentWillConnect,
     isSendBusy,
     sendQueuesBehindSetup,
     isDraftHeroState,
@@ -3657,7 +3658,7 @@ export default function ChatView(props: ChatViewProps) {
                                 }
                                 environmentUnavailable={activeEnvironmentUnavailableState}
                                 environmentQueuesSends={
-                                  activeEnvironmentReconnecting && isServerThread
+                                  activeEnvironmentWillConnect && isServerThread
                                 }
                                 activePendingApproval={activePendingApproval}
                                 pendingApprovals={pendingApprovals}

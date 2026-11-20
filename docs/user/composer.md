@@ -98,8 +98,10 @@ Steer when the running agent supports it.
 
 ## Send while disconnected
 
-On web and desktop, a text message you send while its environment is reconnecting
-waits at the end of the thread, marked with the environment it is waiting for. It
+On web and desktop, a text message you send to an existing thread while its
+environment is not connected, including while it first connects after the app
+starts, waits at the end of the thread, marked with the environment it is waiting
+for. Messages to an environment you switched off are not kept. It
 sends on its own once the environment connects, in the order you wrote it, and it
 survives reloading the app. Use the pencil to move it back into the composer, or
 the X to drop it. If the server refuses it, it stays there with the reason until you

@@ -332,6 +332,8 @@ export interface ChatComposerHandle {
     selectedModelSelection: ModelSelection;
     multipleModelSelections: ReadonlyArray<ModelSelection> | null;
     providerAvailable: boolean;
+    /** The environment has not sent its providers yet, so none can be selected. */
+    providerCatalogPending: boolean;
     selectedProvider: ProviderDriverKind;
     selectedModel: string;
     selectedProviderModels: ReadonlyArray<ServerProvider["models"][number]>;
@@ -3113,6 +3115,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         providerAvailable:
           multipleModelSelections !== null ||
           (!noProviderAvailable && providerSendBlockReason === null),
+        providerCatalogPending,
         selectedProvider,
         selectedModel,
         selectedProviderModels,
