@@ -17,6 +17,7 @@ import * as Path from "effect/Path";
 
 import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import { readDetachedAgentUnits } from "./detachedAgentTurns.ts";
 
 const AGENT_SLICE = "app-t3code-agents.slice";
 // Owns every agent slice and competes with the server's unit or scope under app.slice.
@@ -142,9 +143,26 @@ export const make = Effect.gen(function* () {
     const controlGroup = values.get("ControlGroup") ?? "";
     const events = controlGroup ? yield* readCgroupFile(controlGroup, "cgroup.events") : "";
     if (parseCgroupCounter(events, "populated") === 0) return;
-    yield* Effect.logWarning("Stopping agents left by a previous server", { slice: ownedSlice });
+    // Turns the previous server left running for this one to adopt keep their scopes.
+    const kept = yield* readDetachedAgentUnits(stateDir).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+    );
+    const leftover =
+      kept.size === 0
+        ? [ownedSlice]
+        : (yield* fileSystem
+            .readDirectory(path.join("/sys/fs/cgroup", controlGroup))
+            .pipe(Effect.orElseSucceed(() => []))).filter(
+            (unit) => unit.endsWith(".scope") && !kept.has(unit),
+          );
+    if (leftover.length === 0) return;
+    yield* Effect.logWarning("Stopping agents left by a previous server", {
+      slice: ownedSlice,
+      kept: kept.size,
+    });
     const stopped = yield* runner
-      .run({ command: systemctl, args: ["--user", "stop", ownedSlice], timeout: "30 seconds" })
+      .run({ command: systemctl, args: ["--user", "stop", ...leftover], timeout: "30 seconds" })
       .pipe(Effect.option);
     if (stopped._tag === "None" || stopped.value.code !== 0) {
       yield* Effect.logWarning("Could not stop agents left by a previous server", {

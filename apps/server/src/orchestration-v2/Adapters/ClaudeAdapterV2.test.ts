@@ -3230,6 +3230,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly forkSession?: ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerShape["forkSession"];
     readonly allocateSessionId?: Effect.Effect<string>;
     readonly promptSuggestions?: boolean;
+    /** Opens with an adoptRunId return a CLI left running by an earlier server. */
+    readonly adopted?: boolean;
   }) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -3283,6 +3285,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "provider_thread.updated" }>
         >();
       let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+      const adoptRunIds: Array<string | undefined> = [];
+      const activeRuns: Array<string | null> = [];
       const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
         instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
         settings: options?.settings ?? DEFAULT_CLAUDE_SETTINGS,
@@ -3309,6 +3313,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           open: (input) =>
             Effect.gen(function* () {
               openedOptions = input.options;
+              adoptRunIds.push(input.adoptRunId);
               const processMessages =
                 options?.freshQueueOnReopen === true && processQueues.length > 0
                   ? yield* Queue.unbounded<SDKMessage>()
@@ -3357,6 +3362,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               }
               processQueues.push(sdkMessages);
               return {
+                ...(options?.adopted === true && input.adoptRunId !== undefined
+                  ? { adopted: true }
+                  : {}),
+                setActiveRun: (runId) => void activeRuns.push(runId),
                 messages,
                 offer: (message) =>
                   Effect.sync(() => {
@@ -3472,6 +3481,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         planReceipts,
         providerThreadReceipts,
         getOpenedOptions: () => openedOptions,
+        adoptRunIds,
+        activeRuns,
         terminalEvents,
         hasPendingBackgroundWork,
         until: changes.until,
@@ -3481,6 +3492,102 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  // After a restart the CLI is still mid-tool-call; its output, read back from
+  // its file, is the turn, and it cannot take the continuation's prompt.
+  it.effect("finishes a restart continuation from the CLI the previous server left running", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarnessWithOptions({ adopted: true });
+      const sourceRunId = RunId.make("run-before-restart");
+      const input = {
+        ...makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("adopted-continuation"),
+          text: "T3 Code restarted while this turn was running.",
+          attachments: [],
+          messageCreatedBy: "agent",
+          messageCreationSource: "server",
+          providerTurnOrdinal: 2,
+        }),
+        restartContinuationOfRunId: sourceRunId,
+      };
+      yield* harness.runtime.startTurn(input);
+      assert.deepEqual(harness.adoptRunIds, [sourceRunId]);
+      assert.deepEqual(harness.activeRuns, [input.runId]);
+      yield* harness.offerAndWait(
+        claudeSdkFrame({
+          type: "assistant",
+          message: {
+            model: "claude-sonnet-4-6",
+            id: "msg_adopted_tool",
+            type: "message",
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_adopted",
+                name: "Bash",
+                input: { command: "sleep 45; echo done" },
+              },
+            ],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: {
+              input_tokens: 1,
+              output_tokens: 1,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+          },
+          parent_tool_use_id: null,
+          uuid: "00000000-0000-4000-8000-000000000901",
+          session_id: WAKE_NATIVE_SESSION,
+        }),
+      );
+      yield* harness.offerAndWait(
+        claudeSdkFrame({
+          type: "user",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_adopted", content: "done" }],
+          },
+          parent_tool_use_id: null,
+          uuid: "00000000-0000-4000-8000-000000000902",
+          session_id: WAKE_NATIVE_SESSION,
+        }),
+      );
+      yield* harness.offerAndWait(
+        makeAssistantTextFrame({ uuid: "00000000-0000-4000-8000-000000000903", text: "FINISHED" }),
+      );
+      yield* harness.offerAndWait(
+        makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000904", result: "FINISHED" }),
+      );
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      assert.equal(terminal.status, "completed");
+      assert.lengthOf(harness.offeredMessages, 0);
+      assert.deepEqual(harness.activeRuns, [input.runId, null]);
+      const toolCall = harness.events.findLast(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.nativeItemRef?.nativeId === "toolu_adopted",
+      );
+      assert.equal(
+        toolCall?.type === "turn_item.updated" ? toolCall.turnItem.status : undefined,
+        "completed",
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
 
   it.effect.each(["release-after", "cancel-after", "release-before", "resume-pending"] as const)(
     "keeps attachment reservations across compaction: %s boundary",

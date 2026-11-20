@@ -30,6 +30,7 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import { DetachedAgentTurns } from "../process/detachedAgentTurns.ts";
 
 const threadId = ThreadId.make("thread:restart");
 const runId = RunId.make("run:restart");
@@ -531,7 +532,7 @@ it.effect("prepares no continuation for background work another provider thread 
         ),
       ),
     );
-    yield* recovery.prepareForShutdown;
+    assert.deepEqual([...(yield* recovery.prepareForShutdown)], []);
     assert.lengthOf(writes, 0);
     const ownWork = {
       ...projection,
@@ -558,7 +559,8 @@ it.effect("prepares no continuation for background work another provider thread 
         ),
       ),
     );
-    yield* ownRecovery.prepareForShutdown;
+    // Shutdown leaves running the CLIs of exactly the runs it will continue.
+    assert.deepEqual([...(yield* ownRecovery.prepareForShutdown)], [runId]);
     assert.lengthOf(writes, 1);
     assert.deepEqual(writes[0]!.effects[0]?.request, {
       type: "provider-runtime.continue",
@@ -920,6 +922,27 @@ it.effect("continues a cut run past queued follow-ups, which stay held", () =>
     assert.deepEqual(texts, [
       "Continue where you left off. Your last turn was cut short, so a command or other action it started may have finished or may still be running. Before you repeat one that changes state, confirm it did not take effect and is not still running; if you cannot tell, say so instead of repeating it.",
     ]);
+  }),
+);
+
+// The CLI kept working through the restart, so the run only needs its output shown.
+it.effect("notes instead of prompting when the cut turn kept running", () =>
+  Effect.gen(function* () {
+    const dispatches = yield* continuationDispatches(cutMidTurn()).pipe(
+      Effect.provideService(DetachedAgentTurns, {
+        ...DetachedAgentTurns.defaultValue(),
+        adoptable: (sourceRunId) => Effect.succeed(sourceRunId === runId),
+      }),
+    );
+    assert.deepEqual(
+      dispatches.map((command) => [command.text, command.notification?.summary]),
+      [
+        [
+          "T3 Code restarted while this turn was running. The agent kept working, and the rest of its turn follows.",
+          "T3 Code restarted; this turn kept running",
+        ],
+      ],
+    );
   }),
 );
 

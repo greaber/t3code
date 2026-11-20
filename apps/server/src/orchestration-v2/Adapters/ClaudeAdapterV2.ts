@@ -6,6 +6,12 @@ import {
 } from "@t3tools/shared/toolOutput";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
+import { followClaudeDetachedOutput } from "./ClaudeDetachedOutput.ts";
+import {
+  DETACHED_STDOUT_FILE,
+  DetachedAgentTurns,
+  type DetachedAgentTurn,
+} from "../../process/detachedAgentTurns.ts";
 import {
   dynamicToolTitle,
   formatReadToolLabel,
@@ -402,6 +408,108 @@ export function spawnClaudeProcessGroup(
   return child as ClaudeSpawnedProcess;
 }
 
+// Twelve hours of 2 s polls bounds a detached CLI that never ends its turn.
+const CLAUDE_DETACHED_MAX_POLLS = 21_600;
+
+/**
+ * Like CLAUDE_GROUP_WATCH_SCRIPT, but stdout also goes to `$out/stdout.jsonl`
+ * through tee, which keeps writing the file after the server's pipe closes.
+ * A guard that reads "detach" waits for the CLI to finish its turn instead of
+ * stopping it; the CLI ends the turn and exits on its own once stdin closes.
+ */
+const CLAUDE_DETACHABLE_GROUP_WATCH_SCRIPT = [
+  "out=$1",
+  "shift",
+  `{ trap '' TERM; read -r cmd <&3; if [ "$cmd" = detach ]; then n=0; while kill -0 $$ && [ "$n" -lt ${CLAUDE_DETACHED_MAX_POLLS} ]; do sleep 2; n=$((n + 1)); done; fi; kill -TERM 0; sleep 5; kill -KILL 0; } </dev/null >/dev/null 2>&1 &`,
+  "trap '' PIPE",
+  'mkfifo "$out/stdout.fifo" || exit 1',
+  `( exec <"$out/stdout.fifo" 3<&-; rm -f "$out/stdout.fifo"; exec tee -a "$out/${DETACHED_STDOUT_FILE}" ) &`,
+  'exec "$@" 3<&- >"$out/stdout.fifo"',
+].join("\n");
+// tee can still be passing the CLI's last lines to the SDK when the CLI exits.
+const CLAUDE_STDOUT_DRAIN_TIMEOUT_MS = 2_000;
+
+/**
+ * The command that runs the CLI under the detachable guard. It goes inside the
+ * agent's scope launcher so the guard and tee share the CLI's systemd scope and
+ * outlive the server's own unit.
+ */
+export function detachableClaudeLaunch(outputDir: string, command: string) {
+  return {
+    command: "/bin/sh",
+    args: ["-c", CLAUDE_DETACHABLE_GROUP_WATCH_SCRIPT, "t3-claude", outputDir, command],
+  } as const;
+}
+
+export interface DetachableClaudeProcess {
+  readonly process: ClaudeSpawnedProcess;
+  readonly pid: number | undefined;
+  /** Leaves the CLI running after this server exits; nothing here stops it afterwards. */
+  readonly detach: () => void;
+}
+
+/** Spawns a command that ends in `detachableClaudeLaunch`, in its own process group. */
+export function spawnDetachableClaudeProcessGroup(
+  options: ClaudeSpawnOptions,
+  onExit?: () => void,
+  onStderr: (text: string) => void = () => {},
+  onStderrClose: () => void = () => {},
+): DetachableClaudeProcess {
+  let detached = false;
+  const child = NodeChildProcess.spawn(options.command, options.args, {
+    cwd: options.cwd,
+    env: options.env,
+    stdio: ["pipe", "pipe", "pipe", "pipe"],
+    detached: true,
+  });
+  // Node's own abort handling would kill a detached CLI when the SDK aborts during shutdown.
+  options.signal?.addEventListener(
+    "abort",
+    () => {
+      if (!detached) child.kill("SIGTERM");
+    },
+    { once: true },
+  );
+  child.stderr?.setEncoding("utf8").on("data", onStderr).once("close", onStderrClose);
+  child.once("exit", () => {
+    if (detached) return;
+    const stopGroup = () => {
+      try {
+        signalProcessGroup(child.pid ?? 0, "SIGKILL");
+      } catch {}
+      onExit?.();
+    };
+    const stdout = child.stdout;
+    if (stdout === null || stdout.closed) return stopGroup();
+    // @effect-diagnostics-next-line globalTimers:off - Runs in a ChildProcess callback outside any fiber.
+    const timer = setTimeout(stopGroup, CLAUDE_STDOUT_DRAIN_TIMEOUT_MS);
+    stdout.once("close", () => {
+      clearTimeout(timer);
+      stopGroup();
+    });
+  });
+  // The SDK kills its CLI on close and on process exit; a detached CLI must outlive both.
+  const spawned = new Proxy(child, {
+    get(target, key) {
+      if (key === "kill") {
+        return (signal?: NodeJS.Signals) => (detached ? false : target.kill(signal));
+      }
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as ClaudeSpawnedProcess;
+  return {
+    process: spawned,
+    pid: child.pid,
+    detach: () => {
+      if (detached || child.exitCode !== null || child.signalCode !== null) return;
+      detached = true;
+      const guard = child.stdio[3];
+      if (guard !== null && guard !== undefined && "write" in guard) guard.write("detach\n");
+    },
+  };
+}
+
 export const ClaudeProviderCapabilitiesV2 = {
   sessions: {
     supportsMultipleProviderThreadsPerSession: false,
@@ -549,6 +657,8 @@ export interface ClaudeAgentSdkQueryOpenInput {
   readonly options: ClaudeAgentSdkQueryOptions;
   readonly threadId: ThreadId;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
+  /** The run a restart continuation resumes; its CLI may still be running from before the restart. */
+  readonly adoptRunId?: string;
 }
 
 export interface ClaudeAgentSdkQuerySession {
@@ -590,6 +700,12 @@ export interface ClaudeAgentSdkQuerySession {
   >;
   readonly interrupt: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly close: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  /** Replays a CLI that kept running through a server restart; it takes no input. */
+  readonly adopted?: boolean;
+  /** The run whose turn the CLI is working on, so shutdown can leave that turn running. */
+  readonly setActiveRun?: (runId: string | null) => void;
+  /** The last message the adapter handled, where a later server resumes reading. */
+  readonly markHandled?: (message: SDKMessage) => void;
 }
 
 type ClaudeQueryStreamExit = Exit.Exit<void, ClaudeAgentSdkQueryRunnerError>;
@@ -1160,10 +1276,13 @@ export const layerQueryRunner: Layer.Layer<
   | Path.Path
   | PortScanner.PortDiscovery
   | ProviderEventLoggers.ProviderEventLoggers
+  | FileSystem.FileSystem
 > = Layer.effect(
   ClaudeAgentSdkQueryRunner,
   Effect.gen(function* () {
     const random = yield* SecureRandom.SecureRandom;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const detachedTurns = yield* DetachedAgentTurns;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const path = yield* Path.Path;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
@@ -1172,6 +1291,87 @@ export const layerQueryRunner: Layer.Layer<
     const runFork = Effect.runForkWith(yield* Effect.context<never>());
     const hostEnvironment = yield* HostProcess.Environment;
     const portDiscovery = yield* PortScanner.PortDiscovery;
+
+    const adoptedUnavailable = (method: string) =>
+      Effect.fail(
+        queryRunnerError(
+          new Error("This Claude turn kept running through a server restart and takes no input."),
+          method,
+        ),
+      );
+
+    /** A CLI left running by the previous server, replayed from its output file. */
+    const adoptDetachedTurn = Effect.fn("ClaudeAgentSdkQueryRunner.adoptDetachedTurn")(function* (
+      input: ClaudeAgentSdkQueryOpenInput,
+      turn: DetachedAgentTurn,
+    ) {
+      // Messages wait for the adapter to attach the turn, so none land before it.
+      const attached = yield* Deferred.make<void>();
+      let detached = false;
+      let ended = false;
+      let activeRunId: string | null = null;
+      let lastHandledUuid = turn.resumeAfterUuid;
+      yield* detachedTurns.track({
+        outputDir: turn.outputDir,
+        threadId: input.threadId,
+        nativeThreadId: turn.nativeThreadId,
+        pid: turn.pid,
+        unit: turn.unit,
+        activeRunId: () => activeRunId,
+        resumeAfterUuid: () => lastHandledUuid,
+        detach: () => {
+          detached = true;
+        },
+      });
+      const end = (outcome: "finished" | "stopped") =>
+        Effect.suspend(() => {
+          if (detached || ended) return Effect.void;
+          ended = true;
+          return outcome === "finished" ? detachedTurns.finish(turn) : detachedTurns.kill(turn);
+        });
+      const stop = end("stopped");
+      const messages = Stream.fromEffect(Deferred.await(attached)).pipe(
+        Stream.flatMap(() =>
+          followClaudeDetachedOutput({
+            filePath: turn.stdoutPath,
+            resumeAfterUuid: turn.resumeAfterUuid,
+            alive: detachedTurns.alive(turn),
+          }),
+        ),
+        Stream.mapEffect((message) => (detached ? Effect.never : Effect.succeed(message))),
+        // The file holds the CLI's own stream-json lines, the messages the SDK would have yielded.
+        Stream.map((message) => message as unknown as SDKMessage),
+        Stream.concat(Stream.fromEffect(end("finished")).pipe(Stream.drain)),
+        Stream.provideService(FileSystem.FileSystem, fileSystem),
+      );
+      yield* Effect.logInfo("orchestration-v2.claude-adopted-detached-turn", {
+        threadId: input.threadId,
+        runId: turn.runId,
+      });
+      return {
+        adopted: true,
+        messages,
+        offer: () => adoptedUnavailable("offer"),
+        setModel: () => adoptedUnavailable("setModel"),
+        applyFlagSettings: () => adoptedUnavailable("applyFlagSettings"),
+        setPermissionMode: () => adoptedUnavailable("setPermissionMode"),
+        stopTask: () => adoptedUnavailable("stopTask"),
+        backgroundTasks: () => Effect.succeed(false),
+        mcpServerStatus: Effect.succeed([]),
+        readMcpResource: () => adoptedUnavailable("readMcpResource"),
+        callMcpTool: () => adoptedUnavailable("callMcpTool"),
+        listPermissionRules: adoptedUnavailable("listPermissionRules"),
+        interrupt: stop,
+        close: stop,
+        setActiveRun: (runId) => {
+          activeRunId = runId;
+          if (runId !== null) Deferred.doneUnsafe(attached, Exit.void);
+        },
+        markHandled: (message) => {
+          lastHandledUuid = message.uuid ?? lastHandledUuid;
+        },
+      } satisfies ClaudeAgentSdkQuerySession;
+    });
 
     return ClaudeAgentSdkQueryRunner.of({
       allocateSessionId: random.uuidV4(),
@@ -1204,13 +1404,34 @@ export const layerQueryRunner: Layer.Layer<
           };
           // The SDK can prepend a scope wrapper to native binaries; script entries run through node.
           const binaryPath = queryOptions.pathToClaudeCodeExecutable;
-          const launch =
+          const nativeBinary =
             binaryPath === undefined ||
             CLAUDE_SCRIPT_EXTENSIONS.some((ext) => binaryPath.endsWith(ext))
               ? undefined
+              : binaryPath;
+          const nativeThreadId = input.options.resume ?? input.options.sessionId;
+          if (nativeThreadId !== undefined && platform !== "win32") {
+            // Any other turn first stops a CLI the previous server left running in this session.
+            const detachedTurn = yield* detachedTurns.claim({
+              nativeThreadId,
+              runId: input.adoptRunId,
+            });
+            if (detachedTurn !== undefined) return yield* adoptDetachedTurn(input, detachedTurn);
+          }
+          const outputDir =
+            nativeBinary === undefined ||
+            nativeThreadId === undefined ||
+            platform === "win32" ||
+            queryOptions.spawnClaudeCodeProcess !== undefined
+              ? undefined
+              : yield* detachedTurns.allocate;
+          const launch =
+            nativeBinary === undefined
+              ? undefined
               : yield* agentScope.wrap({
-                  command: binaryPath,
-                  args: [],
+                  ...(outputDir === undefined
+                    ? { command: nativeBinary, args: [] }
+                    : detachableClaudeLaunch(outputDir, nativeBinary)),
                   name: "claude",
                   threadId: input.threadId,
                   env: queryOptions.env,
@@ -1236,6 +1457,39 @@ export const layerQueryRunner: Layer.Layer<
             if (answered) return;
             stderrTail = (stderrTail + text).slice(-CLAUDE_STDERR_TAIL_LENGTH);
           };
+          let activeRunId: string | null = null;
+          let lastHandledUuid: string | undefined;
+          let detached = false;
+          const spawnDetachable = (spawnOptions: ClaudeSpawnOptions, onStderrClose: () => void) => {
+            const spawned = spawnDetachableClaudeProcessGroup(
+              spawnOptions,
+              stopScope,
+              appendStderr,
+              onStderrClose,
+            );
+            if (outputDir === undefined || nativeThreadId === undefined) return spawned.process;
+            if (spawned.pid !== undefined) {
+              runFork(
+                detachedTurns.track({
+                  outputDir,
+                  threadId: input.threadId,
+                  nativeThreadId,
+                  pid: spawned.pid,
+                  unit,
+                  activeRunId: () => activeRunId,
+                  resumeAfterUuid: () => lastHandledUuid,
+                  detach: () => {
+                    detached = true;
+                    spawned.detach();
+                  },
+                }),
+              );
+            }
+            spawned.process.once("exit", () => {
+              if (!detached) runFork(detachedTurns.release(outputDir));
+            });
+            return spawned.process;
+          };
           const spawnProcess =
             options.spawnClaudeCodeProcess ??
             ((spawnOptions: ClaudeSpawnOptions) => {
@@ -1243,7 +1497,9 @@ export const layerQueryRunner: Layer.Layer<
                 // Node can report "exit" before it has read the stderr the CLI wrote.
                 let stderrDone = () => {};
                 stderrClosed = new Promise((resolve) => (stderrDone = resolve));
-                return spawnClaudeProcessGroup(spawnOptions, stopScope, appendStderr, stderrDone);
+                return outputDir === undefined
+                  ? spawnClaudeProcessGroup(spawnOptions, stopScope, appendStderr, stderrDone)
+                  : spawnDetachable(spawnOptions, stderrDone);
               }
               const child = NodeChildProcess.spawn(spawnOptions.command, spawnOptions.args, {
                 cwd: spawnOptions.cwd,
@@ -1369,6 +1625,8 @@ export const layerQueryRunner: Layer.Layer<
               claudeQueryMessages(queryRuntime),
               (cause) => cause,
             ).pipe(
+              // The next server handles the rest of a detached turn from its resume point.
+              Stream.mapEffect((message) => (detached ? Effect.never : Effect.succeed(message))),
               Stream.catch((cause) =>
                 Stream.fromEffect(
                   Effect.gen(function* () {
@@ -1400,7 +1658,14 @@ export const layerQueryRunner: Layer.Layer<
             ),
             offer: (message, onQueued) =>
               Effect.uninterruptibleMask((restore) =>
-                restore(Queue.offer(promptQueue, message)).pipe(
+                // The output file only has to hold the turn this prompt starts.
+                (outputDir === undefined
+                  ? Effect.void
+                  : fileSystem
+                      .truncate(path.join(outputDir, DETACHED_STDOUT_FILE))
+                      .pipe(Effect.ignore)
+                ).pipe(
+                  Effect.andThen(restore(Queue.offer(promptQueue, message))),
                   Effect.tap(() => Effect.sync(() => onQueued?.())),
                 ),
               ).pipe(
@@ -1550,6 +1815,12 @@ export const layerQueryRunner: Layer.Layer<
                 }),
               ),
             ),
+            setActiveRun: (runId) => {
+              activeRunId = runId;
+            },
+            markHandled: (message) => {
+              lastHandledUuid = message.uuid ?? lastHandledUuid;
+            },
           } satisfies ClaudeAgentSdkQuerySession;
         },
         // Fresh IDs may already have a metadata-only transcript; only resumed opens can reuse their ID.
@@ -8352,9 +8623,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ],
             { concurrency: 1 },
           );
-          yield* Ref.update(activeTurn, (current) =>
-            current?.providerTurnId === input.context.providerTurnId ? null : current,
+          const cleared = yield* Ref.modify(activeTurn, (current) =>
+            current?.providerTurnId === input.context.providerTurnId
+              ? [true, null]
+              : [false, current],
           );
+          if (cleared) (yield* Ref.get(queryContext))?.query.setActiveRun?.(null);
           if (input.status === "completed") {
             settledTurnByNativeThread.set(input.context.nativeThreadId, input.context);
           } else {
@@ -11008,7 +11282,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             modelCatalog,
           );
           const resumeSessionAt = yield* getNativeConversationHeadId(turnInput.providerThread);
-          const existing = yield* Ref.get(queryContext);
+          const live = yield* Ref.get(queryContext);
+          // An adopted CLI takes no input, so a later turn always replaces it.
+          const existing = live?.query.adopted === true ? null : live;
+          if (live !== null && existing === null) yield* live.query.close.pipe(Effect.ignore);
           // Continuations drain existing output without prompting; retain the live process regardless of selection.
           if (
             existing !== null &&
@@ -11171,6 +11448,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               threadId: turnInput.threadId,
               providerSessionId: input.providerSessionId,
               options: queryOptions,
+              ...(turnInput.restartContinuationOfRunId === undefined
+                ? {}
+                : { adoptRunId: turnInput.restartContinuationOfRunId }),
             })
             .pipe(
               Effect.onError(() =>
@@ -11278,7 +11558,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       resultsReportingNewContextWindow.add(message);
                     }
                   }
-                  return handleSdkMessage({ query: querySession, message });
+                  return handleSdkMessage({ query: querySession, message }).pipe(
+                    Effect.tap(() => Effect.sync(() => querySession.markHandled?.(message))),
+                  );
                 }),
               ),
             ),
@@ -11439,7 +11721,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               subagentsByTaskId: new Map(),
               subagentsByToolUseId: new Map(),
               promptUuid,
-              promptEcho: isClaudeProviderContinuationTurn(turnInput) ? "confirmed" : "pending",
+              promptEcho:
+                isClaudeProviderContinuationTurn(turnInput) || querySession.query.adopted === true
+                  ? "confirmed"
+                  : "pending",
               promptStarted: false,
               nativeWakeStarted: false,
               gatedFramesBeforeEcho: 0,
@@ -11456,6 +11741,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 querySession.lastTurn = context;
                 return [true, current];
               });
+              if (attached) querySession.query.setActiveRun?.(turnInput.runId);
               if (!attached) {
                 yield* Ref.update(activeTurn, (current) => (current === context ? null : current));
                 return yield* new ProviderAdapter.ProviderAdapterProtocolError({
@@ -11518,6 +11804,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 }),
               });
             });
+            // The adopted CLI is already working on this turn; its output is the turn.
+            if (querySession.query.adopted === true) {
+              yield* attachTurn;
+              return;
+            }
             if (userMessage !== null) {
               yield* attachTurn;
               yield* startUserTurnForWakeReports(nativeThreadId);

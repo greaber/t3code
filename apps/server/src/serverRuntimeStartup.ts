@@ -36,6 +36,7 @@ import * as LegacyV1ThreadImporter from "./orchestration-v2/legacy/LegacyV1Threa
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 import * as ProviderRuntimeRecovery from "./orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
+import * as DetachedAgentTurns from "./process/detachedAgentTurns.ts";
 import * as ThreadLaunch from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
@@ -447,6 +448,7 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
   const providerRuntimeRecovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+  const detachedTurns = yield* DetachedAgentTurns.DetachedAgentTurns;
   const agentAwarenessRelay = yield* AgentAwarenessRelay.AgentAwarenessRelay;
   const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -473,6 +475,18 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
         yield* Fiber.interrupt(workerFiber).pipe(Effect.ignore);
       }
       yield* providerRuntimeRecovery.prepareForShutdown.pipe(
+        // Turns the next server continues keep running; it adopts their output.
+        Effect.tap((continued) =>
+          detachedTurns
+            .detach(continued)
+            .pipe(
+              Effect.tap((detached) =>
+                detached === 0
+                  ? Effect.void
+                  : Effect.logInfo("Left agent turns running through the restart", { detached }),
+              ),
+            ),
+        ),
         Effect.ensuring(providerSessions.shutdown),
       );
       const reconciliation = yield* providerRuntimeRecovery.reconcile("shutdown");

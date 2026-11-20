@@ -32,6 +32,8 @@ import {
   type ClaudeAgentSdkQueryOpenInput,
   layerQueryRunner,
   spawnClaudeProcessGroup,
+  detachableClaudeLaunch,
+  spawnDetachableClaudeProcessGroup,
 } from "./ClaudeAdapterV2.ts";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", { spy: true });
@@ -652,6 +654,74 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
       // A dying server's descriptors close; the kernel would do this for it.
       for (const pipe of child.stdio) pipe?.destroy();
       yield* Effect.promise(() => turnStopped);
+    }),
+  );
+
+  // A detached CLI's stdout keeps reaching its file after the server's pipes close.
+  const fileContains = (file: string, text: string) =>
+    new Promise<void>((resolve) => {
+      const watcher = NodeFS.watch(file, () => check());
+      const check = () => {
+        if (!NodeFS.readFileSync(file, "utf8").includes(text)) return;
+        watcher.close();
+        resolve();
+      };
+      check();
+    });
+
+  const spawnDetachableFakeCli = (script: string) =>
+    Effect.gen(function* () {
+      const cli = fakeClaudeCli(script);
+      const dir = NodePath.dirname(cli);
+      NodeChildProcess.execFileSync("mkfifo", [NodePath.join(dir, "go")]);
+      const outputDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-claude-out-"));
+      const launch = detachableClaudeLaunch(outputDir, cli);
+      const spawned = spawnDetachableClaudeProcessGroup({
+        command: launch.command,
+        args: [...launch.args],
+        cwd: dir,
+        env: process.env,
+        // @effect-diagnostics-next-line abortControllerInEffect:off - These fixtures close pipes themselves.
+        signal: new AbortController().signal,
+      });
+      const child = spawned.process as unknown as NodeChildProcess.ChildProcess;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          try {
+            signalProcessGroup(child.pid ?? 0, "SIGKILL");
+          } catch {}
+          NodeFS.rmSync(dir, { recursive: true, force: true });
+          NodeFS.rmSync(outputDir, { recursive: true, force: true });
+        }),
+      );
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      const firstLine = new Promise<void>((resolve) => child.stdout?.once("data", () => resolve()));
+      yield* Effect.promise(() => firstLine);
+      return { spawned, child, dir, exited, stdoutFile: NodePath.join(outputDir, "stdout.jsonl") };
+    });
+
+  it.effect("leaves a detached CLI to finish its turn after the server goes away", () =>
+    Effect.gen(function* () {
+      const { spawned, child, dir, exited, stdoutFile } = yield* spawnDetachableFakeCli(
+        ['dir=$(dirname "$0")', "echo first", 'read -r _ < "$dir/go"', "echo second"].join("\n"),
+      );
+      spawned.detach();
+      for (const pipe of child.stdio) pipe?.destroy();
+      // The CLI blocks on the FIFO until the "server" is gone, then ends its turn.
+      NodeFS.writeFileSync(NodePath.join(dir, "go"), "go\n");
+      yield* Effect.promise(() => exited);
+      yield* Effect.promise(() => fileContains(stdoutFile, "second"));
+      assert.equal(NodeFS.readFileSync(stdoutFile, "utf8"), "first\nsecond\n");
+    }),
+  );
+
+  it.effect("stops a CLI it did not detach when the server goes away", () =>
+    Effect.gen(function* () {
+      const { child, exited } = yield* spawnDetachableFakeCli(
+        ['dir=$(dirname "$0")', "echo first", 'read -r _ < "$dir/go"'].join("\n"),
+      );
+      for (const pipe of child.stdio) pipe?.destroy();
+      yield* Effect.promise(() => exited);
     }),
   );
 

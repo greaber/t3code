@@ -112,6 +112,8 @@ const withFakeSystemd = <A, E>(
           fileSystem.readFileString(path.replace("/sys/fs/cgroup", cgroupRoot), encoding),
         writeFileString: (path, data, options) =>
           fileSystem.writeFileString(path.replace("/sys/fs/cgroup", cgroupRoot), data, options),
+        readDirectory: (path, options) =>
+          fileSystem.readDirectory(path.replace("/sys/fs/cgroup", cgroupRoot), options),
       }),
     );
     const { stateDir } = yield* ServerConfig.ServerConfig;
@@ -325,6 +327,38 @@ describe("AgentScope service", () => {
         });
         expect(sliceOf(terminal)).toBe("app-t3code-agents.slice");
         expect(calls.filter(([, verb]) => verb === "stop")).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.effect("keeps the scopes of turns a restarted server left running", () =>
+    withFakeSystemd(({ scope, units, calls, stateDir, cgroupRoot }) =>
+      Effect.gen(function* () {
+        const slice = ownedAgentSlice(stateDir);
+        units.set(slice, { activeState: "active", result: "success", controlGroup: `/${slice}` });
+        NodeFS.mkdirSync(NodePath.join(cgroupRoot, slice, "t3code-claude-kept.scope"), {
+          recursive: true,
+        });
+        NodeFS.mkdirSync(NodePath.join(cgroupRoot, slice, "t3code-claude-old.scope"));
+        NodeFS.writeFileSync(NodePath.join(cgroupRoot, slice, "cgroup.events"), "populated 1\n");
+        const turnDir = NodePath.join(stateDir, "agent-turns", "turn-1");
+        NodeFS.mkdirSync(turnDir, { recursive: true });
+        NodeFS.writeFileSync(
+          NodePath.join(turnDir, "record.json"),
+          JSON.stringify({
+            version: 1,
+            driver: "claude",
+            threadId: "thread-1",
+            runId: "run-1",
+            nativeThreadId: "native-1",
+            pid: 1,
+            startTime: "1",
+            unit: "t3code-claude-kept.scope",
+            detachedAt: "2026-01-01T00:00:00.000Z",
+          }),
+        );
+        yield* scope.wrap({ command: "agent", args: [], name: "t", threadId: "a" });
+        expect(stopsOf(calls)).toEqual([["--user", "stop", "t3code-claude-old.scope"]]);
       }),
     ),
   );

@@ -5,6 +5,7 @@ import {
   isProviderNativeSubagentThread,
   type OrchestrationV2DomainEvent,
   type ProviderThreadId,
+  type RunId,
   type OrchestrationV2RestartCancelledBackgroundWork,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
@@ -75,7 +76,8 @@ export class ProviderRuntimeRecoveryService extends Context.Service<
     readonly reconcile: (
       trigger: "startup" | "shutdown",
     ) => Effect.Effect<ProviderRuntimeReconciliationSummary, ProviderRuntimeRecoveryError>;
-    readonly prepareForShutdown: Effect.Effect<void, ProviderRuntimeRecoveryError>;
+    /** Records restart continuations and returns the runs they will continue. */
+    readonly prepareForShutdown: Effect.Effect<ReadonlySet<RunId>, ProviderRuntimeRecoveryError>;
     readonly recover: Effect.Effect<ProviderRuntimeRecoverySummary, ProviderRuntimeRecoveryError>;
   }
 >()("t3/orchestration-v2/ProviderRuntimeRecoveryService") {}
@@ -954,12 +956,13 @@ export const make = Effect.gen(function* () {
   });
 
   const prepareForShutdown = Effect.gen(function* () {
+    const continued = new Set<RunId>();
     const enabled = yield* settings.getSettings.pipe(Effect.orElseSucceed(() => null));
-    if (!enabled) return;
+    if (!enabled) return continued;
     const enabledProjects = Object.entries(enabled.projectSettingsOverrides)
       .filter(([, overrides]) => overrides.continueThreadsAfterServerUpdate === true)
       .map(([id]) => id);
-    if (!enabled.continueThreadsAfterServerUpdate && enabledProjects.length === 0) return;
+    if (!enabled.continueThreadsAfterServerUpdate && enabledProjects.length === 0) return continued;
     const disabledProjects = Object.entries(enabled.projectSettingsOverrides)
       .filter(([, overrides]) => overrides.continueThreadsAfterServerUpdate === false)
       .map(([id]) => id);
@@ -994,6 +997,7 @@ export const make = Effect.gen(function* () {
               },
             ],
           });
+          continued.add(run.id);
         }).pipe(
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
@@ -1004,6 +1008,7 @@ export const make = Effect.gen(function* () {
       // Leave room in the four-reader pool for other shutdown reads.
       { concurrency: 2, discard: true },
     );
+    return continued;
   }).pipe(
     Effect.withSpan("ProviderRuntimeRecoveryService.prepareForShutdown"),
     Effect.mapError((cause) => new ProviderRuntimeRecoveryError({ operation: "reconcile", cause })),
