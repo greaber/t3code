@@ -230,6 +230,13 @@ version and stops any agent turns running there. Removing the connection or
 switching the environment off stops a server that T3 Code launched; a server
 that was already running is left alone.
 
+On a slow or lossy network, the host can stop answering for a while even though
+the SSH connection is still up. T3 Code keeps that connection open for up to
+about 45 seconds and shows the environment as reconnecting because the connection
+is slow, rather than starting a new one over the same network. It opens a new
+SSH connection right away when the old one has closed, for example after your
+computer sleeps.
+
 Each desktop app keeps one session on the host for its SSH connection and reuses
 it when it reconnects. Revoke sessions you no longer use in **Settings →
 Sharing & access** on the host, or on a headless host with `t3 auth session list` and

@@ -8,6 +8,7 @@ import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as NetService from "@t3tools/shared/Net";
 import { extractJsonObject, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { satisfiesSemverRange } from "@t3tools/shared/semver";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
 import * as Deferred from "effect/Deferred";
@@ -54,6 +55,9 @@ const SSH_READY_PROBE_TIMEOUT_MS = 1_000;
 // A forwarded HTTP probe crosses the client WAN; local server probes do not.
 const SSH_TUNNEL_READY_PROBE_TIMEOUT_MS = 8_000;
 const SSH_TUNNEL_REUSE_READY_TIMEOUT_MS = 10_000;
+// A lossy link can stall a live tunnel's probes for tens of seconds, and a new
+// tunnel crosses the same link, so a live but silent tunnel is kept this long.
+const SSH_TUNNEL_SLOW_PATIENCE_MS = 45_000;
 const TUNNEL_SHUTDOWN_TIMEOUT_MS = 2_000;
 const TUNNEL_STDERR_TAIL_CHARS = 16_384;
 const REMOTE_READY_TIMEOUT_MS = 60_000;
@@ -1174,6 +1178,7 @@ const waitForHttpReady = (input: {
   readonly intervalMs?: number;
   readonly probeTimeoutMs?: number;
   readonly path?: string;
+  readonly onProbeFailure?: (unanswered: boolean) => void;
 }): Effect.Effect<void, SshReadinessError, HttpClient.HttpClient> =>
   waitForHttpReadyShared({
     baseUrl: input.baseUrl,
@@ -1185,6 +1190,7 @@ const waitForHttpReady = (input: {
       if (typeof cause === "object" && cause !== null && "kind" in cause) {
         const kind = (cause as { readonly kind?: unknown }).kind;
         if (kind === "probe-timeout") {
+          input.onProbeFailure?.(true);
           return new SshReadinessError({
             message: `Backend readiness probe exceeded ${probeTimeoutMs}ms at ${requestUrl}.`,
             cause,
@@ -1202,6 +1208,7 @@ const waitForHttpReady = (input: {
           });
         }
       }
+      input.onProbeFailure?.(false);
       return new SshReadinessError({
         message: `Backend readiness probe failed at ${requestUrl}.`,
         cause,
@@ -1522,6 +1529,8 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
 ): Effect.fn.Return<SshEnvironmentManagerShape, never, Scope.Scope> {
   const managerScope = yield* Scope.Scope;
   const tunnels = new Map<string, SshTunnelEntry>();
+  // A live tunnel's current run of unanswered probes: when it began and last failed.
+  const slowTunnels = new WeakMap<SshTunnelEntry, { since: number; lastAt: number }>();
   const targetLocks = yield* KeyedLock.make<string>();
   const authSecrets = new Map<string, string>();
   // Disconnect cancels a connect queued or running for the same target, so a
@@ -1778,14 +1787,21 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
         localPort: entry.localPort,
         remotePort: entry.remotePort,
       });
+      const probeStartedAt = yield* Clock.currentTimeMillis;
+      // A probe still in flight at the deadline also went unanswered.
+      let unanswered = true;
       const readinessExit = yield* Effect.exit(
         waitForHttpReady({
           baseUrl: entry.httpBaseUrl,
           timeoutMs: SSH_TUNNEL_REUSE_READY_TIMEOUT_MS,
           probeTimeoutMs: SSH_TUNNEL_READY_PROBE_TIMEOUT_MS,
+          onProbeFailure: (timedOut) => {
+            unanswered = timedOut;
+          },
         }),
       );
       if (Exit.isSuccess(readinessExit)) {
+        slowTunnels.delete(entry);
         yield* Effect.logDebug("ssh.environment.tunnel.reused", {
           ...sshTargetLogFields(resolvedTarget),
           key,
@@ -1793,6 +1809,40 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
           remotePort: entry.remotePort,
         });
         return entry;
+      }
+      // An unanswered probe through a live ssh process and local forward is a
+      // slow link, which a new tunnel would cross too. A refused forward (after
+      // sleep), an exited ssh, or a server error still replaces the tunnel.
+      if (unanswered) {
+        const net = yield* NetService.NetService;
+        const processRunning = yield* entry.process.isRunning.pipe(
+          Effect.orElseSucceed(() => false),
+        );
+        const forwardListening =
+          processRunning && (yield* net.hasListenerOnHost(entry.localPort, "127.0.0.1"));
+        const previous = slowTunnels.get(entry);
+        // A long quiet gap means the link recovered in between; start a new run.
+        const slowSince =
+          previous !== undefined && probeStartedAt - previous.lastAt < SSH_TUNNEL_SLOW_PATIENCE_MS
+            ? previous.since
+            : probeStartedAt;
+        const now = yield* Clock.currentTimeMillis;
+        const slowForMs = now - slowSince;
+        if (forwardListening && slowForMs < SSH_TUNNEL_SLOW_PATIENCE_MS) {
+          slowTunnels.set(entry, { since: slowSince, lastAt: now });
+          yield* Effect.logWarning("ssh.environment.tunnel.existing.slow", {
+            ...sshTargetLogFields(resolvedTarget),
+            key,
+            localPort: entry.localPort,
+            remotePort: entry.remotePort,
+            slowForMs,
+            patienceMs: SSH_TUNNEL_SLOW_PATIENCE_MS,
+            cause: readinessExit.cause,
+          });
+          return yield* new SshReadinessError({
+            message: `The connection to ${resolvedTarget.alias} is slow: no reply for ${Math.round(slowForMs / 1000)}s. Keeping its SSH tunnel open while it recovers.`,
+          });
+        }
       }
       yield* Effect.logWarning("ssh.environment.tunnel.existing.stale", {
         ...sshTargetLogFields(resolvedTarget),

@@ -300,6 +300,88 @@ describe("ssh tunnel scripts", () => {
     }),
   );
 
+  it.effect("keeps a live tunnel through a slow link and replaces it once patience runs out", () =>
+    Effect.gen(function* () {
+      let tunnels = 0;
+      let kills = 0;
+      let unanswered = false;
+      let forwardListening = true;
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.sync(() => {
+          if (commandArgs(command).includes("-N")) {
+            tunnels += 1;
+            unanswered = false;
+            forwardListening = true;
+            return makeRunningProcess(() => {
+              kills += 1;
+            });
+          }
+          return makeSuccessfulProcess('{"remotePort":3773,"serverKind":"managed"}\n');
+        }),
+      );
+      const requests = yield* Queue.unbounded<void>();
+      const lossyHttpClient = HttpClient.make((request) =>
+        unanswered
+          ? Queue.offer(requests, undefined).pipe(Effect.andThen(Effect.never))
+          : Effect.succeed(HttpClientResponse.fromWeb(request, new Response("", { status: 200 }))),
+      );
+      const layer = Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Layer.succeed(HttpClient.HttpClient, lossyHttpClient),
+        Layer.succeed(
+          NetService.NetService,
+          NetService.NetService.of({
+            ...testNetService,
+            hasListenerOnHost: () => Effect.sync(() => forwardListening),
+          }),
+        ),
+        SshAuth.SshPasswordPrompt.disabledLayer,
+        SshTunnel.SshEnvironmentManager.layer({ resolveCliRunner: Effect.succeed(ARCHIVE) }),
+      );
+      yield* Effect.gen(function* () {
+        const manager = yield* SshTunnel.SshEnvironmentManager;
+        const target = { alias: "devbox", hostname: "devbox", username: null, port: null };
+        const ensureUnanswered = Effect.gen(function* () {
+          yield* Queue.clear(requests);
+          const connection = yield* Effect.forkChild(
+            Effect.result(manager.ensureEnvironment(target)),
+          );
+          yield* Queue.take(requests);
+          yield* TestClock.adjust("10 seconds");
+          return yield* Fiber.join(connection);
+        });
+
+        yield* manager.ensureEnvironment(target);
+        unanswered = true;
+        const first = yield* ensureUnanswered;
+        // A quiet minute between failures starts a new slow run.
+        yield* TestClock.adjust("60 seconds");
+        const second = yield* ensureUnanswered;
+        yield* TestClock.adjust("20 seconds");
+        const third = yield* ensureUnanswered;
+        for (const result of [first, second, third]) {
+          assert.isTrue(Result.isFailure(result));
+          if (Result.isFailure(result)) {
+            assert.instanceOf(result.failure, SshReadinessError);
+            assert.include(result.failure.message, "slow");
+          }
+        }
+        assert.equal(tunnels, 1, "A live tunnel on a slow link must be kept.");
+        assert.equal(kills, 0);
+
+        assert.isTrue(Result.isSuccess(yield* ensureUnanswered));
+        assert.equal(tunnels, 2, "A tunnel still silent after the patience window is replaced.");
+
+        unanswered = true;
+        forwardListening = false;
+        assert.isTrue(Result.isSuccess(yield* ensureUnanswered));
+        assert.equal(tunnels, 3, "A refused local forward is replaced without waiting.");
+      }).pipe(Effect.provide(layer), Effect.scoped);
+    }),
+  );
+
   it("rejects archive versions that are not a single exact version segment", () => {
     for (const archiveVersion of [
       "../other",
