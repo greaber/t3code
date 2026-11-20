@@ -35,3 +35,32 @@ export function isTransportConnectionErrorMessage(message: string | null | undef
 export function sanitizeThreadErrorMessage(message: string | null | undefined): string | null {
   return isTransportConnectionErrorMessage(message) ? null : (message ?? null);
 }
+
+function errorMessage(error: unknown): string | null {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "object" && error !== null && "message" in error) {
+    return typeof error.message === "string" ? error.message : null;
+  }
+  return typeof error === "string" ? error : null;
+}
+
+/** Dispatch/auth rejections invalidate payloads; other typed failures may be disconnected transports and must retry. */
+export function shouldRetryThreadOutboxDelivery(error: unknown): boolean {
+  if (typeof error === "object" && error !== null && "_tag" in error) {
+    switch (error._tag) {
+      case "OrchestrationDispatchCommandError":
+      case "EnvironmentAuthorizationError":
+        return false;
+      case "ConnectionTransientError":
+      case "RpcClientError":
+      case "EnvironmentRpcUnavailableError":
+      case "EnvironmentNotRegisteredError":
+        return true;
+      default:
+        break;
+    }
+  }
+  return isTransportConnectionErrorMessage(errorMessage(error));
+}

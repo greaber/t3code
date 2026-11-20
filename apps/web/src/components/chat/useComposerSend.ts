@@ -18,6 +18,7 @@ import {
 import { isUsageLimitsCommand } from "@t3tools/shared/usageLimits";
 import {
   AuthOrchestrationOperateScope,
+  CommandId,
   DEFAULT_MODEL,
   type EnvironmentId,
   type ModelSelection,
@@ -59,7 +60,9 @@ import {
 import { type ChatMessage, DEFAULT_INTERACTION_MODE } from "../../types";
 import { recordPromptSent } from "../GitHubStarPrompt";
 import { stackedThreadToast, toastManager } from "../ui/toast";
-import { newMessageId, newThreadId } from "~/lib/utils";
+import { newMessageId, newThreadId, randomUUID } from "~/lib/utils";
+import { outboxSendDecision } from "../../threadOutbox.logic";
+import { threadOutboxStore } from "../../threadOutboxDelivery";
 import { useNewThreadHandler } from "../../hooks/useHandleNewThread";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import {
@@ -194,6 +197,8 @@ interface ComposerSendInput {
   readonly isRevertingCheckpoint: boolean;
   readonly threadDetailLoading: boolean;
   readonly activeEnvironmentUnavailable: boolean;
+  /** The thread's environment is reconnecting, so plain messages wait in the outbox. */
+  readonly activeEnvironmentReconnecting: boolean;
   readonly isSendBusy: boolean;
   readonly sendQueuesBehindSetup: boolean;
   readonly isDraftHeroState: boolean;
@@ -288,6 +293,7 @@ export function useComposerSend(input: ComposerSendInput) {
     isRevertingCheckpoint,
     threadDetailLoading,
     activeEnvironmentUnavailable,
+    activeEnvironmentReconnecting,
     isSendBusy,
     sendQueuesBehindSetup,
     isDraftHeroState,
@@ -448,7 +454,63 @@ export function useComposerSend(input: ComposerSendInput) {
       });
       return;
     }
-    if (activeEnvironmentUnavailable) {
+    const outboxText = promptAtSend.trim();
+    const outboxDecision = outboxSendDecision({
+      environmentUnavailable: activeEnvironmentUnavailable,
+      environmentReconnecting: activeEnvironmentReconnecting,
+      threadHasOutboxMessages: threadOutboxStore
+        .getState()
+        .messages.some(
+          (message) =>
+            message.environmentId === activeThread.environmentId &&
+            message.threadId === activeThread.id,
+        ),
+      plainTextToServerThread:
+        isServerThread &&
+        sendCtx !== undefined &&
+        sendCtx.providerAvailable &&
+        sendCtx.multipleModelSelections === null &&
+        !directAnnotation &&
+        !queuedRunEdit.isEditing &&
+        sideChatCommand === null &&
+        outboxText.length > 0 &&
+        !isClearComposerCommand(outboxText) &&
+        parseCodexFeedbackCommand(outboxText) === null &&
+        sendCtx.images.length === 0 &&
+        sendCtx.files.length === 0 &&
+        sendCtx.terminalContexts.length === 0 &&
+        sendCtx.previewAnnotations.length === 0 &&
+        sendCtx.reviewComments.length === 0 &&
+        sendCtx.threadContexts.length === 0 &&
+        sendCtx.environmentContexts.length === 0,
+    });
+    if (outboxDecision === "queue" && sendCtx) {
+      if (composerRef.current?.validateProviderInput(outboxText) === false) return;
+      threadOutboxStore.getState().enqueue({
+        environmentId: activeThread.environmentId,
+        threadId: activeThread.id,
+        messageId: newMessageId(),
+        commandId: CommandId.make(randomUUID()),
+        text: formatOutgoingPrompt({
+          provider: sendCtx.selectedProvider,
+          model: sendCtx.selectedModel,
+          models: sendCtx.selectedProviderModels,
+          effort: sendCtx.selectedPromptEffort,
+          text: outboxText,
+        }),
+        draftText: outboxText,
+        modelSelection: sendCtx.selectedModelSelection,
+        runtimeMode,
+        interactionMode: DEFAULT_INTERACTION_MODE,
+        createdAt: new Date().toISOString(),
+        failure: null,
+      });
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
+      return;
+    }
+    if (outboxDecision === "reject") {
       const toastSlot = environmentUnavailableSendToastSlotRef.current;
       environmentUnavailableSendToastSlotRef.current =
         (toastSlot + 1) % ENVIRONMENT_UNAVAILABLE_SEND_TOAST_TRAIL_SIZE;
@@ -456,7 +518,9 @@ export function useComposerSend(input: ComposerSendInput) {
         ...stackedThreadToast({
           type: "warning",
           title: "Not connected: message not sent",
-          description: "Reconnecting to the environment. Try again once it is connected.",
+          description: activeEnvironmentReconnecting
+            ? "Only text messages can wait for the environment to reconnect. Send this one once it is connected."
+            : "Connect the environment, then send it again.",
         }),
         id: `chat-send-environment-unavailable:${toastSlot}`,
       });

@@ -386,6 +386,8 @@ export interface ChatComposerProps {
     readonly label: string;
     readonly connection: EnvironmentConnectionPresentation;
   } | null;
+  /** Plain messages wait in the outbox while the environment reconnects. */
+  environmentQueuesSends?: boolean;
 
   activePendingApproval: PendingApproval | null;
   pendingApprovals: PendingApproval[];
@@ -520,6 +522,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     isPreparingWorktree,
     isCompacting,
     environmentUnavailable,
+    environmentQueuesSends = false,
     activePendingApproval: incomingPendingApproval,
     pendingApprovals,
     onHeldRequestIdsChange,
@@ -1210,13 +1213,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     : null;
   const showResumeAction =
     canResume && !composerDraftHasUserContent(composerDraft) && !isEditingQueuedMessage;
+  const environmentBlocksSend = environmentUnavailable !== null && !environmentQueuesSends;
   const collapsedComposerPrimaryActionDisabled =
     phase === "running" ||
     isSendBusy ||
     isSendDisabled ||
     noProviderAvailable ||
     projectSelectionRequired ||
-    environmentUnavailable !== null ||
+    environmentBlocksSend ||
     (!composerSendState.hasSendableContent && !showResumeAction);
   const collapsedComposerPrimaryActionLabel = showResumeAction
     ? "Resume thread"
@@ -1839,7 +1843,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     (activePendingProgress ? attachmentBlockReason : sendDisabledReason) ??
     (speechInput.preparing ? "Preparing voice input" : null);
   const primaryActionEnvironmentUnavailable =
-    environmentUnavailable !== null ||
+    (activePendingProgress ? environmentUnavailable !== null : environmentBlocksSend) ||
     (!activePendingProgress && (noProviderAvailable || projectSelectionRequired));
   const dictationShortcutLabel = useDictationShortcut({
     keybindings,
@@ -2086,7 +2090,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const shouldBlurMobileComposerOnSubmit = () => {
     if (!isSoftwareKeyboardOpen) return false;
-    if (isSendBusy || submissionBlocked || environmentUnavailable !== null || phase === "running") {
+    if (isSendBusy || submissionBlocked || environmentBlocksSend || phase === "running") {
       return false;
     }
     if (activePendingProgress) {
@@ -3623,6 +3627,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     isSendBusy={isSendBusy}
                     sendDisabledReason={primaryActionSendDisabledReason}
                     isEnvironmentUnavailable={primaryActionEnvironmentUnavailable}
+                    reconnectingEnvironmentLabel={
+                      environmentUnavailable !== null && environmentQueuesSends
+                        ? environmentUnavailable.label
+                        : null
+                    }
                     isPreparingWorktree={isPreparingWorktree}
                     hasSendableContent={composerSendState.hasSendableContent || voiceInputActive}
                     canResume={showResumeAction}

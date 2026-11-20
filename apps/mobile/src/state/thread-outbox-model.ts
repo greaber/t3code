@@ -1,4 +1,4 @@
-import { isTransportConnectionErrorMessage } from "@t3tools/client-runtime/errors";
+import { shouldRetryThreadOutboxDelivery } from "@t3tools/client-runtime/errors";
 import {
   clampFileAttachmentUploadBytes,
   fileAttachmentTooLargeMessage,
@@ -29,6 +29,8 @@ import { DraftComposerAttachmentSchema } from "../lib/composer-image-schema";
 import type { ComposerDispatchMode } from "@t3tools/client-runtime/state/composer-dispatch";
 import type { DraftComposerAttachment } from "../lib/composerImages";
 import { scopedThreadKey } from "../lib/scopedEntities";
+
+export { shouldRetryThreadOutboxDelivery };
 
 // Keep current writes until a compatible native baseline includes the v4 reader.
 const THREAD_OUTBOX_SCHEMA_VERSION = 3;
@@ -255,35 +257,6 @@ export function isQueuedThreadCreationSendable(message: QueuedThreadMessage): bo
     return false;
   }
   return message.creation.workspaceMode !== "worktree" || Boolean(message.creation.branch);
-}
-
-function errorMessage(error: unknown): string | null {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  if (typeof error === "object" && error !== null && "message" in error) {
-    return typeof error.message === "string" ? error.message : null;
-  }
-  return typeof error === "string" ? error : null;
-}
-
-/** Dispatch/auth rejections invalidate payloads; other typed failures may be disconnected transports and must retry. */
-export function shouldRetryThreadOutboxDelivery(error: unknown): boolean {
-  if (typeof error === "object" && error !== null && "_tag" in error) {
-    switch (error._tag) {
-      case "OrchestrationDispatchCommandError":
-      case "EnvironmentAuthorizationError":
-        return false;
-      case "ConnectionTransientError":
-      case "RpcClientError":
-      case "EnvironmentRpcUnavailableError":
-      case "EnvironmentNotRegisteredError":
-        return true;
-      default:
-        break;
-    }
-  }
-  return isTransportConnectionErrorMessage(errorMessage(error));
 }
 
 export type ThreadOutboxCommandStage = "settings-sync" | "start-turn";
