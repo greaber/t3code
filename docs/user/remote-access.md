@@ -237,6 +237,12 @@ neither answers, it keeps the first connection and tries again. When the old
 connection has clearly closed, for example after your computer sleeps, it is
 replaced right away.
 
+When an SSH environment drops, T3 Code tries again as soon as an attempt times
+out, and waits at most 20 seconds between attempts that fail quickly, for
+example while your computer is offline. It stops trying when the host needs you:
+a password or security key prompt you did not answer, a refused key, or a
+changed host key. Choose **Reconnect** once you have dealt with it.
+
 T3 Code sets up the host and its port forward over a single SSH connection, so
 a slow link pays for the SSH handshake once. It keeps its own shared connection
 and does not use `ControlMaster` settings from your SSH config. On Windows each

@@ -164,9 +164,24 @@ export function currentClientMetadata() {
   });
 }
 
+// Failures only the user can resolve: a cancelled or unanswered password
+// prompt, a refused key or password, a security key nobody touched, or a
+// changed host key. Retrying them would only prompt again.
+const SSH_NEEDS_USER_PATTERNS = [
+  /cancel/u,
+  /ssh authentication timed out/u,
+  /permission denied \((?:publickey|password|keyboard-interactive|hostbased|gssapi-with-mic)/u,
+  /authentication failed/u,
+  /too many authentication failures/u,
+  /sign_and_send_pubkey: signing failed/u,
+  /host key verification failed/u,
+  /remote host identification has changed/u,
+];
+
 function sshPreparationError(cause: unknown) {
   const message = cause instanceof Error ? cause.message : String(cause);
-  if (message.toLowerCase().includes("cancel")) {
+  const normalized = message.toLowerCase();
+  if (SSH_NEEDS_USER_PATTERNS.some((pattern) => pattern.test(normalized))) {
     return new ConnectionBlockedError({
       reason: "authentication",
       detail: message,
