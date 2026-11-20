@@ -425,6 +425,9 @@ const client = new Proxy(handlers, {
     }),
 });
 
+const sessionDrops = new Set<(error: ConnectionAttemptError) => void>();
+let refuseConnections = false;
+
 const session: EnvironmentConnectionLease["session"] = {
   client: client as unknown as WsRpcProtocolClient,
   initialConfig: Effect.sync(serverConfig),
@@ -433,25 +436,43 @@ const session: EnvironmentConnectionLease["session"] = {
   ready: Effect.void,
   probe: Effect.void,
   inboundFrames: Effect.succeed(0),
-  closed: Effect.never,
+  closed: Effect.callback<never, ConnectionAttemptError>((resume) => {
+    const drop = (error: ConnectionAttemptError) => resume(Effect.fail(error));
+    sessionDrops.add(drop);
+    return Effect.sync(() => sessionDrops.delete(drop));
+  }),
 };
+
+/**
+ * Drops the live session, and keeps every later connection attempt pending until disposal,
+ * like a link that went away. The cached threads stay on screen.
+ */
+export async function disconnectFakeEnvironment(): Promise<void> {
+  // Loaded late: the package index loads the driver module that tests mock with this file.
+  const { ConnectionTransientError } = await import("@t3tools/client-runtime/connection");
+  refuseConnections = true;
+  const error = new ConnectionTransientError({ reason: "transport", detail: "Link dropped." });
+  for (const drop of sessionDrops) drop(error);
+}
 
 /** Stands in for client-runtime's ConnectionDriver: every connection opens the session above. */
 export const fakeDriver = {
   connect: (
     entry: ConnectionCatalogEntry,
   ): Effect.Effect<EnvironmentConnectionLease, ConnectionAttemptError, Scope.Scope> =>
-    Effect.succeed({
-      prepared: {
-        environmentId: ENVIRONMENT_ID,
-        label: descriptor.label,
-        httpBaseUrl: window.location.origin,
-        socketUrl: window.location.origin.replace(/^http/, "ws"),
-        httpAuthorization: null,
-        target: entry.target,
-      },
-      session,
-    }),
+    refuseConnections
+      ? Effect.never
+      : Effect.succeed({
+          prepared: {
+            environmentId: ENVIRONMENT_ID,
+            label: descriptor.label,
+            httpBaseUrl: window.location.origin,
+            socketUrl: window.location.origin.replace(/^http/, "ws"),
+            httpAuthorization: null,
+            target: entry.target,
+          },
+          session,
+        }),
   preflight: () => Effect.succeed(true),
   checkHost: () => Effect.succeed<RouteCheck>("unchecked"),
 };
@@ -493,6 +514,7 @@ export function installFakeEnvironment(
       threads = [];
       dispatched = [];
       acceptCommands = false;
+      refuseConnections = false;
     },
   };
 }

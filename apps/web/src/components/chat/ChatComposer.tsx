@@ -1216,11 +1216,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const showResumeAction =
     canResume && !composerDraftHasUserContent(composerDraft) && !isEditingQueuedMessage;
   const environmentBlocksSend = environmentUnavailable !== null && !environmentQueuesSends;
+  // Until the environment connects it has sent no providers, and a text message can still wait.
+  const providerBlocksSend =
+    noProviderAvailable &&
+    !(environmentUnavailable !== null && environmentQueuesSends && providerCatalogPending);
   const collapsedComposerPrimaryActionDisabled =
     phase === "running" ||
     isSendBusy ||
     isSendDisabled ||
-    noProviderAvailable ||
+    providerBlocksSend ||
     projectSelectionRequired ||
     environmentBlocksSend ||
     (!composerSendState.hasSendableContent && !showResumeAction);
@@ -1846,7 +1850,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     (speechInput.preparing ? "Preparing voice input" : null);
   const primaryActionEnvironmentUnavailable =
     (activePendingProgress ? environmentUnavailable !== null : environmentBlocksSend) ||
-    (!activePendingProgress && (noProviderAvailable || projectSelectionRequired));
+    (!activePendingProgress && (providerBlocksSend || projectSelectionRequired));
   const dictationShortcutLabel = useDictationShortcut({
     keybindings,
     speech: speechInput,

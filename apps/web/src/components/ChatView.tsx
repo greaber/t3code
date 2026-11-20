@@ -189,7 +189,7 @@ import { cn } from "~/lib/utils";
 import { isModelPickerOpen } from "../modelPickerVisibility";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
-import { threadOutboxStore } from "../threadOutboxDelivery";
+import { threadOutboxStore, useThreadOutbox } from "../threadOutboxDelivery";
 import { environmentWillConnect, type OutboxMessage } from "../threadOutbox.logic";
 import { projectScriptIdFromCommand } from "~/projectScripts";
 import { newMessageId } from "~/lib/utils";
@@ -1161,6 +1161,15 @@ export default function ChatView(props: ChatViewProps) {
   const activeEnvironmentUnavailable =
     activeEnvironment !== null && activeEnvironment.connection.phase !== "connected";
   const activeEnvironmentUnavailableLabel = activeEnvironment?.label ?? null;
+  // Messages waiting for the environment show with the queue even while it is disconnected.
+  const threadHasOutboxMessages = useThreadOutbox((state) =>
+    state.messages.some(
+      (message) =>
+        activeThread != null &&
+        message.environmentId === activeThread.environmentId &&
+        message.threadId === activeThread.id,
+    ),
+  );
   const activeEnvironmentWillConnect =
     activeEnvironment !== null &&
     environmentWillConnect({
@@ -3091,6 +3100,7 @@ export default function ChatView(props: ChatViewProps) {
   // something, by its own rule: an optimistic message stops counting once the server has it.
   const hasQueuedTurns =
     queuedRunCount > 0 ||
+    threadHasOutboxMessages ||
     optimisticUserMessages.some(
       (message) =>
         message.inputIntent === "queued_turn" &&
