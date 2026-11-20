@@ -231,11 +231,11 @@ switching the environment off stops a server that T3 Code launched; a server
 that was already running is left alone.
 
 On a slow or lossy network, the host can stop answering for a while even though
-the SSH connection is still up. T3 Code keeps that connection open for up to
-about 45 seconds and shows the environment as reconnecting because the connection
-is slow, rather than starting a new one over the same network. It opens a new
-SSH connection right away when the old one has closed, for example after your
-computer sleeps.
+the SSH connection is still up. T3 Code then keeps that connection and opens a
+second one alongside it, and uses whichever answers first, closing the other. If
+neither answers, it keeps the first connection and tries again. When the old
+connection has clearly closed, for example after your computer sleeps, it is
+replaced right away.
 
 Each desktop app keeps one session on the host for its SSH connection and reuses
 it when it reconnects. Revoke sessions you no longer use in **Settings →

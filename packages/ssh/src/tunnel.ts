@@ -8,7 +8,6 @@ import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as NetService from "@t3tools/shared/Net";
 import { extractJsonObject, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { satisfiesSemverRange } from "@t3tools/shared/semver";
-import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
 import * as Deferred from "effect/Deferred";
@@ -55,9 +54,6 @@ const SSH_READY_PROBE_TIMEOUT_MS = 1_000;
 // A forwarded HTTP probe crosses the client WAN; local server probes do not.
 const SSH_TUNNEL_READY_PROBE_TIMEOUT_MS = 8_000;
 const SSH_TUNNEL_REUSE_READY_TIMEOUT_MS = 10_000;
-// A lossy link can stall a live tunnel's probes for tens of seconds, and a new
-// tunnel crosses the same link, so a live but silent tunnel is kept this long.
-const SSH_TUNNEL_SLOW_PATIENCE_MS = 45_000;
 const TUNNEL_SHUTDOWN_TIMEOUT_MS = 2_000;
 const TUNNEL_STDERR_TAIL_CHARS = 16_384;
 const REMOTE_READY_TIMEOUT_MS = 60_000;
@@ -1529,8 +1525,6 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
 ): Effect.fn.Return<SshEnvironmentManagerShape, never, Scope.Scope> {
   const managerScope = yield* Scope.Scope;
   const tunnels = new Map<string, SshTunnelEntry>();
-  // A live tunnel's current run of unanswered probes: when it began and last failed.
-  const slowTunnels = new WeakMap<SshTunnelEntry, { since: number; lastAt: number }>();
   const targetLocks = yield* KeyedLock.make<string>();
   const authSecrets = new Map<string, string>();
   // Disconnect cancels a connect queued or running for the same target, so a
@@ -1749,7 +1743,6 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
         Exit.isSuccess(exit) ? Effect.void : Scope.close(entryScope, Exit.void).pipe(Effect.ignore),
       ),
     );
-    tunnels.set(input.key, tunnelEntry);
     // Closing a tunnel, including when the app quits, leaves the remote server
     // running: agent turns may be working there. Only disconnect stops it.
     yield* Scope.addFinalizer(
@@ -1773,6 +1766,77 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
     return tunnelEntry;
   });
 
+  const tunnelStillForwarding = Effect.fn("ssh/tunnel.tunnelStillForwarding")(function* (
+    entry: SshTunnelEntry,
+  ) {
+    const net = yield* NetService.NetService;
+    const processRunning = yield* entry.process.isRunning.pipe(Effect.orElseSucceed(() => false));
+    return processRunning && (yield* net.hasListenerOnHost(entry.localPort, "127.0.0.1"));
+  });
+
+  // Make before break: the slow tunnel stays in use while a replacement on a new
+  // local port comes up, and whichever answers first is kept. The target lock
+  // allows one replacement per environment; the loser's ssh is always stopped.
+  const raceReplacementTunnel = Effect.fn("ssh/tunnel.raceReplacementTunnel")(function* (input: {
+    readonly key: string;
+    readonly entry: SshTunnelEntry;
+    readonly resolvedTarget: DesktopSshEnvironmentTarget;
+    readonly runner?: RemoteT3RunnerOptions;
+  }): Effect.fn.Return<SshTunnelEntry, SshEnvironmentEffectError, SshEnvironmentEffectContext> {
+    const { key, entry, resolvedTarget } = input;
+    const oldRecovers = waitForHttpReady({
+      baseUrl: entry.httpBaseUrl,
+      timeoutMs: SSH_READY_TIMEOUT_MS,
+      probeTimeoutMs: SSH_TUNNEL_READY_PROBE_TIMEOUT_MS,
+    }).pipe(Effect.as(entry));
+    const replacement = createTunnelEntry({
+      key,
+      resolvedTarget,
+      ...(input.runner === undefined ? {} : { runner: input.runner }),
+    });
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        // Interrupting the race stops the replacement, whose scope closes its ssh.
+        const winnerExit = yield* Effect.exit(restore(Effect.race(oldRecovers, replacement)));
+        if (Exit.isSuccess(winnerExit)) {
+          const winner = winnerExit.value;
+          if (winner === entry) {
+            yield* Effect.logInfo("ssh.environment.tunnel.existing.recovered", {
+              ...sshTargetLogFields(resolvedTarget),
+              key,
+              localPort: entry.localPort,
+            });
+            return entry;
+          }
+          tunnels.set(key, winner);
+          yield* closeTunnelEntry(entry);
+          yield* Effect.logInfo("ssh.environment.tunnel.replaced", {
+            ...sshTargetLogFields(resolvedTarget),
+            key,
+            previousLocalPort: entry.localPort,
+            localPort: winner.localPort,
+          });
+          return winner;
+        }
+        // Neither answered. A still-live tunnel stays for the next attempt, which
+        // races another replacement; ssh keepalives end it if the link is dead.
+        if (yield* tunnelStillForwarding(entry)) {
+          yield* Effect.logWarning("ssh.environment.tunnel.replacement.failed", {
+            ...sshTargetLogFields(resolvedTarget),
+            key,
+            cause: winnerExit.cause,
+          });
+          return yield* new SshReadinessError({
+            message: `The connection to ${resolvedTarget.alias} is slow, and a new SSH tunnel did not answer either. Keeping the current one and trying again.`,
+          });
+        }
+        tunnels.delete(key);
+        yield* closeTunnelEntry(entry);
+        return yield* Effect.failCause(winnerExit.cause);
+      }),
+    );
+  });
+
   const ensureTunnelEntry = Effect.fn("ssh/tunnel.ensureTunnelEntry")(function* (
     key: string,
     resolvedTarget: DesktopSshEnvironmentTarget,
@@ -1787,7 +1851,6 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
         localPort: entry.localPort,
         remotePort: entry.remotePort,
       });
-      const probeStartedAt = yield* Clock.currentTimeMillis;
       // A probe still in flight at the deadline also went unanswered.
       let unanswered = true;
       const readinessExit = yield* Effect.exit(
@@ -1801,7 +1864,6 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
         }),
       );
       if (Exit.isSuccess(readinessExit)) {
-        slowTunnels.delete(entry);
         yield* Effect.logDebug("ssh.environment.tunnel.reused", {
           ...sshTargetLogFields(resolvedTarget),
           key,
@@ -1810,39 +1872,23 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
         });
         return entry;
       }
-      // An unanswered probe through a live ssh process and local forward is a
-      // slow link, which a new tunnel would cross too. A refused forward (after
-      // sleep), an exited ssh, or a server error still replaces the tunnel.
-      if (unanswered) {
-        const net = yield* NetService.NetService;
-        const processRunning = yield* entry.process.isRunning.pipe(
-          Effect.orElseSucceed(() => false),
-        );
-        const forwardListening =
-          processRunning && (yield* net.hasListenerOnHost(entry.localPort, "127.0.0.1"));
-        const previous = slowTunnels.get(entry);
-        // A long quiet gap means the link recovered in between; start a new run.
-        const slowSince =
-          previous !== undefined && probeStartedAt - previous.lastAt < SSH_TUNNEL_SLOW_PATIENCE_MS
-            ? previous.since
-            : probeStartedAt;
-        const now = yield* Clock.currentTimeMillis;
-        const slowForMs = now - slowSince;
-        if (forwardListening && slowForMs < SSH_TUNNEL_SLOW_PATIENCE_MS) {
-          slowTunnels.set(entry, { since: slowSince, lastAt: now });
-          yield* Effect.logWarning("ssh.environment.tunnel.existing.slow", {
-            ...sshTargetLogFields(resolvedTarget),
-            key,
-            localPort: entry.localPort,
-            remotePort: entry.remotePort,
-            slowForMs,
-            patienceMs: SSH_TUNNEL_SLOW_PATIENCE_MS,
-            cause: readinessExit.cause,
-          });
-          return yield* new SshReadinessError({
-            message: `The connection to ${resolvedTarget.alias} is slow: no reply for ${Math.round(slowForMs / 1000)}s. Keeping its SSH tunnel open while it recovers.`,
-          });
-        }
+      // Unanswered probes through a live ssh process and local forward may be a
+      // slow link rather than a dead tunnel, so keep it and race a replacement.
+      // A refused forward (after sleep), an exited ssh, or a server error is dead.
+      if (unanswered && (yield* tunnelStillForwarding(entry))) {
+        yield* Effect.logWarning("ssh.environment.tunnel.existing.slow", {
+          ...sshTargetLogFields(resolvedTarget),
+          key,
+          localPort: entry.localPort,
+          remotePort: entry.remotePort,
+          cause: readinessExit.cause,
+        });
+        return yield* raceReplacementTunnel({
+          key,
+          entry,
+          resolvedTarget,
+          ...(runner === undefined ? {} : { runner }),
+        });
       }
       yield* Effect.logWarning("ssh.environment.tunnel.existing.stale", {
         ...sshTargetLogFields(resolvedTarget),
@@ -1855,7 +1901,7 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
       yield* closeTunnelEntry(entry);
     }
 
-    return yield* createTunnelEntry({
+    const created = yield* createTunnelEntry({
       key,
       resolvedTarget,
       ...(runner === undefined ? {} : { runner }),
@@ -1868,6 +1914,8 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
         }),
       ),
     );
+    tunnels.set(key, created);
+    return created;
   });
 
   const ensureEnvironment = Effect.fn("ssh/tunnel.ensureEnvironment")(function* (
