@@ -1622,14 +1622,18 @@ const startSshTunnel = Effect.fn("ssh/tunnel.startSshTunnel")(function* (input: 
     process: child,
     scope: input.scope,
   };
+  // The launch only reports a server that answered on the host, and a forward added
+  // to a live master listens at once, so a probe through it would only cost round trips.
   yield* Effect.raceFirst(
     forwardReady.pipe(
       Effect.andThen(
-        waitForHttpReady({
-          baseUrl: input.httpBaseUrl,
-          timeoutMs: SSH_READY_TIMEOUT_MS,
-          probeTimeoutMs: SSH_TUNNEL_READY_PROBE_TIMEOUT_MS,
-        }),
+        controlPath === undefined
+          ? waitForHttpReady({
+              baseUrl: input.httpBaseUrl,
+              timeoutMs: SSH_READY_TIMEOUT_MS,
+              probeTimeoutMs: SSH_TUNNEL_READY_PROBE_TIMEOUT_MS,
+            })
+          : Effect.void,
       ),
     ),
     tunnel.exitFailure,

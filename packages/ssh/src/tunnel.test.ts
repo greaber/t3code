@@ -485,6 +485,7 @@ describe("ssh tunnel scripts", () => {
     );
     const refused = new Set<number>();
     const refusedProbes = yield* Queue.unbounded<void>();
+    let httpRequests = 0;
     let nextPort = 41_773;
     const layer = Layer.mergeAll(
       NodeServices.layer,
@@ -493,7 +494,7 @@ describe("ssh tunnel scripts", () => {
       Layer.succeed(
         HttpClient.HttpClient,
         HttpClient.make((request) =>
-          refused.has(Number(new URL(request.url).port))
+          ++httpRequests > 0 && refused.has(Number(new URL(request.url).port))
             ? Queue.offer(refusedProbes, undefined).pipe(
                 Effect.andThen(
                   Effect.fail(
@@ -527,7 +528,15 @@ describe("ssh tunnel scripts", () => {
     // Commands over a master cannot connect on their own (ProxyCommand=false).
     const connections = () =>
       spawned.filter((args) => !args.includes("-G") && !args.includes("ProxyCommand=false")).length;
-    return { spawned, masters, refused, refusedProbes, layer, connections };
+    return {
+      spawned,
+      masters,
+      refused,
+      refusedProbes,
+      layer,
+      connections,
+      httpRequests: () => httpRequests,
+    };
   });
 
   it.effect.each([
@@ -551,6 +560,8 @@ describe("ssh tunnel scripts", () => {
           // Launch, tunnel forward, and pairing, then stopping the server.
           const result = yield* manager.ensureEnvironment(target, { issuePairingToken: true });
           assert.equal(result.pairingToken, "PAIRED");
+          // The launch already saw the server answer; only plain tunnels probe through the forward.
+          assert.equal(harness.httpRequests(), row.useControlMaster ? 0 : 1);
           const [master] = harness.masters;
           if (row.useControlMaster) assert.isFalse(master!.killed);
           yield* manager.disconnectEnvironment(target);
