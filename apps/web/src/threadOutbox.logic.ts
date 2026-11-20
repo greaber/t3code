@@ -1,3 +1,4 @@
+import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
 import { shouldRetryThreadOutboxDelivery } from "@t3tools/client-runtime/errors";
 import {
   CommandId,
@@ -81,20 +82,40 @@ export function outboxFailureAction(input: {
 }
 
 /**
- * Whether a send goes to the outbox. Messages queue while their environment reconnects, and
- * keep queueing behind earlier queued ones after it connects so a thread keeps its order.
- * Only plain text queues: attachments upload and context resolves against a live server.
+ * Whether an environment that is not connected will be again without the user
+ * turning it back on: one starting up, reconnecting, offline, or waiting for a
+ * fix such as signing in. A switched-off or unsupported one will not.
+ */
+export function environmentWillConnect(environment: {
+  readonly phase: EnvironmentConnectionPhase;
+  readonly enabled: boolean;
+}): boolean {
+  return environment.enabled && environment.phase !== "unsupported";
+}
+
+/**
+ * Whether a send goes to the outbox. Messages queue while their environment is not connected
+ * but will be, including its first connection after the app starts, and keep queueing behind
+ * earlier queued ones after it connects so a thread keeps its order. Only plain text queues:
+ * attachments upload and context resolves against a live server.
  */
 export function outboxSendDecision(input: {
   readonly environmentUnavailable: boolean;
-  /** The environment is reconnecting or the device is offline, rather than off or refused. */
-  readonly environmentReconnecting: boolean;
+  readonly environmentWillConnect: boolean;
   readonly threadHasOutboxMessages: boolean;
   /** An existing server thread sending one plain-text message to one model. */
   readonly plainTextToServerThread: boolean;
+  readonly providerAvailable: boolean;
+  /**
+   * The environment has not sent its providers since the app started, so a queued message
+   * goes to the thread's own model and the server checks it on delivery.
+   */
+  readonly providerCatalogPending: boolean;
 }): "queue" | "reject" | "send" {
+  const queueable =
+    input.plainTextToServerThread && (input.providerAvailable || input.providerCatalogPending);
   if (!input.environmentUnavailable) {
-    return input.threadHasOutboxMessages && input.plainTextToServerThread ? "queue" : "send";
+    return input.threadHasOutboxMessages && queueable ? "queue" : "send";
   }
-  return input.environmentReconnecting && input.plainTextToServerThread ? "queue" : "reject";
+  return input.environmentWillConnect && queueable ? "queue" : "reject";
 }

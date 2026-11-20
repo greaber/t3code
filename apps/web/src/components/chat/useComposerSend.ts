@@ -197,8 +197,8 @@ interface ComposerSendInput {
   readonly isRevertingCheckpoint: boolean;
   readonly threadDetailLoading: boolean;
   readonly activeEnvironmentUnavailable: boolean;
-  /** The thread's environment is reconnecting, so plain messages wait in the outbox. */
-  readonly activeEnvironmentReconnecting: boolean;
+  /** The thread's environment is not connected but will be, so plain messages wait in the outbox. */
+  readonly activeEnvironmentWillConnect: boolean;
   readonly isSendBusy: boolean;
   readonly sendQueuesBehindSetup: boolean;
   readonly isDraftHeroState: boolean;
@@ -293,7 +293,7 @@ export function useComposerSend(input: ComposerSendInput) {
     isRevertingCheckpoint,
     threadDetailLoading,
     activeEnvironmentUnavailable,
-    activeEnvironmentReconnecting,
+    activeEnvironmentWillConnect,
     isSendBusy,
     sendQueuesBehindSetup,
     isDraftHeroState,
@@ -457,7 +457,7 @@ export function useComposerSend(input: ComposerSendInput) {
     const outboxText = promptAtSend.trim();
     const outboxDecision = outboxSendDecision({
       environmentUnavailable: activeEnvironmentUnavailable,
-      environmentReconnecting: activeEnvironmentReconnecting,
+      environmentWillConnect: activeEnvironmentWillConnect,
       threadHasOutboxMessages: threadOutboxStore
         .getState()
         .messages.some(
@@ -468,7 +468,6 @@ export function useComposerSend(input: ComposerSendInput) {
       plainTextToServerThread:
         isServerThread &&
         sendCtx !== undefined &&
-        sendCtx.providerAvailable &&
         sendCtx.multipleModelSelections === null &&
         !directAnnotation &&
         !queuedRunEdit.isEditing &&
@@ -483,6 +482,8 @@ export function useComposerSend(input: ComposerSendInput) {
         sendCtx.reviewComments.length === 0 &&
         sendCtx.threadContexts.length === 0 &&
         sendCtx.environmentContexts.length === 0,
+      providerAvailable: sendCtx?.providerAvailable === true,
+      providerCatalogPending: sendCtx?.providerCatalogPending === true,
     });
     if (outboxDecision === "queue" && sendCtx) {
       if (composerRef.current?.validateProviderInput(outboxText) === false) return;
@@ -491,15 +492,20 @@ export function useComposerSend(input: ComposerSendInput) {
         threadId: activeThread.id,
         messageId: newMessageId(),
         commandId: CommandId.make(randomUUID()),
-        text: formatOutgoingPrompt({
-          provider: sendCtx.selectedProvider,
-          model: sendCtx.selectedModel,
-          models: sendCtx.selectedProviderModels,
-          effort: sendCtx.selectedPromptEffort,
-          text: outboxText,
-        }),
+        // Before the environment sends its providers, the composer has no model to offer.
+        text: sendCtx.providerAvailable
+          ? formatOutgoingPrompt({
+              provider: sendCtx.selectedProvider,
+              model: sendCtx.selectedModel,
+              models: sendCtx.selectedProviderModels,
+              effort: sendCtx.selectedPromptEffort,
+              text: outboxText,
+            })
+          : outboxText,
         draftText: outboxText,
-        modelSelection: sendCtx.selectedModelSelection,
+        modelSelection: sendCtx.providerAvailable
+          ? sendCtx.selectedModelSelection
+          : activeThread.modelSelection,
         runtimeMode,
         interactionMode: DEFAULT_INTERACTION_MODE,
         createdAt: new Date().toISOString(),
@@ -518,8 +524,8 @@ export function useComposerSend(input: ComposerSendInput) {
         ...stackedThreadToast({
           type: "warning",
           title: "Not connected: message not sent",
-          description: activeEnvironmentReconnecting
-            ? "Only text messages can wait for the environment to reconnect. Send this one once it is connected."
+          description: activeEnvironmentWillConnect
+            ? "Only text messages can wait for the environment to connect. Send this one once it is connected."
             : "Connect the environment, then send it again.",
         }),
         id: `chat-send-environment-unavailable:${toastSlot}`,

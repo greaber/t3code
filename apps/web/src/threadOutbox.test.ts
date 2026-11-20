@@ -13,7 +13,11 @@ import {
   startThreadOutboxDelivery,
   type OutboxSendResult,
 } from "./threadOutbox";
-import { outboxSendDecision, type OutboxMessage } from "./threadOutbox.logic";
+import {
+  environmentWillConnect,
+  outboxSendDecision,
+  type OutboxMessage,
+} from "./threadOutbox.logic";
 
 const devbox = EnvironmentId.make("environment:devbox");
 const laptop = EnvironmentId.make("environment:laptop");
@@ -158,31 +162,67 @@ describe("thread outbox delivery", () => {
 });
 
 describe("outboxSendDecision", () => {
+  // unavailable, will connect, outbox waiting, plain text, provider available, catalog pending
   it.each([
-    ["queues plain text while reconnecting", true, true, false, true, "queue"],
-    ["rejects attachments while reconnecting", true, true, false, false, "reject"],
-    ["rejects while switched off or refused", true, false, false, true, "reject"],
-    ["queues behind waiting messages once connected", false, false, true, true, "queue"],
-    ["sends attachments directly once connected", false, false, true, false, "send"],
-    ["sends directly with nothing waiting", false, false, false, true, "send"],
+    ["queues plain text while reconnecting", true, true, false, true, true, false, "queue"],
+    [
+      "queues before the environment sends its providers",
+      true,
+      true,
+      false,
+      true,
+      false,
+      true,
+      "queue",
+    ],
+    ["rejects a provider the environment lacks", true, true, false, true, false, false, "reject"],
+    ["rejects attachments while reconnecting", true, true, false, false, true, false, "reject"],
+    ["rejects while switched off", true, false, false, true, true, false, "reject"],
+    [
+      "queues behind waiting messages once connected",
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      "queue",
+    ],
+    ["sends attachments directly once connected", false, false, true, false, true, false, "send"],
+    ["sends directly with nothing waiting", false, false, false, true, true, false, "send"],
   ] as const)(
     "%s",
     (
       _name,
       environmentUnavailable,
-      environmentReconnecting,
+      environmentWillConnect,
       threadHasOutboxMessages,
       plainTextToServerThread,
+      providerAvailable,
+      providerCatalogPending,
       expected,
     ) => {
       expect(
         outboxSendDecision({
           environmentUnavailable,
-          environmentReconnecting,
+          environmentWillConnect,
           threadHasOutboxMessages,
           plainTextToServerThread,
+          providerAvailable,
+          providerCatalogPending,
         }),
       ).toBe(expected);
     },
   );
+
+  it.each([
+    ["connecting", true, true],
+    ["reconnecting", true, true],
+    ["offline", true, true],
+    ["error", true, true],
+    ["available", false, false],
+    ["unsupported", true, false],
+  ] as const)("an environment %s (enabled: %s) will connect: %s", (phase, enabled, expected) => {
+    expect(environmentWillConnect({ phase, enabled })).toBe(expected);
+  });
 });
