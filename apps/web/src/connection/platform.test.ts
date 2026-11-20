@@ -262,6 +262,29 @@ describe("desktop SSH pairing", () => {
     }),
   );
 
+  it.effect("blocks SSH failures that need the user instead of retrying them", () =>
+    Effect.gen(function* () {
+      const failEnsure = (message: string) => {
+        const bridge = makeBridge([]);
+        vi.spyOn(bridge, "ensureSshEnvironment").mockRejectedValue(new Error(message));
+        return provisionDesktopSshEnvironment(bridge, TARGET).pipe(Effect.flip);
+      };
+
+      for (const message of [
+        "SSH authentication cancelled for devbox.",
+        "SSH authentication timed out for devbox.",
+        "user@devbox: Permission denied (publickey,password).",
+        "sign_and_send_pubkey: signing failed for ED25519-SK from agent: agent refused operation",
+        "Host key verification failed.",
+      ]) {
+        expect(yield* failEnsure(message)).toBeInstanceOf(ConnectionBlockedError);
+      }
+      expect(
+        yield* failEnsure("ssh: connect to host devbox port 22: Operation timed out"),
+      ).toBeInstanceOf(ConnectionTransientError);
+    }),
+  );
+
   it.effect("reconnects with the saved token while it holds every standard scope", () =>
     Effect.gen(function* () {
       const calls: string[] = [];

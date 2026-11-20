@@ -5,6 +5,7 @@ import {
   type ServerConfigStreamEvent,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -596,9 +597,77 @@ describe("EnvironmentSupervisor", () => {
 
       // Once prepared, the session still has only its usual budget.
       yield* TestClock.adjust("90 seconds");
-      const timedOut = yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
-      expect(timedOut).toMatchObject({ attempt: 1, lastFailure: { reason: "timeout" } });
-      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      const timedOut = yield* awaitState(supervisor.state, (state) => state.attempt === 2);
+      expect(timedOut).toMatchObject({ phase: "connecting", lastFailure: { reason: "timeout" } });
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("retries an SSH environment at once after a slow failure", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: (attempt, target) =>
+          attempt === 1
+            ? Effect.sleep("5 seconds").pipe(Effect.andThen(Effect.fail(transient())))
+            : Effect.succeed(preparedFor(target)),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(SSH_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* TestClock.adjust("5 seconds");
+      const next = yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "backoff" || state.phase === "connected",
+      );
+      expect(next.phase).toBe("connected");
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("backs off after three immediate retries of a persistent slow SSH failure", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: () => Effect.sleep("5 seconds").pipe(Effect.andThen(Effect.fail(transient()))),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(SSH_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* TestClock.adjust("20 seconds");
+      const backoff = yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
+      expect(backoff.attempt).toBe(4);
+      expect(backoff.retryAt! - (yield* Clock.currentTimeMillis)).toBe(1_000);
+      expect(yield* Ref.get(harness.prepareCount)).toBe(4);
+
+      yield* TestClock.adjust("6 seconds");
+      const next = yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "backoff" && state.attempt === 5,
+      );
+      expect(next.retryAt! - (yield* Clock.currentTimeMillis)).toBe(2_000);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("backs off an SSH environment that fails fast from 1 to at most 20 seconds", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ prepare: () => Effect.fail(transient()) });
+      const supervisor = yield* EnvironmentSupervisor.make(SSH_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      const delays: Array<number> = [];
+      for (let attempt = 1; attempt <= 7; attempt += 1) {
+        const backoff = yield* awaitState(
+          supervisor.state,
+          (state) => state.phase === "backoff" && state.attempt === attempt,
+        );
+        const delayMs = backoff.retryAt! - (yield* Clock.currentTimeMillis);
+        delays.push(delayMs);
+        yield* TestClock.adjust(delayMs);
+      }
+
+      expect(delays).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 20_000, 20_000]);
     }).pipe(Effect.provide(TestClock.layer())),
   );
 

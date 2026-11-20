@@ -42,6 +42,13 @@ import {
 
 const RETRY_BASE_DELAY_MS = 1_000;
 const RETRY_MAX_DELAY_MS = 300_000;
+// An SSH attempt that fails this slowly usually waited out a stalled link that
+// may already be back, and the desktop bounds each SSH step, so the next
+// attempt starts at once, up to a few times in a row so a persistent slow
+// failure cannot loop. Faster failures (offline, refused) back off briefly.
+const SSH_SLOW_FAILURE_MS = 3_000;
+const SSH_MAX_IMMEDIATE_RETRIES = 3;
+const SSH_RETRY_MAX_DELAY_MS = 20_000;
 const SESSION_LOSS_RETRY_DELAY_MS = 250;
 // A cold server with a large database can take longer than 15 seconds to
 // answer, and that is not a reason to drop a working connection. Preparing an
@@ -161,6 +168,10 @@ export interface EnvironmentSupervisorOptions {
 function retryDelayMs(failureCount: number, random: number): number {
   const ceiling = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * 2 ** (failureCount + 1));
   return Math.round(ceiling / 2 + (ceiling / 2) * random);
+}
+
+function sshRetryDelayMs(fastFailures: number): number {
+  return Math.min(SSH_RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * 2 ** (fastFailures - 1));
 }
 
 interface SilentRoute {
@@ -294,6 +305,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   const target = entry.target;
   const usesRelay = connectionRoutes(entry).some(
     (route) => route.target._tag === "RelayConnectionTarget",
+  );
+  const usesSsh = connectionRoutes(entry).some(
+    (route) => route.target._tag === "SshConnectionTarget",
   );
   const setupTimeoutDetail = `${target.label} did not respond during connection setup.${
     usesRelay ? ` ${NETWORK_BLOCKING_HINT}` : ""
@@ -1130,17 +1144,20 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     let generation = 0;
     let latestFailure: ConnectionAttemptError | null = null;
     let pendingRetry = Option.none<PendingRetryTrace>();
+    let sshFastFailures = 0;
+    let sshSlowFailures = 0;
     const resetRetryLadder = () => {
       failureCount = 0;
+      sshFastFailures = 0;
+      sshSlowFailures = 0;
       pendingRetry = Option.none();
     };
     let replacing = false;
 
     for (;;) {
       if (yield* Ref.getAndSet(resetRetryState, false)) {
-        failureCount = 0;
+        resetRetryLadder();
         latestFailure = null;
-        pendingRetry = Option.none();
       }
       const currentIntent = yield* Ref.get(intent);
       if (!currentIntent.desired) {
@@ -1163,9 +1180,11 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
       const attempt = failureCount + 1;
       const nextGeneration = generation + 1;
+      const attemptStartedAt = yield* Clock.monotonicTimeNanos;
       const outcome: AttemptOutcome = yield* Effect.scoped(
         runAttempt(attempt, nextGeneration, latestFailure, pendingRetry, replacing),
       );
+      const attemptMs = Number(((yield* Clock.monotonicTimeNanos) - attemptStartedAt) / 1_000_000n);
       replacing = false;
       const failedProbe = yield* Ref.getAndSet(probeUnanswered, false);
       if (outcome.established) {
@@ -1175,6 +1194,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         // a socket the OS killed while the app was suspended: its replacement
         // reports no failure until it fails itself.
         latestFailure = null;
+        sshFastFailures = 0;
+        sshSlowFailures = 0;
         if (outcome.stable) {
           resetRetryLadder();
         }
@@ -1221,15 +1242,30 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       // still counts it, so a host that keeps dropping sessions backs off.
       const firstLoss = outcome.established && failureCount === 0;
       failureCount += 1;
-      const delayMs = firstLoss
-        ? Math.round(SESSION_LOSS_RETRY_DELAY_MS * (0.5 + (yield* Random.next) / 2))
-        : retryDelayMs(failureCount - 1, yield* Random.next);
+      if (usesSsh) {
+        sshSlowFailures = attemptMs >= SSH_SLOW_FAILURE_MS ? sshSlowFailures + 1 : 0;
+        const immediate = sshSlowFailures > 0 && sshSlowFailures <= SSH_MAX_IMMEDIATE_RETRIES;
+        sshFastFailures = immediate ? 0 : sshFastFailures + 1;
+      }
+      const delayMs = usesSsh
+        ? sshFastFailures === 0
+          ? 0
+          : sshRetryDelayMs(sshFastFailures)
+        : firstLoss
+          ? Math.round(SESSION_LOSS_RETRY_DELAY_MS * (0.5 + (yield* Random.next) / 2))
+          : retryDelayMs(failureCount - 1, yield* Random.next);
       pendingRetry = Option.map(attemptSpan, (previousAttempt) => ({
         previousAttempt,
         failureCount,
         delayMs,
         reason: error.reason,
       }));
+      if (delayMs === 0) {
+        yield* setState(
+          connectingState(yield* Ref.get(intent), generation, failureCount + 1, latestFailure),
+        );
+        continue;
+      }
       const failedIntent = yield* Ref.get(intent);
       yield* setState({
         desired: failedIntent.desired,

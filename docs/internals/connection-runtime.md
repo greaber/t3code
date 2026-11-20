@@ -16,6 +16,17 @@ client of a restarted server reconnects in the same second; with a short cap, a
 client that can never connect retries all day. Offline states and authentication
 failures wait for a wakeup instead of spending attempts on unchanged conditions.
 
+Desktop-managed SSH environments use their own ladder: one client per host has
+no herd to spread, and the desktop bounds every SSH step and drops a dead link
+itself. An attempt that failed after 3 seconds or more usually waited out a
+stalled link that may already be back, so the next starts at once, up to three
+times in a row; after that, and after a faster failure (offline, refused), it
+waits 1 second, doubling to 20, until a connection, an explicit retry,
+foregrounding, or a network change resets it. The renderer
+classifies SSH failures that only the user can fix, such as a refused key, an
+unanswered password prompt, or a changed host key, as authentication failures,
+so neither ladder prompts again on its own.
+
 Foregrounding, a network change, an explicit retry, and an offline report probe
 the established session, and only a failed probe reconnects. Offline reports are
 often wrong, for example for a loopback server. The OS can kill a suspended
