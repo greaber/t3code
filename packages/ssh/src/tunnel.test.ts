@@ -450,6 +450,167 @@ describe("ssh tunnel scripts", () => {
     }),
   );
 
+  // Counts the ssh processes that open their own connection to the host.
+  const controlMasterHarness = Effect.fn("controlMasterHarness")(function* (input: {
+    readonly controlSocketDirectory: string | undefined;
+    readonly masterStderr?: string;
+  }) {
+    const spawned: Array<ReadonlyArray<string>> = [];
+    const masters: Array<{ controlPath: string; killed: boolean }> = [];
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.sync(() => {
+        const args = commandArgs(command);
+        spawned.push(args);
+        if (args.includes("ControlMaster=yes")) {
+          const controlPath = args.find((arg) => arg.startsWith("ControlPath="))!.slice(12);
+          if (input.masterStderr !== undefined) {
+            return {
+              ...makeSuccessfulProcess(""),
+              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(255)),
+              stderr: Stream.make(new TextEncoder().encode(input.masterStderr)),
+            };
+          }
+          const master = { controlPath, killed: false };
+          masters.push(master);
+          NodeFS.writeFileSync(controlPath, "");
+          return makeRunningProcess(() => {
+            master.killed = true;
+          });
+        }
+        if (args.includes("-N")) return makeRunningProcess(() => {});
+        if (args.at(-1) === "-s") return makeSuccessfulProcess('{"credential":"PAIRED"}\n');
+        return makeSuccessfulProcess('{"remotePort":3773,"serverKind":"managed"}\n');
+      }),
+    );
+    const refused = new Set<number>();
+    const refusedProbes = yield* Queue.unbounded<void>();
+    let nextPort = 41_773;
+    const layer = Layer.mergeAll(
+      NodeServices.layer,
+      NodeCrypto.layer,
+      Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request) =>
+          refused.has(Number(new URL(request.url).port))
+            ? Queue.offer(refusedProbes, undefined).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new HttpClientError.HttpClientError({
+                      reason: new HttpClientError.TransportError({ request }),
+                    }),
+                  ),
+                ),
+              )
+            : Effect.succeed(
+                HttpClientResponse.fromWeb(request, new Response("", { status: 200 })),
+              ),
+        ),
+      ),
+      Layer.succeed(
+        NetService.NetService,
+        NetService.NetService.of({
+          ...testNetService,
+          reserveLoopbackPort: () => Effect.sync(() => nextPort++),
+          hasListenerOnHost: (port) => Effect.sync(() => !refused.has(port)),
+        }),
+      ),
+      SshAuth.SshPasswordPrompt.disabledLayer,
+      SshTunnel.SshEnvironmentManager.layer({
+        resolveCliRunner: Effect.succeed(ARCHIVE),
+        ...(input.controlSocketDirectory === undefined
+          ? {}
+          : { controlSocketDirectory: input.controlSocketDirectory }),
+      }),
+    );
+    const connections = () =>
+      spawned.filter(
+        (args) =>
+          !args.includes("-G") &&
+          (args.includes("ControlMaster=yes") ||
+            !args.some((arg) => arg.startsWith("ControlPath=") && arg !== "ControlPath=none")),
+      ).length;
+    return { spawned, masters, refused, refusedProbes, layer, connections };
+  });
+
+  it.effect.each([
+    { mode: "plain connections", useControlMaster: false, connections: 3 },
+    { mode: "one control master", useControlMaster: true, connections: 1 },
+  ])("first connect opens $connections ssh connection(s) with $mode", (row) =>
+    Effect.gen(function* () {
+      const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-ssh-cm-"));
+      try {
+        const harness = yield* controlMasterHarness({
+          controlSocketDirectory: row.useControlMaster
+            ? NodePath.join(directory, "control")
+            : undefined,
+        });
+        yield* Effect.gen(function* () {
+          const manager = yield* SshTunnel.SshEnvironmentManager;
+          const target = { alias: "devbox", hostname: "devbox", username: null, port: null };
+          // Launch, tunnel forward, and pairing.
+          const result = yield* manager.ensureEnvironment(target, { issuePairingToken: true });
+          assert.equal(result.pairingToken, "PAIRED");
+          assert.equal(harness.connections(), row.connections);
+          if (!row.useControlMaster) return;
+
+          const [master] = harness.masters;
+          assert.isDefined(master);
+          assert.isTrue(NodeFS.existsSync(master!.controlPath));
+          assert.isTrue(harness.spawned.some((args) => args.includes("forward")));
+          // A dead tunnel's replacement gets its own master.
+          harness.refused.add(41_773);
+          const replacing = yield* Effect.forkChild(manager.ensureEnvironment(target));
+          yield* Queue.take(harness.refusedProbes);
+          yield* TestClock.adjust("10 seconds");
+          yield* Fiber.join(replacing);
+          assert.equal(harness.connections(), 2);
+          assert.equal(harness.masters.length, 2);
+          assert.notEqual(harness.masters[1]!.controlPath, master!.controlPath);
+          assert.isTrue(master!.killed);
+          assert.isFalse(NodeFS.existsSync(master!.controlPath));
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+        // Quitting stops every master and removes its socket.
+        assert.isTrue(harness.masters.every((master) => master.killed));
+        assert.deepEqual(
+          NodeFS.readdirSync(directory).flatMap((entry) =>
+            NodeFS.readdirSync(NodePath.join(directory, entry)),
+          ),
+          [],
+        );
+      } finally {
+        NodeFS.rmSync(directory, { recursive: true, force: true });
+      }
+    }),
+  );
+
+  it.effect("falls back to plain connections when ssh cannot create the control socket", () =>
+    Effect.gen(function* () {
+      const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-ssh-cm-"));
+      try {
+        const harness = yield* controlMasterHarness({
+          controlSocketDirectory: directory,
+          masterStderr: `unix_listener: cannot bind to path ${directory}/x: Address already in use`,
+        });
+        yield* Effect.gen(function* () {
+          const manager = yield* SshTunnel.SshEnvironmentManager;
+          const result = yield* manager.ensureEnvironment({
+            alias: "devbox",
+            hostname: "devbox",
+            username: null,
+            port: null,
+          });
+          assert.equal(result.httpBaseUrl, "http://127.0.0.1:41773/");
+          assert.isTrue(harness.spawned.some((args) => args.includes("ControlMaster=yes")));
+          const tunnel = harness.spawned.find((args) => args.includes("-L"));
+          assert.include(tunnel ?? [], "ControlPath=none");
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      } finally {
+        NodeFS.rmSync(directory, { recursive: true, force: true });
+      }
+    }),
+  );
+
   it("rejects archive versions that are not a single exact version segment", () => {
     for (const archiveVersion of [
       "../other",

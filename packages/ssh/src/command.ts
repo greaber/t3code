@@ -34,7 +34,19 @@ export interface SshCommandResult {
   readonly stderr: string;
 }
 
-export interface RunSshCommandOptions extends SshAuthOptions {
+export interface SshConnectionOptions extends SshAuthOptions {
+  /** An app-owned control master to run over instead of opening a new connection. */
+  readonly controlPath?: string | undefined;
+}
+
+/** Joins a live control master; ssh connects on its own when the master is gone. */
+function controlClientSshArgs(controlPath: string | undefined): string[] {
+  return controlPath === undefined
+    ? []
+    : ["-o", "ControlMaster=no", "-o", `ControlPath=${controlPath}`];
+}
+
+export interface RunSshCommandOptions extends SshConnectionOptions {
   readonly preHostArgs?: ReadonlyArray<string>;
   readonly remoteCommandArgs?: ReadonlyArray<string>;
   readonly stdin?: string;
@@ -208,6 +220,7 @@ const runSshCommandInScope = Effect.fn("ssh/command.runSshCommand.inScope")(func
     "ServerAliveInterval=15",
     "-o",
     "ServerAliveCountMax=3",
+    ...controlClientSshArgs(input.controlPath),
     ...(input.preHostArgs ?? []),
     "--",
     hostSpec,

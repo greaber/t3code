@@ -176,6 +176,14 @@ runner never stops a server, since agent turns may be running there; an update
 stops it and the next connect starts the client's version. Reconnection restores
 the forward before opening the application transport.
 
+Each new SSH connection costs several round trips, which is seconds on a slow
+link, so each tunnel owns one control master and runs its launch, port forward,
+and pairing over it. The master's socket gets a fresh name per tunnel, so a
+replacement for a slow tunnel never joins the master it may be replacing. ssh
+binds the socket at its path plus 17 characters, inside macOS's 104-byte limit,
+so a path that cannot fit, Windows (whose OpenSSH has no multiplexing), and a
+master that cannot create its socket all fall back to one connection per command.
+
 Remote servers can outlive several client releases. Clients must use advertised
 capabilities and handle their absence, rather than assume their own version
 describes the server. Process replacement belongs to the launcher's
