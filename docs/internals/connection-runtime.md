@@ -19,8 +19,10 @@ failures wait for a wakeup instead of spending attempts on unchanged conditions.
 Desktop-managed SSH environments use their own ladder: one client per host has
 no herd to spread, and the desktop bounds every SSH step and drops a dead link
 itself. An attempt that failed after 3 seconds or more usually waited out a
-stalled link that may already be back, so the next starts at once. A faster
-failure (offline, refused) waits 1 second, doubling to 20. The renderer
+stalled link that may already be back, so the next starts at once, up to three
+times in a row; after that, and after a faster failure (offline, refused), it
+waits 1 second, doubling to 20, until a connection, an explicit retry,
+foregrounding, or a network change resets it. The renderer
 classifies SSH failures that only the user can fix, such as a refused key, an
 unanswered password prompt, or a changed host key, as authentication failures,
 so neither ladder prompts again on its own.

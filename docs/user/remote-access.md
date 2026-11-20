@@ -238,8 +238,8 @@ connection has clearly closed, for example after your computer sleeps, it is
 replaced right away.
 
 When an SSH environment drops, T3 Code tries again as soon as an attempt times
-out, and waits at most 20 seconds between attempts that fail quickly, for
-example while your computer is offline. It stops trying when the host needs you:
+out, up to three times in a row, and otherwise waits at most 20 seconds between
+attempts, for example while your computer is offline. It stops trying when the host needs you:
 a password or security key prompt you did not answer, a refused key, or a
 changed host key. Choose **Reconnect** once you have dealt with it.
 

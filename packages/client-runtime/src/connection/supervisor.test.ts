@@ -625,6 +625,30 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
+  it.effect("backs off after three immediate retries of a persistent slow SSH failure", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: () => Effect.sleep("5 seconds").pipe(Effect.andThen(Effect.fail(transient()))),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(SSH_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* TestClock.adjust("20 seconds");
+      const backoff = yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
+      expect(backoff.attempt).toBe(4);
+      expect(backoff.retryAt! - (yield* Clock.currentTimeMillis)).toBe(1_000);
+      expect(yield* Ref.get(harness.prepareCount)).toBe(4);
+
+      yield* TestClock.adjust("6 seconds");
+      const next = yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "backoff" && state.attempt === 5,
+      );
+      expect(next.retryAt! - (yield* Clock.currentTimeMillis)).toBe(2_000);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
   it.effect("backs off an SSH environment that fails fast from 1 to at most 20 seconds", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({ prepare: () => Effect.fail(transient()) });

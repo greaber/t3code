@@ -44,8 +44,10 @@ const RETRY_BASE_DELAY_MS = 1_000;
 const RETRY_MAX_DELAY_MS = 300_000;
 // An SSH attempt that fails this slowly usually waited out a stalled link that
 // may already be back, and the desktop bounds each SSH step, so the next
-// attempt starts at once. Faster failures (offline, refused) back off briefly.
+// attempt starts at once, up to a few times in a row so a persistent slow
+// failure cannot loop. Faster failures (offline, refused) back off briefly.
 const SSH_SLOW_FAILURE_MS = 3_000;
+const SSH_MAX_IMMEDIATE_RETRIES = 3;
 const SSH_RETRY_MAX_DELAY_MS = 20_000;
 const SESSION_LOSS_RETRY_DELAY_MS = 250;
 // A cold server with a large database can take longer than 15 seconds to
@@ -1143,9 +1145,11 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     let latestFailure: ConnectionAttemptError | null = null;
     let pendingRetry = Option.none<PendingRetryTrace>();
     let sshFastFailures = 0;
+    let sshSlowFailures = 0;
     const resetRetryLadder = () => {
       failureCount = 0;
       sshFastFailures = 0;
+      sshSlowFailures = 0;
       pendingRetry = Option.none();
     };
     let replacing = false;
@@ -1190,6 +1194,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         // a socket the OS killed while the app was suspended: its replacement
         // reports no failure until it fails itself.
         latestFailure = null;
+        sshFastFailures = 0;
+        sshSlowFailures = 0;
         if (outcome.stable) {
           resetRetryLadder();
         }
@@ -1237,7 +1243,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       const firstLoss = outcome.established && failureCount === 0;
       failureCount += 1;
       if (usesSsh) {
-        sshFastFailures = attemptMs >= SSH_SLOW_FAILURE_MS ? 0 : sshFastFailures + 1;
+        sshSlowFailures = attemptMs >= SSH_SLOW_FAILURE_MS ? sshSlowFailures + 1 : 0;
+        const immediate = sshSlowFailures > 0 && sshSlowFailures <= SSH_MAX_IMMEDIATE_RETRIES;
+        sshFastFailures = immediate ? 0 : sshFastFailures + 1;
       }
       const delayMs = usesSsh
         ? sshFastFailures === 0
