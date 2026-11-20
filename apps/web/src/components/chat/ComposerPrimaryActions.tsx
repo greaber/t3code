@@ -234,7 +234,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
     : isEditingQueuedMessage
       ? "Update queued message"
       : reconnectingEnvironmentLabel !== null
-        ? `Send when ${reconnectingEnvironmentLabel} reconnects`
+        ? `Send when ${reconnectingEnvironmentLabel} connects`
         : compactsBeforeSend
           ? "Compact and send"
           : isQueuing

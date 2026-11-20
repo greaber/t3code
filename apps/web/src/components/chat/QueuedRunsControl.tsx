@@ -450,7 +450,7 @@ function OutboxMessageActions(props: {
         ? "Sending"
         : props.environmentConnected
           ? "Waiting to send"
-          : `Sends when ${props.environmentLabel} reconnects`;
+          : `Sends when ${props.environmentLabel} connects`;
   return (
     <>
       <span className="flex items-center gap-1 px-1">
