@@ -237,6 +237,11 @@ neither answers, it keeps the first connection and tries again. When the old
 connection has clearly closed, for example after your computer sleeps, it is
 replaced right away.
 
+T3 Code sets up the host and its port forward over a single SSH connection, so
+a slow link pays for the SSH handshake once. It keeps its own shared connection
+and does not use `ControlMaster` settings from your SSH config. On Windows each
+step opens its own connection.
+
 Each desktop app keeps one session on the host for its SSH connection and reuses
 it when it reconnects. Revoke sessions you no longer use in **Settings →
 Sharing & access** on the host, or on a headless host with `t3 auth session list` and

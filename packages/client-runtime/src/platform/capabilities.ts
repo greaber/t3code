@@ -3,6 +3,7 @@ import {
   type DesktopSshEnvironmentBootstrap,
   type DesktopSshEnvironmentTarget,
   EnvironmentId,
+  type ExecutionEnvironmentDescriptor,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -13,6 +14,8 @@ import type { ConnectionAttemptError } from "../connection/model.ts";
 export interface PreparedSshEnvironment {
   readonly bootstrap: DesktopSshEnvironmentBootstrap;
   readonly bearerToken: string;
+  /** What the forwarded endpoint just answered, so authorizing need not ask again. */
+  readonly descriptor?: ExecutionEnvironmentDescriptor;
 }
 
 export interface ProvisionedSshEnvironment extends PreparedSshEnvironment {

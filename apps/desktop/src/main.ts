@@ -124,6 +124,7 @@ const layerDesktopSshEnvironment = Layer.unwrap(
     const environment = yield* DesktopEnvironment.DesktopEnvironment;
     return DesktopSshEnvironment.layer({
       resolveCliRunner: Effect.succeed(resolveDesktopSshCliRunner(environment)),
+      controlSocketDirectory: environment.path.join(environment.stateDir, "ssh-control"),
     });
   }),
 );

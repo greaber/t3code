@@ -378,6 +378,43 @@ describe("RemoteEnvironmentAuthorization", () => {
     }),
   );
 
+  it.effect("authorizes over SSH without reading the descriptor the desktop just read", () =>
+    Effect.gen(function* () {
+      const descriptor = {
+        ...DESCRIPTOR,
+        orchestrationProtocolVersion: ORCHESTRATION_PROTOCOL_VERSION,
+      } as ExecutionEnvironmentDescriptor;
+      const harness = yield* makeHarness({
+        responses: [
+          websocketTicket("forwarded"),
+          Response.json(descriptor),
+          websocketTicket("checked"),
+        ],
+      });
+      yield* Effect.gen(function* () {
+        const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+        const authorize = (verifiedDescriptor: ExecutionEnvironmentDescriptor) =>
+          remote.authorizeBearer({
+            expectedEnvironmentId: ENVIRONMENT_ID,
+            httpBaseUrl: "http://127.0.0.1:41773",
+            wsBaseUrl: "ws://127.0.0.1:41773",
+            bearerToken: "bearer-token",
+            connectionMethod: "ssh",
+            verifiedDescriptor,
+          });
+        yield* authorize(descriptor);
+        // One for another environment proves nothing, so it reads again.
+        yield* authorize({ ...descriptor, environmentId: "other" as never });
+      }).pipe(Effect.provide(harness.layer));
+
+      expect(harness.fetch.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+        "/api/auth/websocket-ticket/rpc",
+        "/.well-known/t3/environment",
+        "/api/auth/websocket-ticket/rpc",
+      ]);
+    }),
+  );
+
   it.effect("blocks a warm direct bearer prepare when the environment changes identity", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({

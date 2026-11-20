@@ -258,6 +258,7 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
       wsBaseUrl: prepared.bootstrap.wsBaseUrl,
       bearerToken: prepared.bearerToken,
       connectionMethod: "ssh",
+      ...(prepared.descriptor === undefined ? {} : { verifiedDescriptor: prepared.descriptor }),
     });
     return {
       ...authorized,

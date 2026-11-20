@@ -176,6 +176,22 @@ runner never stops a server, since agent turns may be running there; an update
 stops it and the next connect starts the client's version. Reconnection restores
 the forward before opening the application transport.
 
+Each new SSH connection costs several round trips, which is seconds on a slow
+link, so each tunnel is one supervised control master (`ssh -M -N`), and its
+launch, port forward (`-O forward`), pairing, and disconnect run over it. Explicit
+options override the user's `ControlMaster` and `ControlPersist`, which otherwise
+hand the forward to another master and exit (upstream #3533), and the commands
+over it set `ProxyCommand=false`, so a dead master fails them instead of letting
+them connect on their own. The master's socket gets a fresh name per tunnel, so a
+replacement for a slow tunnel never joins the master it may be replacing, and
+sockets a crashed app left behind get `-O exit` before the first new one. ssh
+binds the socket at its path plus 17 characters, inside macOS's 104-byte limit,
+so a path that cannot fit, Windows (whose OpenSSH has no multiplexing), and a
+master that cannot create its socket all fall back to one connection per command.
+The supervisor's 15-second setup budget stops while an SSH route is being
+prepared: desktop main bounds every SSH step and request in it, and a launch over
+a slow link or a first install takes far longer than 15 seconds.
+
 Remote servers can outlive several client releases. Clients must use advertised
 capabilities and handle their absence, rather than assume their own version
 describes the server. Process replacement belongs to the launcher's

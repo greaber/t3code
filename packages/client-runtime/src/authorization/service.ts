@@ -68,6 +68,11 @@ export class RemoteEnvironmentAuthorization extends Context.Service<
       readonly wsBaseUrl: string;
       readonly bearerToken: string;
       readonly connectionMethod: ClientConnectionMethod;
+      /**
+       * A descriptor this client read from the same endpoint moment ago over a route it
+       * controls, such as its own SSH forward, which saves reading it again.
+       */
+      readonly verifiedDescriptor?: ExecutionEnvironmentDescriptor;
     }) => Effect.Effect<AuthorizedRemoteEnvironment, ConnectionAttemptError>;
     readonly authorizeDpop: (input: {
       readonly expectedEnvironmentId: EnvironmentId;
@@ -189,8 +194,12 @@ export const make = Effect.gen(function* () {
       readonly wsBaseUrl: string;
       readonly bearerToken: string;
       readonly connectionMethod: ClientConnectionMethod;
+      readonly verifiedDescriptor?: ExecutionEnvironmentDescriptor;
     }) {
-      const descriptor = yield* verifyDirectEndpoint(input);
+      const descriptor =
+        input.verifiedDescriptor?.environmentId === input.expectedEnvironmentId
+          ? input.verifiedDescriptor
+          : yield* verifyDirectEndpoint(input);
       const socketUrl = yield* resolveRemoteWebSocketConnectionUrl({
         wsBaseUrl: input.wsBaseUrl,
         httpBaseUrl: input.httpBaseUrl,
