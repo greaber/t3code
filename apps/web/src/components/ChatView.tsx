@@ -188,7 +188,9 @@ import { shortcutLabelForCommand } from "../keybindings";
 import { cn } from "~/lib/utils";
 import { isModelPickerOpen } from "../modelPickerVisibility";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
-import { toastManager } from "./ui/toast";
+import { stackedThreadToast, toastManager } from "./ui/toast";
+import { threadOutboxStore } from "../threadOutboxDelivery";
+import type { OutboxMessage } from "../threadOutbox.logic";
 import { projectScriptIdFromCommand } from "~/projectScripts";
 import { newMessageId } from "~/lib/utils";
 import { isInSideChatPane, type SideChatParentPanel } from "~/lib/sideChatPane";
@@ -1159,6 +1161,11 @@ export default function ChatView(props: ChatViewProps) {
   const activeEnvironmentUnavailable =
     activeEnvironment !== null && activeEnvironment.connection.phase !== "connected";
   const activeEnvironmentUnavailableLabel = activeEnvironment?.label ?? null;
+  const activeEnvironmentPhase = activeEnvironment?.connection.phase;
+  const activeEnvironmentReconnecting =
+    activeEnvironmentPhase === "connecting" ||
+    activeEnvironmentPhase === "reconnecting" ||
+    activeEnvironmentPhase === "offline";
   const activeEnvironmentUnavailableState = (() => {
     if (!activeEnvironmentUnavailable || !activeEnvironmentUnavailableLabel || !activeEnvironment) {
       return null;
@@ -2888,6 +2895,7 @@ export default function ChatView(props: ChatViewProps) {
     isRevertingCheckpoint,
     threadDetailLoading,
     activeEnvironmentUnavailable,
+    activeEnvironmentReconnecting,
     isSendBusy,
     sendQueuesBehindSetup,
     isDraftHeroState,
@@ -2978,6 +2986,28 @@ export default function ChatView(props: ChatViewProps) {
       .some((id) => id !== "" && !previousIds.has(id));
     if (hasNewMessage && timelineLiveFollowEnabled) scrollToEnd(true);
   }, [routeThreadKey, pendingGuestMessageKey, timelineLiveFollowEnabled, scrollToEnd]);
+  const editOutboxMessage = (message: OutboxMessage) => {
+    const draftStore = useComposerDraftStore.getState();
+    if (composerDraftHasUserContent(draftStore.getComposerDraft(composerDraftTarget))) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "info",
+          title: "Finish your draft first",
+          description: "Send or clear the composer, then edit the waiting message.",
+        }),
+      );
+      return;
+    }
+    threadOutboxStore.getState().remove(message.messageId);
+    promptRef.current = message.draftText;
+    draftStore.setPrompt(composerDraftTarget, message.draftText);
+    composerRef.current?.resetCursorState({
+      cursor: message.draftText.length,
+      prompt: message.draftText,
+    });
+    scheduleComposerFocus();
+  };
+  const editOutboxMessageStable = useStableCallback(editOutboxMessage);
   const queuedRunsControl =
     isServerThread && activeThread ? (
       <>
@@ -3000,6 +3030,9 @@ export default function ChatView(props: ChatViewProps) {
           onCancelEdit={queuedRunEdit.cancelEdit}
           timestampFormat={timestampFormat}
           onOpenThread={onOpenRelatedThreadStable}
+          environmentLabel={activeEnvironment?.label ?? "the environment"}
+          environmentConnected={!activeEnvironmentUnavailable}
+          onEditOutboxMessage={editOutboxMessageStable}
         />
       </>
     ) : null;
@@ -3623,6 +3656,9 @@ export default function ChatView(props: ChatViewProps) {
                                     : undefined
                                 }
                                 environmentUnavailable={activeEnvironmentUnavailableState}
+                                environmentQueuesSends={
+                                  activeEnvironmentReconnecting && isServerThread
+                                }
                                 activePendingApproval={activePendingApproval}
                                 pendingApprovals={pendingApprovals}
                                 onHeldRequestIdsChange={onHeldRequestIdsChange}

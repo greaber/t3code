@@ -48,6 +48,7 @@ import {
   syncDocumentWindowControlsOverlayClass,
 } from "./lib/windowControlsOverlay";
 import { startProviderAuthDelivery } from "./providerAuthDelivery";
+import { startAppThreadOutboxDelivery } from "./threadOutboxDelivery";
 import { getRouter, type AppRouter } from "./router";
 import { appAtomRegistry } from "./rpc/atomRegistry";
 import { primaryServerConfigAtom } from "./state/server";
@@ -185,6 +186,7 @@ export function startAppServices(): AppRouter {
   startDocumentTitle();
   startHostEnvironmentLookup();
   startDraftUploadKeepAlive();
+  startAppThreadOutboxDelivery();
   startEnvironmentThemeRepaint();
   startBrowserChromeThemeSync(router);
   startDefaultThemeAdoption();

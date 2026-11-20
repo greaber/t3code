@@ -27,6 +27,8 @@ import * as DateTime from "effect/DateTime";
 import { useId, useImperativeHandle, useRef, useState, type ReactNode, type Ref } from "react";
 
 import { useAssetUrls } from "../../assets/assetUrls";
+import { threadOutboxMessages, type OutboxMessage } from "../../threadOutbox.logic";
+import { threadOutboxStore, useThreadOutbox } from "../../threadOutboxDelivery";
 import { threadEnvironment } from "../../state/threads";
 import { useQuietThreadShell, useThreadProjection } from "../../state/entities";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -92,6 +94,10 @@ export function QueuedRunsControl({
   readonly onCancelEdit: () => void;
   readonly timestampFormat: TimestampFormat;
   readonly onOpenThread: (threadId: ThreadId) => void;
+  /** Messages written while the environment was unreachable wait here until they send. */
+  readonly environmentLabel: string;
+  readonly environmentConnected: boolean;
+  readonly onEditOutboxMessage: (message: OutboxMessage) => void;
 }) {
   const projection = useThreadProjection(
     scopeThreadRef(props.environmentId, props.threadId),
@@ -124,6 +130,9 @@ export function QueuedRunsControl({
       return url && resource ? [[resource.attachmentId, url] as const] : [];
     }),
   );
+  const outboxMessages = useThreadOutbox((state) => state.messages);
+  const outboxBusy = useThreadOutbox((state) => state.busy);
+  const outboxQueued = threadOutboxMessages(outboxMessages, props.environmentId, props.threadId);
   const optimisticQueued = props.optimisticMessages.filter(
     (message) => message.inputIntent === "queued_turn" && !acknowledgedMessageIds.has(message.id),
   );
@@ -147,6 +156,7 @@ export function QueuedRunsControl({
           url: queuedImageUrlById.get(attachment.id) ?? null,
         })),
       pending: false,
+      outbox: null,
     })),
     ...optimisticQueued.map((message) => ({
       key: message.id,
@@ -166,6 +176,21 @@ export function QueuedRunsControl({
           url: attachment.previewUrl ?? null,
         })),
       pending: true,
+      outbox: null,
+    })),
+    ...outboxQueued.map((message) => ({
+      key: message.messageId,
+      message: undefined,
+      runId: null,
+      messageId: null,
+      freshContext: false,
+      serverIndex: null,
+      text: message.draftText,
+      editable: true,
+      attachments: [] as ReadonlyArray<ContractChatAttachment>,
+      thumbnails: [] as ReadonlyArray<QueuedRowThumbnail>,
+      pending: false,
+      outbox: message,
     })),
   ];
 
@@ -275,7 +300,16 @@ export function QueuedRunsControl({
                 timestampFormat={props.timestampFormat}
                 onOpenThread={props.onOpenThread}
               >
-                {canSendRun(item.freshContext) && !isEditing ? (
+                {item.outbox ? (
+                  <OutboxMessageActions
+                    message={item.outbox}
+                    busy={outboxBusy.includes(item.outbox.messageId)}
+                    environmentLabel={props.environmentLabel}
+                    environmentConnected={props.environmentConnected}
+                    onEdit={props.onEditOutboxMessage}
+                  />
+                ) : null}
+                {!item.outbox && canSendRun(item.freshContext) && !isEditing ? (
                   <>
                     <Tooltip>
                       <TooltipTrigger render={<span className="flex shrink-0" />}>
@@ -305,7 +339,7 @@ export function QueuedRunsControl({
                     Saving
                   </span>
                 ) : null}
-                {isEditing ? (
+                {item.outbox ? null : isEditing ? (
                   <>
                     <span className="px-1 text-foreground">Editing in the composer</span>
                     <Button
@@ -398,6 +432,71 @@ export function QueuedRunsControl({
         </div>
       ) : null}
     </section>
+  );
+}
+
+function OutboxMessageActions(props: {
+  readonly message: OutboxMessage;
+  readonly busy: boolean;
+  readonly environmentLabel: string;
+  readonly environmentConnected: boolean;
+  readonly onEdit: (message: OutboxMessage) => void;
+}) {
+  const { message, busy } = props;
+  const status =
+    message.failure !== null
+      ? `Not sent: ${message.failure}`
+      : busy
+        ? "Sending"
+        : props.environmentConnected
+          ? "Waiting to send"
+          : `Sends when ${props.environmentLabel} reconnects`;
+  return (
+    <>
+      <span className="flex items-center gap-1 px-1">
+        <Clock3Icon aria-hidden className="size-3" />
+        {status}
+      </span>
+      {message.failure !== null ? (
+        <Button
+          size="xs"
+          variant="ghost-muted"
+          onClick={() => threadOutboxStore.getState().retry(message.messageId)}
+        >
+          Retry
+        </Button>
+      ) : null}
+      <Tooltip>
+        <TooltipTrigger render={<span className="flex shrink-0" />}>
+          <Button
+            size="icon-xs"
+            variant="ghost-muted"
+            aria-label="Edit waiting message"
+            disabled={busy}
+            onClick={() => props.onEdit(message)}
+          >
+            <PencilIcon />
+          </Button>
+        </TooltipTrigger>
+        <TooltipPopup>Edit in the composer</TooltipPopup>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              size="icon-xs"
+              variant="ghost-muted"
+              aria-label="Remove waiting message"
+              disabled={busy}
+              onClick={() => threadOutboxStore.getState().remove(message.messageId)}
+            />
+          }
+        >
+          <XIcon />
+        </TooltipTrigger>
+        <TooltipPopup>Don't send</TooltipPopup>
+      </Tooltip>
+    </>
   );
 }
 

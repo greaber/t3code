@@ -44,6 +44,8 @@ interface ComposerPrimaryActionsProps {
   isSendBusy: boolean;
   sendDisabledReason: string | null;
   isEnvironmentUnavailable: boolean;
+  /** The environment label a message waits for while it reconnects. */
+  reconnectingEnvironmentLabel?: string | null;
   isPreparingWorktree: boolean;
   hasSendableContent: boolean;
   canResume?: boolean;
@@ -97,6 +99,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   isSendBusy,
   sendDisabledReason,
   isEnvironmentUnavailable,
+  reconnectingEnvironmentLabel = null,
   isPreparingWorktree,
   hasSendableContent,
   canResume = false,
@@ -230,13 +233,15 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
     ? "Resume thread"
     : isEditingQueuedMessage
       ? "Update queued message"
-      : compactsBeforeSend
-        ? "Compact and send"
-        : isQueuing
-          ? "Queue message"
-          : isRunning
-            ? "Steer message"
-            : "Submit message";
+      : reconnectingEnvironmentLabel !== null
+        ? `Send when ${reconnectingEnvironmentLabel} reconnects`
+        : compactsBeforeSend
+          ? "Compact and send"
+          : isQueuing
+            ? "Queue message"
+            : isRunning
+              ? "Steer message"
+              : "Submit message";
   const submitStatus = isEnvironmentUnavailable
     ? "Environment disconnected"
     : (sendDisabledReason ??
@@ -249,11 +254,13 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           : null));
   const submitTooltip =
     submitStatus ??
-    (compactsBeforeSend
-      ? `Summarize ${compactTokens} tokens of history, then send`
-      : isRunning && !isEditingQueuedMessage && canSteer
-        ? `Click to ${followUpBehavior}, ${isMacPlatform(navigator.platform) ? "⌘" : "Ctrl"}-click${alternateShortcutLabel ? ` or ${alternateShortcutLabel}` : ""} to ${alternateAction}`
-        : submitLabel);
+    (reconnectingEnvironmentLabel !== null
+      ? submitLabel
+      : compactsBeforeSend
+        ? `Summarize ${compactTokens} tokens of history, then send`
+        : isRunning && !isEditingQueuedMessage && canSteer
+          ? `Click to ${followUpBehavior}, ${isMacPlatform(navigator.platform) ? "⌘" : "Ctrl"}-click${alternateShortcutLabel ? ` or ${alternateShortcutLabel}` : ""} to ${alternateAction}`
+          : submitLabel);
 
   const sendButton = (
     <button

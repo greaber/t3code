@@ -96,12 +96,20 @@ other action for a single message. From a hardware keyboard, `Cmd+Return`
 (`Ctrl+Shift+Return`) when Return inserts a new line. The button only offers
 Steer when the running agent supports it.
 
-## Queue messages offline on mobile
+## Send while disconnected
 
-Mobile keeps local copies of draft attachments, so you can preview them and queue
-messages while disconnected. Uploads resume when you reconnect. Drafts and queued
-messages survive app restarts. Signing out of T3 Connect keeps that work on your
-device until you sign back into the same account.
+On web and desktop, a text message you send while its environment is reconnecting
+waits at the end of the thread, marked with the environment it is waiting for. It
+sends on its own once the environment connects, in the order you wrote it, and it
+survives reloading the app. Use the pencil to move it back into the composer, or
+the X to drop it. If the server refuses it, it stays there with the reason until you
+retry or remove it. Messages with attachments or added context still need a
+connection to send.
+
+Mobile also keeps local copies of draft attachments, so you can preview them and queue
+messages with attachments while disconnected. Uploads resume when you reconnect.
+Drafts and queued messages survive app restarts. Signing out of T3 Connect keeps that
+work on your device until you sign back into the same account.
 
 ## Custom models
 
