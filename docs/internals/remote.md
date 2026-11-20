@@ -183,6 +183,9 @@ replacement for a slow tunnel never joins the master it may be replacing. ssh
 binds the socket at its path plus 17 characters, inside macOS's 104-byte limit,
 so a path that cannot fit, Windows (whose OpenSSH has no multiplexing), and a
 master that cannot create its socket all fall back to one connection per command.
+The supervisor's 15-second setup budget stops while an SSH route is being
+prepared: desktop main bounds every SSH step and request in it, and a launch over
+a slow link or a first install takes far longer than 15 seconds.
 
 Remote servers can outlive several client releases. Clients must use advertised
 capabilities and handle their absence, rather than assume their own version

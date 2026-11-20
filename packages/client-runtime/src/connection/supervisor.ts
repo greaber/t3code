@@ -44,7 +44,9 @@ const RETRY_BASE_DELAY_MS = 1_000;
 const RETRY_MAX_DELAY_MS = 300_000;
 const SESSION_LOSS_RETRY_DELAY_MS = 250;
 // A cold server with a large database can take longer than 15 seconds to
-// answer, and that is not a reason to drop a working connection.
+// answer, and that is not a reason to drop a working connection. Preparing an
+// SSH route does not count: the desktop bounds each SSH step and HTTP request
+// itself, and a slow link or a cold remote install can take far longer.
 const CONNECTION_ESTABLISHMENT_TIMEOUT = "15 seconds";
 const establishmentTimeout = Duration.fromInputUnsafe(CONNECTION_ESTABLISHMENT_TIMEOUT);
 const synchronizationTimeout = Duration.fromInputUnsafe("75 seconds");
@@ -72,6 +74,14 @@ const SILENT_ROUTE_BACKOFF_MAX_MS = 1_800_000;
 // A better route that answered the check but then failed to connect is not
 // tried again for this long, so a flaky LAN cannot bounce the connection.
 const BETTER_ROUTE_COOLDOWN_MS = 300_000;
+
+/** What extends one attempt's setup deadline beyond its base budget. */
+interface EstablishmentBudget {
+  readonly synchronizedRoutes: number;
+  readonly exemptNanos: bigint;
+  /** When the SSH route now being prepared started, if one is. */
+  readonly sshPreparingSince: bigint | null;
+}
 
 interface SupervisorIntent {
   readonly desired: boolean;
@@ -470,13 +480,31 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     attempt: number,
     generation: number,
     lastFailure: ConnectionAttemptError | null,
-    synchronizedRoutes: Ref.Ref<number>,
+    budget: SubscriptionRef.SubscriptionRef<EstablishmentBudget>,
   ) {
     return yield* driver.connect(yield* attemptEntry, (progress) =>
-      (progress.stage === "synchronizing"
-        ? Ref.update(synchronizedRoutes, (count) => count + 1)
-        : Effect.void
-      ).pipe(Effect.andThen(reportProgress(attempt, generation, lastFailure, progress))),
+      Clock.monotonicTimeNanos.pipe(
+        Effect.flatMap((now) =>
+          SubscriptionRef.update(budget, (current) => {
+            const resumed =
+              current.sshPreparingSince === null
+                ? current
+                : {
+                    ...current,
+                    exemptNanos: current.exemptNanos + (now - current.sshPreparingSince),
+                    sshPreparingSince: null,
+                  };
+            if (progress.stage === "synchronizing") {
+              return { ...resumed, synchronizedRoutes: resumed.synchronizedRoutes + 1 };
+            }
+            return progress.stage === "preparing" &&
+              progress.route?.target._tag === "SshConnectionTarget"
+              ? { ...resumed, sshPreparingSince: now }
+              : resumed;
+          }),
+        ),
+        Effect.andThen(reportProgress(attempt, generation, lastFailure, progress)),
+      ),
     );
   });
 
@@ -557,17 +585,17 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     generation: number,
     lastFailure: ConnectionAttemptError | null,
     pendingRetry: Option.Option<PendingRetryTrace>,
-    synchronizedRoutes: Ref.Ref<number>,
+    budget: SubscriptionRef.SubscriptionRef<EstablishmentBudget>,
   ) {
     if (usesRelay) {
       return yield* traceRelayEstablishment(
-        establishConnection(attempt, generation, lastFailure, synchronizedRoutes),
+        establishConnection(attempt, generation, lastFailure, budget),
         attempt,
         generation,
         pendingRetry,
       );
     }
-    return yield* establishConnection(attempt, generation, lastFailure, synchronizedRoutes).pipe(
+    return yield* establishConnection(attempt, generation, lastFailure, budget).pipe(
       Effect.map((lease) => ({
         attemptSpan: Option.none<Tracer.Span>(),
         lease,
@@ -883,16 +911,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   ) {
     const switchingTo = yield* Ref.get(preferredRouteId);
     yield* SubscriptionRef.set(prepared, Option.none());
-    const synchronizedRoutes = yield* Ref.make(0);
+    const budget = yield* SubscriptionRef.make<EstablishmentBudget>({
+      synchronizedRoutes: 0,
+      exemptNanos: 0n,
+      sshPreparingSince: null,
+    });
     const establishment = yield* Effect.raceAllFirst([
       exitUnlessInterrupted(
-        establishTracedConnection(
-          attempt,
-          generation,
-          lastFailure,
-          pendingRetry,
-          synchronizedRoutes,
-        ),
+        establishTracedConnection(attempt, generation, lastFailure, pendingRetry, budget),
       ).pipe(
         Effect.map((exit): EstablishmentEvent => ({
           _tag: "Completed",
@@ -907,15 +933,26 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       ),
       // Each route may use the full setup time before the next is tried, and
       // each route that reaches synchronizing adds its own snapshot budget, so
-      // a route that fails late does not eat the next route's time.
+      // a route that fails late does not eat the next route's time. The clock
+      // stops while an SSH route is being prepared.
       Effect.gen(function* () {
         const routeCount = connectionRoutes(yield* Ref.get(currentEntry)).length;
         const startedAt = yield* Clock.monotonicTimeNanos;
         const setup = Duration.toNanosUnsafe(Duration.times(establishmentTimeout, routeCount));
         while (true) {
-          const synchronized = BigInt(yield* Ref.get(synchronizedRoutes));
+          const current = yield* SubscriptionRef.get(budget);
+          if (current.sshPreparingSince !== null) {
+            yield* SubscriptionRef.changes(budget).pipe(
+              Stream.filter((next) => next.sshPreparingSince === null),
+              Stream.runHead,
+            );
+            continue;
+          }
           const deadline =
-            startedAt + setup + synchronized * Duration.toNanosUnsafe(synchronizationTimeout);
+            startedAt +
+            setup +
+            current.exemptNanos +
+            BigInt(current.synchronizedRoutes) * Duration.toNanosUnsafe(synchronizationTimeout);
           const remaining = deadline - (yield* Clock.monotonicTimeNanos);
           if (remaining <= 0n) {
             return { _tag: "TimedOut" } as const satisfies EstablishmentEvent;

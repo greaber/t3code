@@ -32,6 +32,7 @@ import {
   ConnectionTransientError,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
+  SshConnectionTarget,
   type ConnectionAttemptError,
   type ConnectionTarget,
   type NetworkStatus,
@@ -64,6 +65,16 @@ const TARGET_ENTRY: ConnectionCatalogEntry = {
 
 const RELAY_ENTRY: ConnectionCatalogEntry = {
   target: RELAY_TARGET,
+  profile: Option.none(),
+  enabled: true,
+};
+
+const SSH_ENTRY: ConnectionCatalogEntry = {
+  target: new SshConnectionTarget({
+    environmentId: TARGET.environmentId,
+    label: TARGET.label,
+    connectionId: "ssh:devbox",
+  }),
   profile: Option.none(),
   enabled: true,
 };
@@ -191,10 +202,11 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     options?.checkRoute?.(route) ?? Effect.succeed<ConnectionDriver.RouteCheck>("unchecked");
 
   const connectRoute = Effect.fn("TestConnectionDriver.connectRoute")(function* (
-    target: ConnectionTarget,
+    route: ConnectionRoute,
     reportProgress: (progress: ConnectionDriver.ConnectionDriverProgress) => Effect.Effect<void>,
   ) {
-    const prepared = yield* prepare(target);
+    yield* reportProgress({ stage: "preparing", route });
+    const prepared = yield* prepare(route.target);
     yield* reportProgress({ stage: "opening", prepared });
 
     const attempt = yield* Ref.updateAndGet(sessionCount, (count) => count + 1);
@@ -233,7 +245,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
   ) {
     yield* reportProgress({ stage: "preparing" });
     return yield* ConnectionDriver.connectOverRoutes(entry, checkRoute, (route) =>
-      connectRoute(route.target, reportProgress),
+      connectRoute(route, reportProgress),
     );
   });
 
@@ -553,6 +565,40 @@ describe("EnvironmentSupervisor", () => {
       });
       expect(yield* Ref.get(harness.prepareCount)).toBe(1);
       expect(yield* Ref.get(harness.sessionCount)).toBe(0);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("does not count preparing an SSH route against the setup timeout", () =>
+    Effect.gen(function* () {
+      const prepareStarted = yield* Deferred.make<void>();
+      const tunnelReady = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        prepare: (_attempt, target) =>
+          Deferred.succeed(prepareStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(tunnelReady)),
+            Effect.as(preparedFor(target)),
+          ),
+        ready: () => Effect.never,
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(SSH_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      // A cold launch over a slow link outlasts the 15-second setup budget.
+      yield* Deferred.await(prepareStarted);
+      yield* TestClock.adjust("60 seconds");
+      yield* Deferred.succeed(tunnelReady, undefined);
+      const settled = yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "backoff" || state.stage === "synchronizing",
+      );
+      expect(settled).toMatchObject({ phase: "connecting", stage: "synchronizing", attempt: 1 });
+
+      // Once prepared, the session still has only its usual budget.
+      yield* TestClock.adjust("90 seconds");
+      const timedOut = yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
+      expect(timedOut).toMatchObject({ attempt: 1, lastFailure: { reason: "timeout" } });
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
