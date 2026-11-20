@@ -141,6 +141,7 @@ const net = require("node:net");
 const path = require("node:path");
 const version = path.basename(__dirname);
 const [command, ...args] = process.argv.slice(2);
+fs.appendFileSync(path.join(process.env.HOME, "t3-starts"), command + "\\n");
 const option = (name) => args[args.indexOf(name) + 1];
 if (command === "--version") {
   console.log(version);
@@ -523,61 +524,76 @@ describe("ssh tunnel scripts", () => {
           : { controlSocketDirectory: input.controlSocketDirectory }),
       }),
     );
+    // Commands over a master cannot connect on their own (ProxyCommand=false).
     const connections = () =>
-      spawned.filter(
-        (args) =>
-          !args.includes("-G") &&
-          (args.includes("ControlMaster=yes") ||
-            !args.some((arg) => arg.startsWith("ControlPath=") && arg !== "ControlPath=none")),
-      ).length;
+      spawned.filter((args) => !args.includes("-G") && !args.includes("ProxyCommand=false")).length;
     return { spawned, masters, refused, refusedProbes, layer, connections };
   });
 
   it.effect.each([
-    { mode: "plain connections", useControlMaster: false, connections: 3 },
+    { mode: "plain connections", useControlMaster: false, connections: 4 },
     { mode: "one control master", useControlMaster: true, connections: 1 },
-  ])("first connect opens $connections ssh connection(s) with $mode", (row) =>
+  ])("connect, pair, and disconnect open $connections ssh connection(s) with $mode", (row) =>
     Effect.gen(function* () {
       const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-ssh-cm-"));
+      const controlDirectory = NodePath.join(directory, "control");
+      // A socket left by a crashed app.
+      NodeFS.mkdirSync(controlDirectory);
+      const stale = NodePath.join(controlDirectory, "stale");
+      NodeFS.writeFileSync(stale, "");
       try {
         const harness = yield* controlMasterHarness({
-          controlSocketDirectory: row.useControlMaster
-            ? NodePath.join(directory, "control")
-            : undefined,
+          controlSocketDirectory: row.useControlMaster ? controlDirectory : undefined,
         });
         yield* Effect.gen(function* () {
           const manager = yield* SshTunnel.SshEnvironmentManager;
           const target = { alias: "devbox", hostname: "devbox", username: null, port: null };
-          // Launch, tunnel forward, and pairing.
+          // Launch, tunnel forward, and pairing, then stopping the server.
           const result = yield* manager.ensureEnvironment(target, { issuePairingToken: true });
           assert.equal(result.pairingToken, "PAIRED");
+          const [master] = harness.masters;
+          if (row.useControlMaster) assert.isFalse(master!.killed);
+          yield* manager.disconnectEnvironment(target);
           assert.equal(harness.connections(), row.connections);
           if (!row.useControlMaster) return;
 
-          const [master] = harness.masters;
-          assert.isDefined(master);
-          assert.isTrue(NodeFS.existsSync(master!.controlPath));
+          assert.isTrue(master!.killed);
+          assert.isFalse(NodeFS.existsSync(stale));
+          assert.isTrue(
+            harness.spawned.some(
+              (args) => args.includes("exit") && args.includes(`ControlPath=${stale}`),
+            ),
+          );
+          // Options from the user's ssh config (ControlMaster auto, ControlPersist)
+          // cannot hand the forward to another master or fork it into the background.
+          for (const args of harness.spawned.filter((entry) => !entry.includes("-G"))) {
+            const controlPath = args.find((arg) => arg.startsWith("ControlPath="));
+            assert.isDefined(controlPath);
+            if (args.includes("-N")) {
+              assert.includeMembers([...args], ["ControlMaster=yes", "ControlPersist=no"]);
+            } else {
+              assert.includeMembers([...args], ["ControlMaster=no", "ProxyCommand=false"]);
+            }
+          }
           assert.isTrue(harness.spawned.some((args) => args.includes("forward")));
+
           // A dead tunnel's replacement gets its own master.
-          harness.refused.add(41_773);
+          yield* manager.ensureEnvironment(target);
+          const live = harness.masters[1]!;
+          harness.refused.add(41_774);
           const replacing = yield* Effect.forkChild(manager.ensureEnvironment(target));
           yield* Queue.take(harness.refusedProbes);
           yield* TestClock.adjust("10 seconds");
           yield* Fiber.join(replacing);
-          assert.equal(harness.connections(), 2);
-          assert.equal(harness.masters.length, 2);
-          assert.notEqual(harness.masters[1]!.controlPath, master!.controlPath);
-          assert.isTrue(master!.killed);
-          assert.isFalse(NodeFS.existsSync(master!.controlPath));
+          assert.equal(harness.connections(), 3);
+          assert.equal(harness.masters.length, 3);
+          assert.notEqual(harness.masters[2]!.controlPath, live.controlPath);
+          assert.isTrue(live.killed);
+          assert.isFalse(NodeFS.existsSync(live.controlPath));
         }).pipe(Effect.provide(harness.layer), Effect.scoped);
         // Quitting stops every master and removes its socket.
         assert.isTrue(harness.masters.every((master) => master.killed));
-        assert.deepEqual(
-          NodeFS.readdirSync(directory).flatMap((entry) =>
-            NodeFS.readdirSync(NodePath.join(directory, entry)),
-          ),
-          [],
-        );
+        if (row.useControlMaster) assert.deepEqual(NodeFS.readdirSync(controlDirectory), []);
       } finally {
         NodeFS.rmSync(directory, { recursive: true, force: true });
       }
@@ -1257,6 +1273,7 @@ describe("ssh tunnel scripts", () => {
 
         // Another alias adopts the same server and still pairs with its version.
         yield* install("1.0.1");
+        const startsBefore = (yield* fs.readFileString(path.join(home, "t3-starts"))).length;
         const adopted = yield* SshTunnel.launchOrReuseRemoteServer(
           tailnet,
           undefined,
@@ -1264,6 +1281,11 @@ describe("ssh tunnel scripts", () => {
         );
         assert.equal(adopted.remotePort, first.remotePort);
         assert.equal(adopted.remoteServerKind, "external");
+        // Each t3 start costs about a second on a busy host; an installed runtime needs none to prepare.
+        assert.notInclude(
+          (yield* fs.readFileString(path.join(home, "t3-starts"))).slice(startsBefore),
+          "--version",
+        );
         const adoptedPairing = yield* SshTunnel.issueRemotePairingToken(
           tailnet,
           undefined,

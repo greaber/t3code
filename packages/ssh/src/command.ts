@@ -39,11 +39,14 @@ export interface SshConnectionOptions extends SshAuthOptions {
   readonly controlPath?: string | undefined;
 }
 
-/** Joins a live control master; ssh connects on its own when the master is gone. */
+/**
+ * Runs over a live control master only. ssh tries the master before connecting,
+ * so a failing ProxyCommand stops it opening a second connection when the master is gone.
+ */
 function controlClientSshArgs(controlPath: string | undefined): string[] {
   return controlPath === undefined
     ? []
-    : ["-o", "ControlMaster=no", "-o", `ControlPath=${controlPath}`];
+    : ["-o", "ControlMaster=no", "-o", `ControlPath=${controlPath}`, "-o", "ProxyCommand=false"];
 }
 
 export interface RunSshCommandOptions extends SshConnectionOptions {

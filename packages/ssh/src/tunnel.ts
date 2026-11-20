@@ -67,6 +67,13 @@ const SSH_TUNNEL_CONNECT_TIMEOUT_MS = REMOTE_LAUNCH_BASE_TIMEOUT_MS;
 const SSH_TUNNEL_FORWARD_PROBE_INTERVAL_MS = 100;
 // Control commands only talk to the local master.
 const SSH_CONTROL_COMMAND_TIMEOUT_MS = 10_000;
+// `ssh -O exit` needs a destination, though it only talks to the socket.
+const STALE_CONTROL_TARGET: DesktopSshEnvironmentTarget = {
+  alias: "t3-stale-control",
+  hostname: "t3-stale-control",
+  username: null,
+  port: null,
+};
 // ssh binds the control socket at its path plus ".XXXXXXXXXXXXXXXX" before renaming it,
 // and macOS allows 104 bytes for a socket path, including the terminating NUL.
 const SSH_CONTROL_PATH_MAX_BYTES = 103 - 17;
@@ -572,6 +579,10 @@ if [ -n "\${T3_LOCK:-}" ]; then
   rm -rf "$T3_LOCK"
   trap - EXIT
 fi
+# A launch only needs the runtime installed; starting t3 takes a second on a busy host.
+if [ "\${T3_RUNNER_PREPARE_ONLY:-}" = "1" ]; then
+  exit 0
+fi
 exec "$T3_RUNTIME_DIR/t3" "$@"
 `;
 
@@ -619,7 +630,7 @@ if [ "$T3_ARCHIVE_MODE" = "1" ]; then
   if [ "$(cat "$MANAGED_FILE" 2>/dev/null || true)" = "managed" ] && [ -x "$RUNNER_FILE" ] && [ -n "$RECORDED_PID" ] && kill -0 "$RECORDED_PID" 2>/dev/null; then
     RUNNER="$RUNNER_FILE"
   else
-    "$RUNNER_NEXT" --version >/dev/null
+    T3_RUNNER_PREPARE_ONLY=1 "$RUNNER_NEXT"
   fi
 elif ! ensure_remote_node_path; then
   printf 'Remote host is missing node on PATH. Install Node or configure a supported version manager for non-interactive shells.\\n' >&2
@@ -816,7 +827,7 @@ fi
 if [ -z "$REMOTE_PORT" ]; then
   if [ "$RUNNER" != "$RUNNER_NEXT" ]; then
     # The server this launch meant to reuse is gone, so start the new runner.
-    "$RUNNER_NEXT" --version >/dev/null
+    T3_RUNNER_PREPARE_ONLY=1 "$RUNNER_NEXT"
     RUNNER="$RUNNER_NEXT"
   fi
   REMOTE_PORT="$(pick_port)" || true
@@ -1152,7 +1163,7 @@ export const issueRemotePairingToken = Effect.fn("ssh/tunnel.issueRemotePairingT
 
 const stopRemoteServer = Effect.fn("ssh/tunnel.stopRemoteServer")(function* (
   target: DesktopSshEnvironmentTarget,
-  input?: SshAuth.SshAuthOptions,
+  input?: SshConnectionOptions,
 ): Effect.fn.Return<
   void,
   SshCommandError | SshInvalidTargetError,
@@ -1167,6 +1178,7 @@ const stopRemoteServer = Effect.fn("ssh/tunnel.stopRemoteServer")(function* (
     remoteCommandArgs: ["sh", "-s"],
     stdin: buildRemoteStopScript(stateKey),
     timeoutMs: (REMOTE_STOP_WAIT_SECONDS + 30) * 1000,
+    controlPath: input?.controlPath,
     ...(input?.authSecret === undefined ? {} : { authSecret: input.authSecret }),
     ...(input?.batchMode === undefined ? {} : { batchMode: input.batchMode }),
     ...(input?.interactiveAuth === undefined ? {} : { interactiveAuth: input.interactiveAuth }),
@@ -1846,11 +1858,43 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
     });
   });
 
+  // A master left by a crashed app would hold its connection open indefinitely.
+  // Runs once, before this manager creates a socket of its own.
+  const sweepStaleControlMasters = yield* Effect.cached(
+    Effect.gen(function* () {
+      const directory = options.controlSocketDirectory;
+      if (directory === undefined || (yield* HostProcess.Platform) === "win32") return;
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const names = yield* fs.readDirectory(directory).pipe(Effect.orElseSucceed(() => []));
+      yield* Effect.forEach(
+        names,
+        (name) => {
+          const controlPath = path.join(directory, name);
+          return runSshCommand(STALE_CONTROL_TARGET, {
+            preHostArgs: ["-F", "/dev/null", "-O", "exit"],
+            controlPath,
+            batchMode: "yes",
+            timeoutMs: SSH_CONTROL_COMMAND_TIMEOUT_MS,
+          }).pipe(
+            Effect.ignore,
+            Effect.andThen(fs.remove(controlPath, { force: true }).pipe(Effect.ignore)),
+          );
+        },
+        { concurrency: "unbounded", discard: true },
+      );
+      if (names.length > 0) {
+        yield* Effect.logInfo("ssh.controlMaster.staleSwept", { count: names.length });
+      }
+    }).pipe(Effect.withSpan("ssh/tunnel.sweepStaleControlMasters")),
+  );
+
   // Each entry gets a fresh socket name, so a replacement tunnel never joins the
   // master of the tunnel it may replace.
   const makeControlPath = Effect.fn("ssh/tunnel.makeControlPath")(function* (key: string) {
     const directory = options.controlSocketDirectory;
     if (directory === undefined || (yield* HostProcess.Platform) === "win32") return null;
+    yield* sweepStaleControlMasters;
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const digestService = yield* Digest.Digest;
@@ -2248,17 +2292,32 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
           key,
           hasTunnel: entry !== null,
         });
-        if (entry !== null) {
-          yield* Effect.gen(function* () {
-            tunnels.delete(key);
-            yield* closeTunnelEntry(entry);
-          }).pipe(Effect.uninterruptible);
-        }
-        yield* runWithSshAuth({
+        // Stop over the tunnel's live master rather than a new connection, then close it.
+        const controlPath =
+          entry !== null &&
+          entry.controlPath !== null &&
+          (yield* entry.process.isRunning.pipe(Effect.orElseSucceed(() => false)))
+            ? entry.controlPath
+            : undefined;
+        const stop = runWithSshAuth({
           key,
           target: resolvedTarget,
-          operation: (authOptions) => stopRemoteServer(resolvedTarget, authOptions),
+          operation: (authOptions) =>
+            stopRemoteServer(resolvedTarget, { ...authOptions, controlPath }),
         });
+        const closeEntry =
+          entry === null
+            ? Effect.void
+            : Effect.gen(function* () {
+                tunnels.delete(key);
+                yield* closeTunnelEntry(entry);
+              }).pipe(Effect.uninterruptible);
+        if (controlPath === undefined) {
+          yield* closeEntry;
+          yield* stop;
+        } else {
+          yield* stop.pipe(Effect.ensuring(closeEntry));
+        }
         yield* Effect.logInfo("ssh.environment.disconnect.succeeded", {
           ...sshTargetLogFields(resolvedTarget),
           key,
