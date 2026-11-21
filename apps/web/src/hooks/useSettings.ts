@@ -49,7 +49,12 @@ import { AsyncResult, Atom } from "effect/reactivity";
 import { toastManager } from "~/components/ui/toast";
 import { isHostedStaticApp } from "~/hostedPairing";
 import { environmentCatalog } from "~/connection/catalog";
-import { primaryServerSettingsAtom, serverEnvironment } from "~/state/server";
+import { isElectron } from "~/env";
+import {
+  primaryServerConfigAtom,
+  primaryServerSettingsAtom,
+  serverEnvironment,
+} from "~/state/server";
 import { useEnvironments, usePrimaryEnvironment } from "~/state/environments";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useTheme } from "./useTheme";
@@ -342,8 +347,72 @@ const modelPreferencesMigrationTargetsAtom = Atom.make((get) =>
   }),
 ).pipe(Atom.withLabel("web-model-preferences-migration-targets"));
 
+function desktopVisibilitySeed(client: ClientSettings, primary: ServerSettings) {
+  const hidden: Record<string, string[]> = {};
+  for (const [id, preferences] of Object.entries(
+    resolveModelPreferences(primary, client).providerModelPreferences,
+  )) {
+    const driver = primary.providerInstances?.[id as ProviderInstanceId]?.driver ?? id;
+    hidden[driver] = [...new Set([...(hidden[driver] ?? []), ...preferences.hiddenModels])];
+  }
+  return hidden;
+}
+
+export async function updateDesktopModelVisibility(
+  driver: string,
+  affected: readonly string[],
+  next: readonly string[],
+) {
+  try {
+    await persistClientSettingsUpdate((client) => {
+      const primary = appAtomRegistry.get(primaryServerConfigAtom);
+      if (client.desktopHiddenModels === undefined && !primary)
+        throw new Error("Local settings not ready");
+      const all = client.desktopHiddenModels ?? desktopVisibilitySeed(client, primary!.settings);
+      const hidden = new Set(all[driver]);
+      const requested = new Set(next);
+      for (const slug of affected) {
+        if (requested.has(slug)) hidden.add(slug);
+        else hidden.delete(slug);
+      }
+      return { ...client, desktopHiddenModels: { ...all, [driver]: [...hidden] } };
+    });
+  } catch {
+    toastManager.add({
+      type: "error",
+      title: "Model visibility not saved",
+      description: "Could not save desktop settings. Try again.",
+    });
+  }
+}
+
+let seedingDesktopVisibility = false;
 function migrateModelPreferences(): void {
   if (clientSettingsHydrationStatus !== "ready") return;
+  if (
+    isElectron &&
+    clientSettingsSnapshot.desktopHiddenModels === undefined &&
+    !seedingDesktopVisibility
+  ) {
+    const primary = appAtomRegistry.get(primaryServerConfigAtom);
+    if (primary) {
+      seedingDesktopVisibility = true;
+      void persistClientSettingsUpdate((current) =>
+        current.desktopHiddenModels !== undefined
+          ? current
+          : {
+              ...current,
+              desktopHiddenModels: desktopVisibilitySeed(current, primary.settings),
+            },
+      )
+        .catch(() =>
+          toastManager.add({ type: "error", title: "Could not import desktop model visibility" }),
+        )
+        .finally(() => {
+          seedingDesktopVisibility = false;
+        });
+    }
+  }
   for (const { environmentId, generation, settings } of appAtomRegistry.get(
     modelPreferencesMigrationTargetsAtom,
   )) {
@@ -363,6 +432,9 @@ function migrateModelPreferences(): void {
 /** Moves this client's legacy model preferences onto each server, once per connection. */
 export function startModelPreferencesMigration(): () => void {
   const unsubscribes = [
+    ...(isElectron
+      ? [appAtomRegistry.subscribe(primaryServerConfigAtom, migrateModelPreferences)]
+      : []),
     appAtomRegistry.subscribe(modelPreferencesMigrationTargetsAtom, migrateModelPreferences),
     subscribeClientSettings(migrateModelPreferences),
     subscribeClientSettingsHydration(migrateModelPreferences),

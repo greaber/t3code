@@ -8,6 +8,7 @@ import {
 import { isReasoningControl } from "@t3tools/client-runtime/model-traits";
 import { type CustomModelDefinition, normalizeCustomModelSlug } from "@t3tools/shared/model";
 
+import { isElectron } from "~/env";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { cn } from "../../lib/utils";
 import { sortModelsForProviderInstance } from "../../modelOrdering";
@@ -233,7 +234,7 @@ export function ProviderModelsSection({
   };
 
   const setHidden = (slug: string, hidden: boolean) => {
-    if (!canWritePreferences || hidden === hiddenModelSet.has(slug)) return;
+    if ((!isElectron && !canWritePreferences) || hidden === hiddenModelSet.has(slug)) return;
     onHiddenModelsChange(
       hidden ? [...hiddenModels, slug] : hiddenModels.filter((model) => model !== slug),
       [slug],
@@ -618,7 +619,7 @@ function ProviderModelRow({
           <Switch
             size="sm"
             checked={!isHidden}
-            disabled={!canWritePreferences || model.isCustom}
+            disabled={(!isElectron && !canWritePreferences) || model.isCustom}
             onCheckedChange={(checked) => onSetHidden(model.slug, !checked)}
             aria-label={`Show ${model.name} in the model picker`}
           />

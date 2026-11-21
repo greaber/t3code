@@ -369,6 +369,31 @@ describe("instance-scoped model selection", () => {
     ).toBe("claude-sonnet-4-6");
   });
 
+  it("uses desktop visibility for the same provider across environments, including an empty list", () => {
+    const entry = deriveProviderInstanceEntries([
+      provider({
+        instanceId: "remote-work",
+        provider: ProviderDriverKind.make("claudeAgent"),
+        models: ["opus", "sonnet"],
+      }),
+    ])[0]!;
+    const settings = {
+      ...settingsWithProviderInstances(),
+      providerModelPreferences: {
+        [entry.instanceId]: { hiddenModels: ["sonnet"], modelOrder: ["sonnet", "opus"] },
+      },
+    };
+    for (const [hidden, expected] of [
+      [["opus"], ["sonnet"]],
+      [[], ["sonnet", "opus"]],
+    ] as const) {
+      const desktop = { ...settings, desktopHiddenModels: { claudeAgent: hidden } };
+      expect(getAppModelOptionsForInstance(desktop, entry).map((model) => model.slug)).toEqual(
+        expected,
+      );
+    }
+  });
+
   it("falls back instead of resolving a custom slug against the wrong instance", () => {
     const providers = [
       provider({

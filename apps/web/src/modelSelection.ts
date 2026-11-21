@@ -111,16 +111,19 @@ function toAppModelOption(
   return option;
 }
 
-function readInstanceModelPreferences(
+export function readInstanceModelPreferences(
   settings: UnifiedSettings,
   instanceId: ProviderInstanceId,
-): { readonly hiddenModels: ReadonlyArray<string>; readonly modelOrder: ReadonlyArray<string> } {
-  return (
-    settings.providerModelPreferences?.[instanceId] ?? {
-      hiddenModels: [],
-      modelOrder: [],
-    }
-  );
+  driver: ProviderDriverKind,
+) {
+  const preferences = settings.providerModelPreferences?.[instanceId];
+  return {
+    hiddenModels:
+      settings.desktopHiddenModels === undefined
+        ? (preferences?.hiddenModels ?? [])
+        : (settings.desktopHiddenModels[driver] ?? []),
+    modelOrder: preferences?.modelOrder ?? [],
+  };
 }
 
 function applyInstanceModelPreferences(
@@ -195,7 +198,7 @@ function getAppModelOptions(
     });
   }
 
-  const preferences = readInstanceModelPreferences(settings, defaultInstanceId);
+  const preferences = readInstanceModelPreferences(settings, defaultInstanceId, provider);
   return appendUnavailableDynamicModelSelection(
     applyInstanceModelPreferences(options, preferences),
     rawModels,
@@ -236,7 +239,7 @@ export function getAppModelOptionsForInstance(
     });
   }
 
-  const preferences = readInstanceModelPreferences(settings, entry.instanceId);
+  const preferences = readInstanceModelPreferences(settings, entry.instanceId, entry.driverKind);
   return appendUnavailableDynamicModelSelection(
     applyInstanceModelPreferences(options, preferences),
     entry.models,
@@ -285,7 +288,11 @@ export function resolveAppModelSelectionForInstance(
     (entry.driverKind === "opencode" || entry.driverKind === "antigravity")
   ) {
     const unavailableSelection = normalizeCustomModelSlug(selectedModel);
-    const hiddenModels = readInstanceModelPreferences(settings, entry.instanceId).hiddenModels;
+    const hiddenModels = readInstanceModelPreferences(
+      settings,
+      entry.instanceId,
+      entry.driverKind,
+    ).hiddenModels;
     if (
       unavailableSelection &&
       !hiddenModels.includes(unavailableSelection) &&

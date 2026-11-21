@@ -1,3 +1,4 @@
+import { isElectron } from "~/env";
 import { Spinner } from "~/components/ui/spinner";
 
 import {
@@ -1398,8 +1399,9 @@ export function ProviderInstanceCard({
         <SettingsSection title="Models">
           <div className="px-3 py-3 sm:px-4">
             <p className="mb-3 text-xs text-muted-foreground">
-              Model preferences and custom models are saved on the selected environment and shared
-              across connected devices.
+              {isElectron
+                ? "Hiding a model hides it in this desktop app across all environments. Favorites, order, and custom models stay on the selected environment."
+                : "Model preferences and custom models are saved on the selected environment and shared across connected devices."}
             </p>
             <ProviderModelsSection
               canManageCustomModels={!readOnly}

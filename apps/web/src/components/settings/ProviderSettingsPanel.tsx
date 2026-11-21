@@ -51,7 +51,9 @@ import { useStableCallback } from "../../hooks/useStableCallback";
 import { ensureLocalApi } from "../../localApi";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { cn } from "../../lib/utils";
-import { resolveAppModelSelectionState } from "../../modelSelection";
+import { isElectron } from "~/env";
+import { updateDesktopModelVisibility } from "../../hooks/useSettings";
+import { readInstanceModelPreferences, resolveAppModelSelectionState } from "../../modelSelection";
 import {
   useEnvironments,
   usePrimaryEnvironmentId,
@@ -964,7 +966,7 @@ export function EnvironmentProviderSettings({
               )
             : false
         }
-        modelPreferences={settings.providerModelPreferences?.[row.instanceId]}
+        modelPreferences={readInstanceModelPreferences(settings, row.instanceId, row.driver)}
         favorites={favorites}
         actions={actions}
       />
@@ -1402,6 +1404,10 @@ function ProviderInstanceRow({
       favoriteModels={favoriteModels}
       modelOrder={modelOrder}
       onHiddenModelsChange={(next, affectedModels) => {
+        if (isElectron) {
+          void updateDesktopModelVisibility(driver, affectedModels, next);
+          return;
+        }
         const hidden = new Set(next);
         void actions.updateModelPreferences({
           setModelsHidden: affectedModels.map((model) => ({
