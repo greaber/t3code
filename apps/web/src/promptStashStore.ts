@@ -33,24 +33,19 @@ type PersistedPromptStashState = typeof PersistedPromptStashState.Type;
 const decodePersistedPromptStashState = Schema.decodeUnknownSync(PersistedPromptStashState);
 
 // Encoders cannot survive reload; clear orphaned counts so entries remain restorable.
-function clearOrphanedPendingImages(
-  entries: ReadonlyArray<PromptStashEntry>,
-): ReadonlyArray<PromptStashEntry> {
-  return entries.map((entry) => {
-    if (!entry.pendingImageCount) return entry;
-    const lostCount = entry.pendingImageCount;
-    return {
-      ...entry,
-      pendingImageCount: 0,
-      unreadableImageNames: [
-        ...(entry.unreadableImageNames ?? []),
-        ...Array.from(
-          { length: lostCount },
-          (_, index) => `image ${index + 1} (not saved before reload)`,
-        ),
-      ],
-    };
-  });
+function clearOrphanedPendingImages(entry: PromptStashEntry): PromptStashEntry {
+  if (!entry.pendingImageCount) return entry;
+  return {
+    ...entry,
+    pendingImageCount: 0,
+    unreadableImageNames: [
+      ...(entry.unreadableImageNames ?? []),
+      ...Array.from(
+        { length: entry.pendingImageCount },
+        (_, index) => `image ${index + 1} (not saved before reload)`,
+      ),
+    ],
+  };
 }
 
 /**
@@ -113,11 +108,13 @@ interface PersistResult {
   /** Only a quota error means storage is full; other failures say nothing about space. */
   readonly storageFull: boolean;
 }
+const unpersistedFinalizedEntryIds = new Set<string>();
 
 // Clear the composer only after a durable write; debounce cannot confirm durability.
 function persistSerialized(serialized: string): PersistResult {
   try {
     baseStashStorage.setItem(PROMPT_STASH_STORAGE_KEY, serialized);
+    unpersistedFinalizedEntryIds.clear();
     return { written: true, durable: storageIsDurable, storageFull: false };
   } catch (error) {
     console.error("[PROMPT-STASH] Could not persist stash.", error);
@@ -129,17 +126,47 @@ function persistEntries(entries: ReadonlyArray<PromptStashEntry>): PersistResult
   return persistSerialized(serializeEntries(entries));
 }
 
-function readPersistedEntries(): ReadonlyArray<PromptStashEntry> | null {
+function readStoredEntries(): ReadonlyArray<PromptStashEntry> | null {
   try {
     const raw = baseStashStorage.getItem(PROMPT_STASH_STORAGE_KEY);
     if (typeof raw !== "string" || raw.length === 0) return null;
     const parsed: unknown = JSON.parse(raw);
     const state = (parsed as { state?: unknown } | null)?.state;
     if (!state) return null;
-    return clearOrphanedPendingImages(decodePersistedPromptStashState(state).entries);
+    return decodePersistedPromptStashState(state).entries;
   } catch {
     return null;
   }
+}
+
+function readPersistedEntries(): ReadonlyArray<PromptStashEntry> | null {
+  return readStoredEntries()?.map(clearOrphanedPendingImages) ?? null;
+}
+
+/**
+ * Starts each write from storage so other tabs' stashes, takes and finalized images survive.
+ * Local encoding and failed finalize writes retain ownership while the stored entry exists.
+ */
+function latestEntries(memory: ReadonlyArray<PromptStashEntry>): ReadonlyArray<PromptStashEntry> {
+  const stored = readStoredEntries();
+  if (!stored) return memory;
+  const storedIds = new Set(stored.map((entry) => entry.id));
+  for (const id of unpersistedFinalizedEntryIds) {
+    if (!storedIds.has(id)) unpersistedFinalizedEntryIds.delete(id);
+  }
+  const memoryById = new Map(memory.map((entry) => [entry.id, entry]));
+  return stored.map((entry) => {
+    const local = memoryById.get(entry.id);
+    if (
+      local &&
+      (local.pendingImageCount ||
+        entry.pendingImageCount ||
+        unpersistedFinalizedEntryIds.has(entry.id))
+    ) {
+      return local;
+    }
+    return clearOrphanedPendingImages(entry);
+  });
 }
 
 interface PromptStashStoreState {
@@ -170,7 +197,7 @@ interface PromptStashStoreState {
 export const usePromptStashStore = create<PromptStashStoreState>()((set, get) => ({
   entries: [],
   stashEntry: (entry) => {
-    const nextEntries = [entry, ...get().entries];
+    const nextEntries = [entry, ...latestEntries(get().entries)];
     const { written, durable, storageFull } = persistEntries(nextEntries);
     // A failed write keeps the existing stash and the intact composer; nothing is evicted.
     if (!written) {
@@ -180,16 +207,17 @@ export const usePromptStashStore = create<PromptStashStoreState>()((set, get) =>
     return { written: true, durable, storageFull: false };
   },
   takeEntry: (entryId) => {
-    const entries = get().entries;
+    const entries = latestEntries(get().entries);
     const entry = entries.find((candidate) => candidate.id === entryId) ?? null;
     if (!entry) return { entry: null, durable: true };
     const nextEntries = entries.filter((candidate) => candidate.id !== entryId);
     const { durable } = persistEntries(nextEntries);
+    unpersistedFinalizedEntryIds.delete(entryId);
     set(() => ({ entries: nextEntries }));
     return { entry, durable };
   },
   finalizeEntryImages: (entryId, images) => {
-    const entries = get().entries;
+    const entries = latestEntries(get().entries);
     const index = entries.findIndex((candidate) => candidate.id === entryId);
     const existing = index === -1 ? undefined : entries[index];
     if (!existing) return { attached: false, durable: true, storageDroppedImageNames: [] };
@@ -217,6 +245,7 @@ export const usePromptStashStore = create<PromptStashStoreState>()((set, get) =>
           : persistSerialized(serialized);
       },
     );
+    if (!result.written) unpersistedFinalizedEntryIds.add(entryId);
     set(() => ({ entries: withImages(kept, droppedNames) }));
     return { attached: true, durable: result.durable, storageDroppedImageNames: droppedNames };
   },

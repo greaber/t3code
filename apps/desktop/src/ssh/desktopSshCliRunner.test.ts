@@ -9,11 +9,14 @@ describe("packaged desktop SSH bootstrap", () => {
     ["0.1.9-nightly.20261120.1", "0.1.9-nightly.20261120.1"],
   ])("uses the published SSH helper for %s", (appVersion, archiveVersion) => {
     expect(
-      resolveDesktopSshCliRunner({
-        appVersion,
-        isDevelopment: false,
-        devRemoteT3ServerEntryPath: Option.none(),
-      }),
+      resolveDesktopSshCliRunner(
+        {
+          appVersion,
+          isDevelopment: false,
+          devRemoteT3ServerEntryPath: Option.none(),
+        },
+        {},
+      ),
     ).toEqual({ archiveVersion });
   });
 });

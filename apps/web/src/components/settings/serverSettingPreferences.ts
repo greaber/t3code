@@ -1,3 +1,5 @@
+import { msg } from "gt-react";
+import { m } from "~/i18n/messages";
 import {
   type EnvironmentId,
   globalIdleCompaction,
@@ -218,17 +220,19 @@ function differenceReason(
   differing: readonly ServerSettingPreferenceKey[],
 ): string {
   if (differing.some((key) => isPreferenceLocked(target.managedPolicy, key))) {
-    return "managed there";
+    return m(msg("managed there"));
   }
-  if (!target.canWrite) return "no permission to change settings";
+  if (!target.canWrite) return m(msg("no permission to change settings"));
   if (
     differing.includes("idleCompaction") &&
     preferences.idleCompaction === "off" &&
     !readsIdleCompactionModes(target.settings)
   ) {
-    return "can't store Never, update T3 Code there";
+    return m(msg("can't store Never, update T3 Code there"));
   }
-  return target.failure === undefined ? "not applied yet" : `not saved: ${target.failure}`;
+  return target.failure === undefined
+    ? m(msg("not applied yet"))
+    : m(msg("not saved: {reason}", { reason: target.failure }));
 }
 
 /** Connected environments whose value for any of `keys` differs from the preference, and why. */

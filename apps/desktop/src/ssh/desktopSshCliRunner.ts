@@ -1,3 +1,5 @@
+import { publishedServerVersion } from "@t3tools/client-runtime/connection";
+import { CLI_RELEASE_BASE_URL_ENV } from "@t3tools/shared/cliRelease";
 import type { RemoteT3RunnerOptions } from "@t3tools/ssh/tunnel";
 import * as Option from "effect/Option";
 import serverPackageJson from "../../../server/package.json" with { type: "json" };
@@ -8,6 +10,7 @@ export function resolveDesktopSshCliRunner(
     DesktopEnvironment["Service"],
     "appVersion" | "isDevelopment" | "devRemoteT3ServerEntryPath"
   >,
+  env: NodeJS.ProcessEnv,
 ): RemoteT3RunnerOptions {
   const devRemoteEntryPath = Option.getOrUndefined(environment.devRemoteT3ServerEntryPath);
   if (environment.isDevelopment && devRemoteEntryPath !== undefined) {
@@ -16,11 +19,9 @@ export function resolveDesktopSshCliRunner(
       nodeEngineRange: serverPackageJson.engines.node,
     };
   }
-  // Picker revisions only ship the Mac app, not new remote CLI archives.
+  const releaseBaseUrl = env[CLI_RELEASE_BASE_URL_ENV]?.trim();
   return {
-    archiveVersion: environment.appVersion.replace(
-      /^(\d+\.\d+\.\d+-grant\.\d+)\.picker\.\d+$/,
-      "$1",
-    ),
+    ...(releaseBaseUrl ? { releaseBaseUrl } : {}),
+    archiveVersion: publishedServerVersion(environment.appVersion),
   };
 }

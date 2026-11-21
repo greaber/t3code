@@ -11,6 +11,7 @@ import { DEFAULT_MAX_TERMINAL_BUFFER_BYTES } from "@t3tools/contracts";
 import {
   appendNewerOutput,
   appendOutput,
+  clearOutput,
   EMPTY_TERMINAL_OUTPUT_STATE,
   prependOutput,
   resetOutput,
@@ -23,6 +24,7 @@ export {
   canLoadOlderTerminalOutput,
   INITIAL_TERMINAL_OUTPUT_CURSOR,
   readTerminalOutputUpdate,
+  terminalOutputReplay,
   terminalOutputText,
   type TerminalOutputCursor,
   type TerminalOutputState,
@@ -127,6 +129,7 @@ function terminalBufferStateFromSnapshot(
         ? undefined
         : {
             offset: snapshot.historyOffset,
+            sequenceState: snapshot.historySequenceState ?? 0,
             end: snapshot.historyEnd,
             older: snapshot.olderHistory ?? false,
           },
@@ -135,7 +138,7 @@ function terminalBufferStateFromSnapshot(
     ),
     grid: nextGrid(current.grid, snapshot),
     status: snapshot.status,
-    error: null,
+    error: snapshot.error ?? null,
     updatedAt: snapshot.updatedAt,
     version: current.version + 1,
     lifecycleVersion: current.lifecycleVersion,
@@ -239,7 +242,7 @@ export function applyTerminalAttachStreamEvent(
     case "cleared":
       return {
         ...current,
-        output: resetOutput(current.output, "", maxBufferBytes),
+        output: clearOutput(current.output, maxBufferBytes),
         error: null,
         version: current.version + 1,
       };

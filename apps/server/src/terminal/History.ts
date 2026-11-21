@@ -1,3 +1,9 @@
+import {
+  TERMINAL_SEQUENCE_GROUND,
+  terminalSequenceEnd,
+  terminalSequenceStateAfter,
+} from "@t3tools/contracts";
+
 // Offsets count UTF-8 bytes appended over a history's life, so they keep naming the same
 // text as output is trimmed, and minus `fileStart` they are positions in its file. Memory
 // holds the newest text; for older, "spilled" text only sizes stay, and the file has it.
@@ -15,6 +21,7 @@ interface Chunk {
 }
 
 interface Segment {
+  readonly sequenceState?: number;
   bytes: number;
   lineBreaks: number;
 }
@@ -68,6 +75,7 @@ export class BoundedTerminalHistory {
   private generation = 0;
   // Reading the old string's tail on each append can force chunk concatenation.
   private lastCodeUnit: number | undefined;
+  private memoryState = TERMINAL_SEQUENCE_GROUND;
   private cachedValue: string | null = "";
   persisted: PersistedHistoryFile | null = null;
 
@@ -87,6 +95,7 @@ export class BoundedTerminalHistory {
     start: number,
     segments: ReadonlyArray<Segment>,
     tail: string,
+    tailState = TERMINAL_SEQUENCE_GROUND,
   ): BoundedTerminalHistory {
     const history = new BoundedTerminalHistory(maxLines, "", maxBytes);
     history.end = start;
@@ -97,6 +106,7 @@ export class BoundedTerminalHistory {
       history.spilledLines += segment.lineBreaks;
       history.end += segment.bytes;
     }
+    history.memoryState = tailState;
     history.trim();
     history.append(tail);
     return history;
@@ -207,6 +217,7 @@ export class BoundedTerminalHistory {
 
   private discardChunk(): void {
     const first = this.chunks[this.start]!;
+    this.memoryState = terminalSequenceStateAfter(this.memoryState, first.data);
     this.byteLength -= first.byteLength;
     this.lineBreaks -= first.lineBreaks;
     this.chunks[this.start++] = undefined;
@@ -219,6 +230,7 @@ export class BoundedTerminalHistory {
       this.discardChunk();
       return;
     }
+    this.memoryState = terminalSequenceStateAfter(this.memoryState, first.data, 0, offset);
     first.data = first.data.slice(offset);
     first.byteLength -= byteLength;
     first.lineBreaks -= lineBreaks;
@@ -258,6 +270,12 @@ export class BoundedTerminalHistory {
       (this.linesOver() > 0 || this.spilledBytes + this.byteLength > this.maxBytes)
     ) {
       this.discardSegment();
+      while (
+        this.spilledBytes > 0 &&
+        (this.spilled[this.spilledStart]?.sequenceState ?? TERMINAL_SEQUENCE_GROUND) !==
+          TERMINAL_SEQUENCE_GROUND
+      )
+        this.discardSegment();
     }
 
     let linesToDrop = this.linesOver();
@@ -298,6 +316,16 @@ export class BoundedTerminalHistory {
       }
       this.trimChunk(offset, bytes, lineBreaks);
     }
+    while (
+      this.spilledBytes === 0 &&
+      this.memoryState !== TERMINAL_SEQUENCE_GROUND &&
+      this.start < this.chunks.length
+    ) {
+      const chunk = this.chunks[this.start]!;
+      const offset = terminalSequenceEnd(this.memoryState, chunk.data);
+      const cut = chunk.data.slice(0, offset);
+      this.trimChunk(offset, Buffer.byteLength(cut), countLineBreaks(cut));
+    }
     this.compactChunks();
   }
 
@@ -333,7 +361,11 @@ export class BoundedTerminalHistory {
         last.bytes += first.byteLength;
         last.lineBreaks += first.lineBreaks;
       } else {
-        this.spilled.push({ bytes: first.byteLength, lineBreaks: first.lineBreaks });
+        this.spilled.push({
+          bytes: first.byteLength,
+          lineBreaks: first.lineBreaks,
+          sequenceState: this.memoryState,
+        });
       }
       this.spilledBytes += first.byteLength;
       this.spilledLines += first.lineBreaks;
@@ -357,6 +389,7 @@ export class BoundedTerminalHistory {
 
   clear(): void {
     this.clearRetained();
+    this.memoryState = TERMINAL_SEQUENCE_GROUND;
     this.generation += 1;
   }
 
@@ -368,6 +401,37 @@ export class BoundedTerminalHistory {
       .map((chunk) => chunk!.data)
       .join("");
     return this.cachedValue;
+  }
+
+  /** The nearest indexed parser state at or before a history read. */
+  sequenceCheckpoint(offset: number) {
+    let at = this.startOffset;
+    if (offset < this.memoryStart) {
+      for (let index = this.spilledStart; index < this.spilled.length; index++) {
+        const segment = this.spilled[index]!;
+        if (offset < at + segment.bytes)
+          return { at, state: segment.sequenceState ?? TERMINAL_SEQUENCE_GROUND };
+        at += segment.bytes;
+      }
+    }
+    return { at: this.memoryStart, state: this.memoryState };
+  }
+
+  memorySequenceState(offset: number) {
+    let state = this.memoryState;
+    let start = this.memoryStart;
+    for (let index = this.start; start < offset && index < this.chunks.length; index++) {
+      const chunk = this.chunks[index]!;
+      const end = start + chunk.byteLength;
+      state = terminalSequenceStateAfter(
+        state,
+        chunk.data,
+        0,
+        end <= offset ? chunk.data.length : utf16IndexAtByte(chunk.data, offset - start),
+      );
+      start = end;
+    }
+    return state;
   }
 
   /** The text from `from` to `to`, which must both lie in memory. */
@@ -425,6 +489,7 @@ export class BoundedTerminalHistory {
 
 /** A page of output: its text, where it starts and ends, and whether more lies either side. */
 export interface HistoryPage {
+  readonly sequenceState?: number;
   readonly data: string;
   readonly offset: number;
   readonly end: number;

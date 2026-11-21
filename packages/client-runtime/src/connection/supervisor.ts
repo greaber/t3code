@@ -1,3 +1,5 @@
+import { msg } from "gt-i18n";
+import { translatableDetail } from "../errors/translatable.ts";
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -23,6 +25,7 @@ import {
   type ConnectionTarget,
   ConnectionTransientError,
   type NetworkStatus,
+  NO_REFUSED_ROUTES,
   type PreparedConnection,
   type SupervisorConnectionState,
 } from "./model.ts";
@@ -50,6 +53,10 @@ const SSH_SLOW_FAILURE_MS = 3_000;
 const SSH_MAX_IMMEDIATE_RETRIES = 3;
 const SSH_RETRY_MAX_DELAY_MS = 20_000;
 const SESSION_LOSS_RETRY_DELAY_MS = 250;
+// Someone is approving this device on the host; check back soon rather than climbing the ladder.
+const APPROVAL_PENDING_RETRY_DELAY_MS = 4_000;
+// A request lives 10 minutes; past that nobody is approving, so a forgotten device backs off.
+const APPROVAL_PENDING_FAST_RETRIES = 150;
 // A cold server with a large database can take longer than 15 seconds to
 // answer, and that is not a reason to drop a working connection. Preparing an
 // SSH route does not count: the desktop bounds each SSH step and HTTP request
@@ -112,7 +119,19 @@ interface PendingRetryTrace {
 
 type ConnectedLease = ConnectionDriver.EnvironmentConnectionLease & {
   readonly activeRoute: ConnectionRoute | undefined;
+  readonly generation: number;
 };
+
+function mergeRefusedRoutes(
+  known: ReadonlyArray<string>,
+  refused: ReadonlyArray<string>,
+  keep: (routeId: string) => boolean,
+): ReadonlyArray<string> {
+  const next = [...new Set([...known, ...refused])].filter(keep);
+  return next.length === known.length && next.every((id, index) => id === known[index])
+    ? known
+    : next;
+}
 
 interface TracedAttemptFailure {
   readonly error: ConnectionAttemptError;
@@ -146,16 +165,6 @@ type EstablishmentEvent =
     }
   | { readonly _tag: "Interrupted"; readonly resetRetry: boolean }
   | { readonly _tag: "TimedOut" };
-
-function exitUnlessInterrupted<A, E, R>(
-  effect: Effect.Effect<A, E, R>,
-): Effect.Effect<Exit.Exit<A, E>, never, R> {
-  return Effect.matchCauseEffect(effect, {
-    onFailure: (cause) =>
-      Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.succeed(Exit.failCause(cause)),
-    onSuccess: (value) => Effect.succeed(Exit.succeed(value)),
-  });
-}
 
 export interface EnvironmentSupervisorOptions {
   readonly initiallyDesired?: boolean;
@@ -206,6 +215,7 @@ function availableState(intent: SupervisorIntent, generation: number): Superviso
     generation,
     lastFailure: null,
     retryAt: null,
+    refusedRouteIds: NO_REFUSED_ROUTES,
   };
 }
 
@@ -224,6 +234,7 @@ function offlineState(
     generation,
     lastFailure,
     retryAt: null,
+    refusedRouteIds: NO_REFUSED_ROUTES,
   };
 }
 
@@ -243,38 +254,31 @@ function connectingState(
     generation,
     lastFailure,
     retryAt: null,
+    refusedRouteIds: NO_REFUSED_ROUTES,
   };
 }
 
-function failureFromExit<A>(
+function failureFromCause(
   target: ConnectionTarget,
-  exit: Exit.Exit<A, TracedAttemptFailure>,
+  cause: Cause.Cause<TracedAttemptFailure>,
   established: boolean,
   stable: boolean,
-): AttemptOutcome {
-  if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) {
-    return { _tag: "Interrupted", established, stable, resetRetry: false };
-  }
-  const typedFailure = exit.cause.reasons.find(Cause.isFailReason);
-  if (typedFailure) {
-    return {
-      _tag: "Failure",
-      established,
-      stable,
-      failure: typedFailure.error,
-    };
-  }
+) {
   return {
     _tag: "Failure",
     established,
     stable,
-    failure: {
-      error: new ConnectionTransientError({
-        reason: "transport",
-        detail: `${target.label} connection failed unexpectedly.`,
-      }),
-      attemptSpan: Option.none(),
-    },
+    failure: cause.reasons.find(Cause.isFailReason)?.error ?? unexpectedFailure(target),
+  } satisfies AttemptOutcome;
+}
+
+function unexpectedFailure(target: ConnectionTarget): TracedAttemptFailure {
+  return {
+    error: new ConnectionTransientError({
+      reason: "transport",
+      ...translatableDetail(msg("{host} connection failed unexpectedly.", { host: target.label })),
+    }),
+    attemptSpan: Option.none(),
   };
 }
 
@@ -309,9 +313,12 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   const usesSsh = connectionRoutes(entry).some(
     (route) => route.target._tag === "SshConnectionTarget",
   );
-  const setupTimeoutDetail = `${target.label} did not respond during connection setup.${
-    usesRelay ? ` ${NETWORK_BLOCKING_HINT}` : ""
-  }`;
+  const setupTimeout = msg("{host} did not respond during connection setup.", {
+    host: target.label,
+  });
+  const setupTimeoutDetail = usesRelay
+    ? translatableDetail(setupTimeout, NETWORK_BLOCKING_HINT)
+    : translatableDetail(setupTimeout);
   yield* annotateTarget(target);
 
   const connectivity = yield* Connectivity.Connectivity;
@@ -345,6 +352,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   const currentRoutes = Ref.get(currentEntry).pipe(Effect.map(connectionRoutes));
   const preferredRouteId = yield* Ref.make(Option.none<string>());
   const routeCooldowns = yield* Ref.make<ReadonlyMap<string, bigint>>(new Map());
+  // Outlives sessions so a reconnect shows a refusal seen earlier; a route leaves once it connects.
+  const refusedRoutes = yield* Ref.make(NO_REFUSED_ROUTES);
   // The generation keeps a check that started before a reset from recording
   // its stale failures after it.
   const silentRoutes = yield* Ref.make({
@@ -434,10 +443,25 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       }
       return { generation: previous.generation, routes };
     });
-    const index = results.indexOf("ready");
-    if (index === -1) return;
     const live = yield* SubscriptionRef.get(session);
     if (Option.isNone(live) || live.value !== lease.session) return;
+    const refused = better
+      .filter((_route, position) => results[position] === "refused")
+      .map((route) => connectionRouteId(route.target));
+    if (refused.length > 0) {
+      const known = yield* Ref.updateAndGet(refusedRoutes, (current) =>
+        mergeRefusedRoutes(current, refused, () => true),
+      );
+      yield* SubscriptionRef.updateSome(state, (current) =>
+        current.phase === "connected" &&
+        current.generation === lease.generation &&
+        current.refusedRouteIds !== known
+          ? Option.some({ ...current, refusedRouteIds: known })
+          : Option.none(),
+      );
+    }
+    const index = results.indexOf("ready");
+    if (index === -1) return;
     yield* signal({
       _tag: "BetterRouteAvailable",
       routeId: connectionRouteId(better[index]!.target),
@@ -476,9 +500,27 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     }),
   );
 
+  const logUnexpectedFailure = (
+    failed: "attempt" | "release" | "loop",
+    cause: Cause.Cause<TracedAttemptFailure>,
+  ) => {
+    const died = cause.reasons.find(Cause.isDieReason);
+    if (!died && cause.reasons.some(Cause.isFailReason)) return Effect.void;
+    return Effect.logError(
+      `Connection ${failed} failed with an unexpected ${died ? "defect" : "interruption"}.`,
+    ).pipe(
+      Effect.annotateLogs({
+        "environment.id": target.environmentId,
+        "environment.label": target.label,
+        "cause.reason_count": cause.reasons.length,
+        ...(died ? safeErrorLogAttributes(died.defect) : {}),
+      }),
+    );
+  };
+
   const reportProgress = Effect.fn("EnvironmentSupervisor.reportProgress")(function* (
     attempt: number,
-    generation: number,
+    nextGeneration: number,
     lastFailure: ConnectionAttemptError | null,
     progress: ConnectionDriver.ConnectionDriverProgress,
   ) {
@@ -486,13 +528,13 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       yield* SubscriptionRef.set(prepared, Option.some(progress.prepared));
     }
     yield* setState(
-      connectingState(yield* Ref.get(intent), generation, attempt, lastFailure, progress.stage),
+      connectingState(yield* Ref.get(intent), nextGeneration, attempt, lastFailure, progress.stage),
     );
   });
 
   const establishConnection = Effect.fnUntraced(function* (
     attempt: number,
-    generation: number,
+    nextGeneration: number,
     lastFailure: ConnectionAttemptError | null,
     budget: SubscriptionRef.SubscriptionRef<EstablishmentBudget>,
   ) {
@@ -517,7 +559,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
               : resumed;
           }),
         ),
-        Effect.andThen(reportProgress(attempt, generation, lastFailure, progress)),
+        Effect.andThen(reportProgress(attempt, nextGeneration, lastFailure, progress)),
       ),
     );
   });
@@ -557,7 +599,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       Scope.Scope
     >,
     attempt: number,
-    generation: number,
+    nextGeneration: number,
     pendingRetry: Option.Option<PendingRetryTrace>,
   ) => {
     // The span must end with the ConnectionAttemptError itself: the exporter
@@ -566,10 +608,11 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     let attemptSpan = Option.none<Tracer.Span>();
     const traced = Effect.gen(function* () {
       attemptSpan = Option.some(yield* Effect.currentSpan.pipe(Effect.orDie));
-      yield* annotateTarget(target);
       yield* Effect.annotateCurrentSpan({
+        "environment.id": target.environmentId,
+        "environment.target.kind": target._tag,
         "connection.attempt": attempt,
-        "connection.generation": generation,
+        "connection.generation": nextGeneration,
         "connection.retry.failure_count": Option.match(pendingRetry, {
           onNone: () => 0,
           onSome: (retry) => retry.failureCount,
@@ -596,20 +639,20 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
   const establishTracedConnection = Effect.fnUntraced(function* (
     attempt: number,
-    generation: number,
+    nextGeneration: number,
     lastFailure: ConnectionAttemptError | null,
     pendingRetry: Option.Option<PendingRetryTrace>,
     budget: SubscriptionRef.SubscriptionRef<EstablishmentBudget>,
   ) {
     if (usesRelay) {
       return yield* traceRelayEstablishment(
-        establishConnection(attempt, generation, lastFailure, budget),
+        establishConnection(attempt, nextGeneration, lastFailure, budget),
         attempt,
-        generation,
+        nextGeneration,
         pendingRetry,
       );
     }
-    return yield* establishConnection(attempt, generation, lastFailure, budget).pipe(
+    return yield* establishConnection(attempt, nextGeneration, lastFailure, budget).pipe(
       Effect.map((lease) => ({
         attemptSpan: Option.none<Tracer.Span>(),
         lease,
@@ -621,7 +664,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     );
   });
 
-  const waitForEstablishmentInterrupt = Effect.fnUntraced(function* () {
+  const waitForEstablishmentInterrupt = Effect.fnUntraced(function* (ignoreOffline: boolean) {
     // A primary attempt keeps running through an offline report, so the
     // network returning restarts it in case it stalled meanwhile.
     let deviceOffline = (yield* connectivity.status) === "offline";
@@ -629,11 +672,17 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       const next = yield* Queue.take(signals);
       switch (next._tag) {
         case "DisconnectRequested":
-        case "RetryRequested":
           return false;
+        case "RetryRequested":
+          // Once the loop has taken this retry's flag, the running attempt is
+          // the one the retry asked for.
+          if (yield* Ref.get(resetRetryState)) {
+            return false;
+          }
+          break;
         case "NetworkChanged":
           if (target._tag !== "PrimaryConnectionTarget") {
-            if (next.network === "offline") {
+            if (next.network === "offline" && !ignoreOffline) {
               return false;
             }
           } else if (next.network === "offline") {
@@ -733,6 +782,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     }
   };
 
+  const isForegroundProbe = (next: SupervisorSignal) =>
+    next._tag === "Wakeup" && next.reason === "application-active";
+
   // Ends "silent" when the host answers a fresh request while the socket
   // delivers nothing, as when iOS kills a suspended socket without a close
   // event, and "alive" once the socket delivers a frame. A slow or
@@ -814,7 +866,11 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         continue;
       }
       yield* Ref.set(probeUnanswered, true);
-      const probe = yield* Effect.forkChild(lease.session.probe);
+      let probe = yield* Effect.forkChild(lease.session.probe);
+      // A busy server can miss one foreground probe while the socket is still
+      // healthy, so the first miss asks again and only the follow-up's miss
+      // replaces the session.
+      let toleratesMiss = isForegroundProbe(next);
       let silentSocket: Fiber.Fiber<"silent" | "alive"> | undefined;
       // A signal during a running check, such as a network change that kills
       // the socket, needs a fresh check only if the running one sees a frame.
@@ -827,7 +883,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       // The web and desktop foreground probe allows a busy host 15 seconds,
       // and a busy host can answer a fresh request before a queued probe.
       const armSilentSocketCheck = Effect.fnUntraced(function* (signal: SupervisorSignal) {
-        if (signal._tag === "Wakeup" && signal.reason === "application-active") return;
+        if (isForegroundProbe(signal)) return;
         if (silentSocket !== undefined) {
           recheck = true;
           return;
@@ -879,13 +935,24 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           return true;
         }
         if (probeEvent._tag === "TimedOut") {
+          if (toleratesMiss) {
+            toleratesMiss = false;
+            yield* Fiber.interrupt(probe);
+            probe = yield* Effect.forkChild(lease.session.probe);
+            deadline = (yield* Clock.monotonicTimeNanos) + Duration.toNanosUnsafe(probeTimeout);
+            continue;
+          }
           yield* stopProbe;
           // A long suspension leaves the socket suspect even when the network
           // reports offline, so it is replaced like a silent one.
           if (longResume) return true;
           return yield* new ConnectionTransientError({
             reason: "timeout",
-            detail: `${target.label} did not respond to a connection health check.`,
+            ...translatableDetail(
+              msg("{host} did not respond to a connection health check.", {
+                host: target.label,
+              }),
+            ),
           });
         }
         if (probeEvent._tag === "ProbeCompleted") {
@@ -903,6 +970,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         }
         const signalTimeout = probeTimeoutFor(probeEvent.signal, routeKind);
         if (signalTimeout !== undefined) {
+          // A retry or network signal wants a definite answer, even when its
+          // own deadline lands after the foreground one.
+          if (!isForegroundProbe(probeEvent.signal)) toleratesMiss = false;
           if (isLongResume(probeEvent.signal) && !longResume) {
             longResume = true;
             longResumeStartedAt = yield* Clock.monotonicTimeNanos;
@@ -916,9 +986,11 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     }
   });
 
+  // Advanced as a session goes live and kept across loop restarts, so no two sessions share one.
+  let generation = 0;
   const runAttempt = Effect.fnUntraced(function* (
     attempt: number,
-    generation: number,
+    nextGeneration: number,
     lastFailure: ConnectionAttemptError | null,
     pendingRetry: Option.Option<PendingRetryTrace>,
     ignoreOffline: boolean,
@@ -931,15 +1003,15 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       sshPreparingSince: null,
     });
     const establishment = yield* Effect.raceAllFirst([
-      exitUnlessInterrupted(
-        establishTracedConnection(attempt, generation, lastFailure, pendingRetry, budget),
+      Effect.exit(
+        establishTracedConnection(attempt, nextGeneration, lastFailure, pendingRetry, budget),
       ).pipe(
         Effect.map((exit): EstablishmentEvent => ({
           _tag: "Completed",
           exit,
         })),
       ),
-      waitForEstablishmentInterrupt().pipe(
+      waitForEstablishmentInterrupt(ignoreOffline).pipe(
         Effect.map((resetRetry): EstablishmentEvent => ({
           _tag: "Interrupted",
           resetRetry,
@@ -992,29 +1064,15 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         failure: {
           error: new ConnectionTransientError({
             reason: "timeout",
-            detail: setupTimeoutDetail,
+            ...setupTimeoutDetail,
           }),
           attemptSpan: Option.none(),
         },
       } satisfies AttemptOutcome;
     }
     if (Exit.isFailure(establishment.exit)) {
-      const isUnexpectedDefect =
-        !Cause.hasInterruptsOnly(establishment.exit.cause) &&
-        !establishment.exit.cause.reasons.some(Cause.isFailReason);
-      const outcome = failureFromExit(target, establishment.exit, false, false);
-      if (isUnexpectedDefect) {
-        const defect = establishment.exit.cause.reasons.find(Cause.isDieReason)?.defect;
-        yield* Effect.logError("Connection attempt failed with an unexpected defect.").pipe(
-          Effect.annotateLogs({
-            "environment.id": target.environmentId,
-            "environment.label": target.label,
-            "cause.reason_count": establishment.exit.cause.reasons.length,
-            ...safeErrorLogAttributes(defect),
-          }),
-        );
-      }
-      return outcome;
+      yield* logUnexpectedFailure("attempt", establishment.exit.cause);
+      return failureFromCause(target, establishment.exit.cause, false, false);
     }
 
     const active = establishment.exit.value;
@@ -1038,14 +1096,23 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       } satisfies AttemptOutcome;
     }
 
+    const routes = yield* currentRoutes;
+    const activeRouteId = connectionRouteId(active.lease.prepared.target);
     const connectedLease: ConnectedLease = {
       ...active.lease,
-      activeRoute: (yield* currentRoutes).find(
-        (route) =>
-          connectionRouteId(route.target) === connectionRouteId(active.lease.prepared.target),
-      ),
+      activeRoute: routes.find((route) => connectionRouteId(route.target) === activeRouteId),
+      generation: nextGeneration,
     };
+    const refusedRouteIds = yield* Ref.updateAndGet(refusedRoutes, (known) =>
+      mergeRefusedRoutes(
+        known,
+        active.lease.refusedRouteIds,
+        (id) =>
+          id !== activeRouteId && routes.some((route) => connectionRouteId(route.target) === id),
+      ),
+    );
     const connectedAt = yield* Clock.currentTimeMillis;
+    generation = nextGeneration;
     yield* SubscriptionRef.set(prepared, Option.some(connectedLease.prepared));
     yield* SubscriptionRef.set(session, Option.some(connectedLease.session));
     if (options?.learnRoutes !== undefined) {
@@ -1057,9 +1124,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       phase: "connected",
       stage: null,
       attempt,
-      generation,
+      generation: nextGeneration,
       lastFailure: null,
       retryAt: null,
+      refusedRouteIds,
     });
 
     const connectedExit = yield* Effect.raceFirst(
@@ -1075,7 +1143,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           attemptSpan: active.attemptSpan,
         })),
       ),
-    ).pipe(exitUnlessInterrupted);
+    ).pipe(Effect.exit);
     const connectedForMs = (yield* Clock.currentTimeMillis) - connectedAt;
     if (Exit.isSuccess(connectedExit)) {
       return {
@@ -1085,27 +1153,26 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         resetRetry: connectedExit.value,
       } satisfies AttemptOutcome;
     }
-    const outcome = failureFromExit(
+    yield* logUnexpectedFailure("attempt", connectedExit.cause);
+    const outcome = failureFromCause(
       target,
-      connectedExit,
+      connectedExit.cause,
       true,
       connectedForMs >= BACKOFF_RESET_AFTER_MS,
     );
-    if (outcome._tag === "Failure") {
-      yield* Effect.void.pipe(
-        Effect.withSpan("EnvironmentSupervisor.connectionLost", {
-          root: true,
-          attributes: {
-            "environment.id": target.environmentId,
-            "environment.label": target.label,
-            "environment.target.kind": target._tag,
-            "connection.connected_ms": connectedForMs,
-            "connection.failure.reason": outcome.failure.error.reason,
-            "connection.failure.detail": outcome.failure.error.detail,
-          },
-        }),
-      );
-    }
+    yield* Effect.void.pipe(
+      Effect.withSpan("EnvironmentSupervisor.connectionLost", {
+        root: true,
+        attributes: {
+          "environment.id": target.environmentId,
+          "environment.label": target.label,
+          "environment.target.kind": target._tag,
+          "connection.connected_ms": connectedForMs,
+          "connection.failure.reason": outcome.failure.error.reason,
+          "connection.failure.detail": outcome.failure.error.detail,
+        },
+      }),
+    );
     return outcome;
   }, Effect.ensuring(clearLease));
 
@@ -1141,7 +1208,9 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
   const run = Effect.fnUntraced(function* () {
     let failureCount = 0;
-    let generation = 0;
+    // Approval waits count as attempts but not toward backoff, so a later outage starts low.
+    let backoffFailures = 0;
+    let approvalWaits = 0;
     let latestFailure: ConnectionAttemptError | null = null;
     let pendingRetry = Option.none<PendingRetryTrace>();
     let sshFastFailures = 0;
@@ -1150,12 +1219,15 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       failureCount = 0;
       sshFastFailures = 0;
       sshSlowFailures = 0;
+      backoffFailures = 0;
+      approvalWaits = 0;
       pendingRetry = Option.none();
     };
     let replacing = false;
 
     for (;;) {
-      if (yield* Ref.getAndSet(resetRetryState, false)) {
+      const retryRequested = yield* Ref.getAndSet(resetRetryState, false);
+      if (retryRequested) {
         resetRetryLadder();
         latestFailure = null;
       }
@@ -1168,7 +1240,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         yield* waitForSignal;
         continue;
       }
-      if (currentIntent.network === "offline" && !replacing) {
+      // The platform's offline report can stay wrong after the network is back,
+      // so an explicit retry still tries instead of waiting for it to change.
+      const ignoreOffline = replacing || retryRequested;
+      if (currentIntent.network === "offline" && !ignoreOffline) {
         yield* clearLease;
         yield* setState(offlineState(currentIntent, generation, failureCount + 1, latestFailure));
         const applicationActivated = yield* waitForSignal;
@@ -1181,14 +1256,26 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       const attempt = failureCount + 1;
       const nextGeneration = generation + 1;
       const attemptStartedAt = yield* Clock.monotonicTimeNanos;
-      const outcome: AttemptOutcome = yield* Effect.scoped(
-        runAttempt(attempt, nextGeneration, latestFailure, pendingRetry, replacing),
+      const outcome: AttemptOutcome = yield* Effect.acquireUseRelease(
+        Scope.make(),
+        (scope) =>
+          runAttempt(attempt, nextGeneration, latestFailure, pendingRetry, ignoreOffline).pipe(
+            Scope.provide(scope),
+            Effect.catchCause((cause) =>
+              logUnexpectedFailure("attempt", cause).pipe(
+                Effect.as(failureFromCause(target, cause, generation === nextGeneration, false)),
+              ),
+            ),
+          ),
+        (scope, exit) =>
+          Scope.close(scope, exit).pipe(
+            Effect.catchCause((cause) => logUnexpectedFailure("release", cause)),
+          ),
       );
       const attemptMs = Number(((yield* Clock.monotonicTimeNanos) - attemptStartedAt) / 1_000_000n);
       replacing = false;
       const failedProbe = yield* Ref.getAndSet(probeUnanswered, false);
       if (outcome.established) {
-        generation = nextGeneration;
         // A session came up, so no earlier failure describes the connection.
         // Losing a live session is not a failed connection either, for example
         // a socket the OS killed while the app was suspended: its replacement
@@ -1224,6 +1311,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           generation,
           lastFailure: error,
           retryAt: null,
+          refusedRouteIds: NO_REFUSED_ROUTES,
         });
         const applicationActivated = yield* waitForSignal;
         if (applicationActivated) {
@@ -1247,13 +1335,24 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         const immediate = sshSlowFailures > 0 && sshSlowFailures <= SSH_MAX_IMMEDIATE_RETRIES;
         sshFastFailures = immediate ? 0 : sshFastFailures + 1;
       }
-      const delayMs = usesSsh
-        ? sshFastFailures === 0
-          ? 0
-          : sshRetryDelayMs(sshFastFailures)
-        : firstLoss
-          ? Math.round(SESSION_LOSS_RETRY_DELAY_MS * (0.5 + (yield* Random.next) / 2))
-          : retryDelayMs(failureCount - 1, yield* Random.next);
+      if (error.reason === "approval-pending") approvalWaits += 1;
+      const awaitingApproval =
+        error.reason === "approval-pending" && approvalWaits <= APPROVAL_PENDING_FAST_RETRIES;
+      if (!awaitingApproval) backoffFailures += 1;
+      const delayMs = awaitingApproval
+        ? APPROVAL_PENDING_RETRY_DELAY_MS
+        : usesSsh && error.reason !== "approval-pending"
+          ? sshFastFailures === 0
+            ? 0
+            : sshRetryDelayMs(sshFastFailures)
+          : firstLoss
+            ? Math.round(SESSION_LOSS_RETRY_DELAY_MS * (0.5 + (yield* Random.next) / 2))
+            : error.reason === "approval-pending"
+              ? Math.max(
+                  APPROVAL_PENDING_RETRY_DELAY_MS,
+                  retryDelayMs(backoffFailures - 1, yield* Random.next),
+                )
+              : retryDelayMs(backoffFailures - 1, yield* Random.next);
       pendingRetry = Option.map(attemptSpan, (previousAttempt) => ({
         previousAttempt,
         failureCount,
@@ -1276,6 +1375,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         generation,
         lastFailure: latestFailure,
         retryAt: (yield* Clock.currentTimeMillis) + delayMs,
+        refusedRouteIds: NO_REFUSED_ROUTES,
       });
       const applicationActivated = yield* waitForRetrySignal(delayMs);
       if (applicationActivated) {
@@ -1284,41 +1384,101 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     }
   });
 
-  yield* connectivity.changes.pipe(
-    Stream.runForEach((network) =>
-      Ref.modify(intent, (current) => {
-        const next = targetNetwork(network);
-        return current.network === next
-          ? [false, current]
-          : ([true, { ...current, network: next }] as const);
-      }).pipe(
-        Effect.flatMap((changed) =>
-          changed
-            ? (network === "offline" ? Effect.void : forgetSilentRoutes).pipe(
-                Effect.andThen(signal({ _tag: "NetworkChanged", network })),
-              )
-            : Effect.void,
-        ),
+  // Registered before the fibers below so closing the scope interrupts them first.
+  // A loop still running when the queue shuts down would report that as a failure.
+  yield* Effect.addFinalizer(() => Queue.shutdown(signals).pipe(Effect.andThen(clearLease)));
+  // A defect in a background listener would otherwise end it for good, silently.
+  // Untraced: a span here would stay open for the supervisor's whole lifetime.
+  const keepRunning = Effect.fnUntraced(
+    function* (task: string, effect: Effect.Effect<void>, onRestart?: Effect.Effect<void>) {
+      let current = effect;
+      while (true) {
+        const exit = yield* Effect.exit(current);
+        if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) return yield* exit;
+        yield* Effect.logError("Connection supervisor task failed; restarting it.").pipe(
+          Effect.annotateLogs({
+            "environment.id": target.environmentId,
+            "environment.label": target.label,
+            task,
+            ...safeErrorLogAttributes(exit.cause.reasons.find(Cause.isDieReason)?.defect),
+          }),
+        );
+        yield* Effect.sleep(RETRY_BASE_DELAY_MS);
+        current = onRestart ? onRestart.pipe(Effect.andThen(effect)) : effect;
+      }
+    },
+    (self) => Effect.forkScoped(self),
+  );
+
+  const applyNetwork = (network: NetworkStatus) =>
+    Ref.modify(intent, (current) => {
+      const next = targetNetwork(network);
+      return current.network === next
+        ? [false, current]
+        : ([true, { ...current, network: next }] as const);
+    }).pipe(
+      Effect.flatMap((changed) =>
+        changed
+          ? (network === "offline" ? Effect.void : forgetSilentRoutes).pipe(
+              Effect.andThen(signal({ _tag: "NetworkChanged", network })),
+            )
+          : Effect.void,
+      ),
+    );
+  // A restarted listener may have missed changes while it was down.
+  yield* keepRunning(
+    "network-listener",
+    connectivity.changes.pipe(Stream.runForEach(applyNetwork)),
+    connectivity.status.pipe(Effect.flatMap(applyNetwork)),
+  );
+  yield* keepRunning(
+    "wakeup-listener",
+    wakeups.changes.pipe(
+      Stream.filter(ConnectionWakeups.reachesConnectionSupervisor),
+      Stream.runForEach((reason) =>
+        // A long suspension can hide a network change the platform never reported.
+        (reason === "network-changed" || reason === "application-active-long"
+          ? forgetSilentRoutes
+          : Effect.void
+        ).pipe(Effect.andThen(signal({ _tag: "Wakeup", reason }))),
       ),
     ),
-    Effect.forkScoped,
   );
-  yield* wakeups.changes.pipe(
-    Stream.runForEach((reason) =>
-      // A long suspension can hide a network change the platform never reported.
-      (reason === "network-changed" || reason === "application-active-long"
-        ? forgetSilentRoutes
-        : Effect.void
-      ).pipe(Effect.andThen(signal({ _tag: "Wakeup", reason }))),
+  yield* keepRunning(
+    "better-route-checker",
+    Queue.take(betterRouteChecks).pipe(Effect.flatMap(checkBetterRoutes), Effect.forever),
+  );
+  // A restarted loop has forgotten its retry ladder, so it waits out the
+  // ladder's ceiling unless a signal cuts the wait short.
+  yield* run().pipe(
+    Effect.catchCause((cause) =>
+      Effect.gen(function* () {
+        yield* logUnexpectedFailure("loop", cause);
+        const currentIntent = yield* Ref.get(intent);
+        const lastFailure = unexpectedFailure(target).error;
+        yield* setState(
+          !currentIntent.desired
+            ? availableState(currentIntent, generation)
+            : currentIntent.network === "offline"
+              ? offlineState(currentIntent, generation, 1, lastFailure)
+              : {
+                  desired: true,
+                  network: currentIntent.network,
+                  phase: "backoff",
+                  stage: null,
+                  attempt: 1,
+                  generation,
+                  lastFailure,
+                  retryAt: (yield* Clock.currentTimeMillis) + RETRY_MAX_DELAY_MS,
+                  refusedRouteIds: NO_REFUSED_ROUTES,
+                },
+        );
+        yield* waitForRetrySignal(RETRY_MAX_DELAY_MS);
+      }),
     ),
-    Effect.forkScoped,
-  );
-  yield* Queue.take(betterRouteChecks).pipe(
-    Effect.flatMap(checkBetterRoutes),
     Effect.forever,
     Effect.forkScoped,
   );
-  yield* run().pipe(Effect.forkScoped);
 
   const connect = Ref.update(intent, (current) => ({
     ...current,
@@ -1340,8 +1500,6 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     Effect.andThen(signal({ _tag: "RetryRequested" })),
     Effect.withSpan("EnvironmentSupervisor.retryNow"),
   );
-
-  yield* Effect.addFinalizer(() => Queue.shutdown(signals).pipe(Effect.andThen(clearLease)));
 
   return EnvironmentSupervisor.of({
     target,

@@ -1,3 +1,4 @@
+import { msg } from "gt-react";
 import {
   ClientCapabilities,
   PlatformConnectionSource,
@@ -17,6 +18,7 @@ import {
   PrimaryConnectionRegistration,
   PrimaryConnectionTarget,
   sshTargetKey,
+  publishedServerVersion,
   Wakeups,
 } from "@t3tools/client-runtime/connection";
 import { bootstrapRemoteBearerSession } from "@t3tools/client-runtime/authorization";
@@ -62,6 +64,7 @@ import {
 } from "./desktopLocal";
 import * as ConnectionStorage from "./storage";
 import { clientPresentationMetadata } from "./clientMetadata";
+import { m } from "../i18n/messages";
 
 let nextObservedRpcRequestId = 0;
 
@@ -142,6 +145,24 @@ const layerWakeups = Wakeups.layer({
             }),
         ).pipe(Effect.asVoid),
       ),
+      // A window left visible beside another app never fires visibilitychange when refocused.
+      Stream.callback<"application-focused">((queue) =>
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            const listener = () => {
+              if (document.visibilityState === "visible") {
+                Queue.offerUnsafe(queue, "application-focused");
+              }
+            };
+            window.addEventListener("focus", listener);
+            return listener;
+          }),
+          (listener) =>
+            Effect.sync(() => {
+              window.removeEventListener("focus", listener);
+            }),
+        ).pipe(Effect.asVoid),
+      ),
       managedRelayAccountChanges(appAtomRegistry).pipe(
         Stream.map(() => "credentials-changed" as const),
       ),
@@ -189,7 +210,7 @@ function sshPreparationError(cause: unknown) {
   }
   return new ConnectionTransientError({
     reason: "remote-unavailable",
-    detail: `Could not prepare the SSH environment: ${message}`,
+    detail: m(msg("Could not prepare the SSH environment: {message}", { message })),
   });
 }
 
@@ -235,7 +256,7 @@ export const provisionDesktopSshEnvironment = Effect.fn(
   if (pairingToken === null) {
     return yield* new ConnectionBlockedError({
       reason: "authentication",
-      detail: "The SSH environment did not issue a pairing credential.",
+      detail: m(msg("The SSH environment did not issue a pairing credential.")),
     });
   }
   const descriptor = yield* Effect.tryPromise({
@@ -245,7 +266,12 @@ export const provisionDesktopSshEnvironment = Effect.fn(
   if (expectedEnvironmentId !== undefined && descriptor.environmentId !== expectedEnvironmentId) {
     return yield* new ConnectionBlockedError({
       reason: "configuration",
-      detail: `That host reaches ${descriptor.label}, a different machine. Add it as its own environment instead.`,
+      detail: m(
+        msg(
+          "That host reaches {label}, a different machine. Add it as its own environment instead.",
+          { label: descriptor.label },
+        ),
+      ),
     });
   }
   const access = yield* Effect.tryPromise({
@@ -256,19 +282,34 @@ export const provisionDesktopSshEnvironment = Effect.fn(
       // the desktop's runner just minted, and answers 500 on every retry.
       if (
         error._tag === "ConnectionBlockedError" ||
-        descriptor.serverVersion === APP_VERSION ||
+        descriptor.serverVersion === publishedServerVersion(APP_VERSION) ||
         !error.detail.includes("[ssh_http:500]")
       ) {
         return error;
       }
       return new ConnectionBlockedError({
         reason: "configuration",
-        detail: `${descriptor.label} runs T3 Code ${descriptor.serverVersion}, but this desktop is ${APP_VERSION}, and that server could not accept its pairing. ${
+        detail: m(
           bootstrap.remoteServerKind === "managed"
-            ? // Without a session the Update button is unavailable; switching off stops the server.
-              `Switch ${descriptor.label} off and on in Settings → Connections to restart it on ${APP_VERSION}.`
-            : `Restart the T3 server on ${descriptor.label} so it runs ${APP_VERSION}, then retry.`
-        }`,
+            ? msg(
+                "{label} runs T3 Code {serverVersion}, but this desktop is {appVersion}, and that server could not accept its pairing. Switch {label} off and on in Settings → Connections to restart it on {serverRelease}.",
+                {
+                  label: descriptor.label,
+                  serverVersion: descriptor.serverVersion,
+                  appVersion: APP_VERSION,
+                  serverRelease: publishedServerVersion(APP_VERSION),
+                },
+              )
+            : msg(
+                "{label} runs T3 Code {serverVersion}, but this desktop is {appVersion}, and that server could not accept its pairing. Restart the T3 server on {label} so it runs {serverRelease}, then retry.",
+                {
+                  label: descriptor.label,
+                  serverVersion: descriptor.serverVersion,
+                  appVersion: APP_VERSION,
+                  serverRelease: publishedServerVersion(APP_VERSION),
+                },
+              ),
+        ),
       });
     },
   });
@@ -305,7 +346,12 @@ export const prepareDesktopSshEnvironment = Effect.fn("web.connectionPlatform.ss
       if (descriptor.environmentId !== input.expectedEnvironmentId) {
         return yield* new ConnectionBlockedError({
           reason: "configuration",
-          detail: `That host reaches ${descriptor.label}, a different machine. Add it as its own environment instead.`,
+          detail: m(
+            msg(
+              "That host reaches {label}, a different machine. Add it as its own environment instead.",
+              { label: descriptor.label },
+            ),
+          ),
         });
       }
       const session = yield* Effect.tryPromise({
@@ -363,7 +409,7 @@ const layerCapabilities = Layer.effectContext(
         if (session === null) {
           return yield* new ConnectionBlockedError({
             reason: "authentication",
-            detail: "Sign in to T3 Connect to connect this environment.",
+            detail: m(msg("Sign in to T3 Connect to connect this environment.")),
           });
         }
         const token = yield* session.readClerkToken().pipe(
@@ -378,7 +424,7 @@ const layerCapabilities = Layer.effectContext(
         if (token === null) {
           return yield* new ConnectionBlockedError({
             reason: "authentication",
-            detail: "The T3 Connect session is unavailable.",
+            detail: m(msg("The T3 Connect session is unavailable.")),
           });
         }
         return token;
@@ -393,7 +439,11 @@ const layerCapabilities = Layer.effectContext(
         catch: (cause) =>
           new ConnectionTransientError({
             reason: "remote-unavailable",
-            detail: `Could not load the desktop primary credential: ${String(cause)}`,
+            detail: m(
+              msg("Could not load the desktop primary credential: {cause}", {
+                cause: String(cause),
+              }),
+            ),
           }),
       }).pipe(Effect.map(Option.fromNullishOr)),
     });
@@ -404,7 +454,7 @@ const layerCapabilities = Layer.effectContext(
           if (bridge === undefined) {
             return yield* new ConnectionBlockedError({
               reason: "unsupported",
-              detail: "SSH environments are only available in the desktop app.",
+              detail: m(msg("SSH environments are only available in the desktop app.")),
             });
           }
           return yield* provisionDesktopSshEnvironment(bridge, target, expectedEnvironmentId);
@@ -415,7 +465,7 @@ const layerCapabilities = Layer.effectContext(
         if (bridge === undefined) {
           return yield* new ConnectionBlockedError({
             reason: "unsupported",
-            detail: "SSH environments are only available in the desktop app.",
+            detail: m(msg("SSH environments are only available in the desktop app.")),
           });
         }
         return yield* prepareDesktopSshEnvironment(bridge, input);
@@ -431,7 +481,9 @@ const layerCapabilities = Layer.effectContext(
           catch: (cause) =>
             new ConnectionTransientError({
               reason: "remote-unavailable",
-              detail: `Could not disconnect the SSH environment: ${String(cause)}`,
+              detail: m(
+                msg("Could not disconnect the SSH environment: {cause}", { cause: String(cause) }),
+              ),
             }),
         });
       }),
@@ -476,7 +528,7 @@ const loadSecondaryConnectionRegistration = Effect.fn(
   ) {
     return yield* new ConnectionTransientError({
       reason: "endpoint-unavailable",
-      detail: `Desktop-local backend ${entry.id} is not ready yet.`,
+      detail: m(msg("Desktop-local backend {id} is not ready yet.", { id: entry.id })),
     });
   }
   const httpBaseUrl = entry.httpBaseUrl;

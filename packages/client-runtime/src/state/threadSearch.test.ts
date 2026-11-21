@@ -67,6 +67,7 @@ it("ignores invalid search keys", () => {
     expect(state).toEqual({
       matches: [],
       isLoading: false,
+      failed: false,
       hasMore: false,
       partial: false,
       rows: [],
@@ -74,6 +75,7 @@ it("ignores invalid search keys", () => {
     expect(malformedState).toEqual({
       matches: [],
       isLoading: false,
+      failed: false,
       hasMore: false,
       partial: false,
       rows: [],
@@ -84,7 +86,7 @@ it("ignores invalid search keys", () => {
   }
 });
 
-it("merges successful environments and silently ignores failures", () => {
+it("merges successful environments, and reports a failure only when none answered", () => {
   const result: OrchestrationSearchThreadsResult = {
     matches: [
       {
@@ -115,9 +117,19 @@ it("merges successful environments and silently ignores failures", () => {
     isLoading: false,
     hasMore: false,
     partial: false,
+    failed: false,
     rows: [],
   });
   expect(threadSearchMatchKey(state.matches[0]!)).toBe('["env-a","thread-a"]');
+  // With no environment answering, an empty result must not read as "no matches".
+  expect(registry.get(searchAtom(makeThreadSearchKey([envB], "needle")))).toEqual({
+    matches: [],
+    isLoading: false,
+    failed: true,
+    hasMore: false,
+    partial: false,
+    rows: [],
+  });
 
   registry.dispose();
 });

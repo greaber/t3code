@@ -1,7 +1,13 @@
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "@effect/vitest";
-import { ScheduledTaskUpsertInput } from "@t3tools/contracts";
+import {
+  type OrchestrationV2ConversationMessage,
+  type OrchestrationV2Run,
+  MessageId,
+  RunId,
+  ScheduledTaskUpsertInput,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -11,6 +17,7 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -174,6 +181,201 @@ it.effect("keeps the task list order when a toggle or edit rewrites updated_at",
       const edit = { ...input(older.task.id), requireExisting: true, title: "Edited" };
       yield* service.upsert(yield* decodeUpsertInput({ ...edit, enabled: false }));
       expect(yield* listedIds).toEqual(order);
+    }).pipe(Effect.provide(ScheduledTaskService.layer.pipe(Layer.provide(layerDependencies))));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect("keeps one queued occurrence of a recurring task while its bound thread is busy", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse("2026-07-01T09:00:00.000Z"));
+    // The bound thread's own run never finishes, so every scheduled send lands
+    // in its queue and stays there.
+    const activeRun = {
+      id: RunId.make("run:busy"),
+      status: "running",
+      userMessageId: MessageId.make("message:busy"),
+    } as OrchestrationV2Run;
+    const thread = yield* Ref.make<{
+      readonly runs: ReadonlyArray<OrchestrationV2Run>;
+      readonly messages: ReadonlyArray<OrchestrationV2ConversationMessage>;
+    }>({ runs: [activeRun], messages: [] });
+    const runDueWork = yield* Ref.make<Effect.Effect<void>>(Effect.void);
+    const sql = yield* SqlClient.SqlClient;
+    const outcomeDuringLookup = yield* Ref.make(false);
+    const layerDependencies = Layer.mergeAll(
+      NodeCrypto.layer,
+      ManagedPolicy.layerTest(),
+      // Capture the poll pass so the test drives each due interval directly.
+      Layer.mock(Scheduler.Scheduler)({
+        register: (name, work) =>
+          name !== "scheduled-tasks"
+            ? Effect.void
+            : Effect.context<Effect.Services<typeof work>>().pipe(
+                Effect.flatMap((context) =>
+                  Ref.set(runDueWork, work.pipe(Effect.provideContext(context), Effect.ignore)),
+                ),
+              ),
+      }),
+      Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+        namedProjectsRoot: "/projects",
+        isScratchProject: () => Effect.succeed(false),
+      }),
+      Layer.mock(ThreadManagementService.ThreadManagementService)({
+        sendToThread: (input) =>
+          Ref.modify(thread, (current) => {
+            const run = {
+              id: RunId.make(`run:${input.messageId}`),
+              status: "queued",
+              userMessageId: input.messageId,
+            } as OrchestrationV2Run;
+            const message = {
+              id: input.messageId,
+              threadId: input.threadId,
+              runId: run.id,
+              role: "user",
+              text: input.text,
+              ...(input.scheduledTaskId === undefined
+                ? {}
+                : { scheduledTaskId: input.scheduledTaskId }),
+            } as OrchestrationV2ConversationMessage;
+            return [
+              {
+                delivery: "queued",
+                run,
+                message,
+              } as ThreadManagementService.ThreadManagementSendResult,
+              { runs: [...current.runs, run], messages: [...current.messages, message] },
+            ];
+          }),
+        getThreadRecords: (_id, fields) =>
+          Effect.gen(function* () {
+            if (
+              fields.some((field) => field === "messages") &&
+              (yield* Ref.get(outcomeDuringLookup))
+            ) {
+              yield* Ref.set(outcomeDuringLookup, false);
+              yield* sql`UPDATE scheduled_tasks SET last_run_status = 'failed',
+                last_run_error = 'Provider failed' WHERE task_id = 'scheduled-task:busy-thread'`;
+            }
+            return (yield* Ref.get(thread)) as never;
+          }).pipe(Effect.orDie),
+        getThreadShell: () =>
+          Effect.succeed({
+            projectId: "project-busy-thread",
+            deletedAt: null,
+            archivedAt: null,
+          } as never),
+      }),
+      Layer.mock(SecretRequests.SecretRequests)({}),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const { task } = yield* service.upsert(
+        yield* decodeUpsertInput({
+          id: "scheduled-task:busy-thread",
+          title: "Check progress",
+          prompt: "Check progress",
+          enabled: true,
+          schedule: { type: "interval", everyMs: 60_000 },
+          projectId: "project-busy-thread",
+          threadId: "thread:busy",
+          workspaceStrategy: { type: "root" },
+          modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        }),
+      );
+
+      for (let interval = 0; interval < 3; interval++) {
+        yield* TestClock.adjust("61 seconds");
+        yield* Effect.flatten(Ref.get(runDueWork));
+      }
+
+      const queuedOccurrencesOf = (taskId: typeof task.id) =>
+        Ref.get(thread).pipe(
+          Effect.map(
+            ({ runs, messages }) =>
+              runs
+                .filter((run) => run.status === "queued")
+                .map((run) => messages.find((message) => message.id === run.userMessageId))
+                .filter((message) => message?.scheduledTaskId === taskId).length,
+          ),
+        );
+      const queuedOccurrences = queuedOccurrencesOf(task.id);
+      expect(yield* queuedOccurrences).toBe(1);
+      // Skipped intervals still move the schedule forward.
+      const [listed] = (yield* service.list()).tasks;
+      expect(Date.parse(listed?.nextRunAt ?? "")).toBeGreaterThan(
+        Date.parse("2026-07-01T09:03:03.000Z"),
+      );
+
+      yield* Ref.update(thread, (current) => ({
+        ...current,
+        runs: current.runs.map((run) =>
+          run.status === "queued" ? { ...run, queueHeld: true } : run,
+        ),
+      }));
+      yield* TestClock.adjust("61 seconds");
+      yield* Effect.flatten(Ref.get(runDueWork));
+      const [blocked] = (yield* service.list()).tasks;
+      expect(blocked?.lastRunStatus).toBe("failed");
+      expect(blocked?.lastRunError).toBe(
+        "A previous occurrence is held in the thread queue. Resume or remove it to run this task again.",
+      );
+      expect(yield* queuedOccurrences).toBe(1);
+
+      // The prior run can finish while the poll is looking up its held occurrence.
+      yield* sql`UPDATE scheduled_tasks SET last_run_status = 'succeeded', last_run_error = NULL
+        WHERE task_id = ${task.id}`;
+      yield* Ref.set(outcomeDuringLookup, true);
+      yield* TestClock.adjust("61 seconds");
+      yield* Effect.flatten(Ref.get(runDueWork));
+      const [raced] = (yield* service.list()).tasks;
+      expect(raced?.lastRunStatus).toBe("failed");
+      expect(raced?.lastRunError).toBe("Provider failed");
+      expect(Date.parse(raced?.nextRunAt ?? "")).toBeGreaterThan(
+        Date.parse(blocked?.nextRunAt ?? ""),
+      );
+
+      // Run now is an explicit request, so it still queues behind the held one.
+      yield* service.runNow({ id: task.id });
+      expect(yield* queuedOccurrences).toBe(2);
+
+      // Once the queued copies start, the next interval sends again.
+      yield* Ref.update(thread, (current) => ({
+        ...current,
+        runs: current.runs.map((run) =>
+          run.status === "queued" ? ({ ...run, status: "running" } as OrchestrationV2Run) : run,
+        ),
+      }));
+      yield* TestClock.adjust("61 seconds");
+      yield* Effect.flatten(Ref.get(runDueWork));
+      expect(yield* queuedOccurrences).toBe(1);
+      const [resumed] = (yield* service.list()).tasks;
+      expect(resumed?.lastRunStatus).toBe("succeeded");
+      expect(resumed?.lastRunError).toBeNull();
+
+      // A one-time task's only scheduled occurrence still sends behind a queued Run now.
+      const { task: once } = yield* service.upsert(
+        yield* decodeUpsertInput({
+          id: "scheduled-task:busy-thread-once",
+          title: "Check once",
+          prompt: "Check once",
+          enabled: true,
+          schedule: { type: "once", runAt: "2026-07-01T09:07:00.000Z" },
+          projectId: "project-busy-thread",
+          threadId: "thread:busy",
+          workspaceStrategy: { type: "root" },
+          modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        }),
+      );
+      yield* service.runNow({ id: once.id });
+      yield* TestClock.adjust("61 seconds");
+      yield* Effect.flatten(Ref.get(runDueWork));
+      expect(yield* queuedOccurrencesOf(once.id)).toBe(2);
     }).pipe(Effect.provide(ScheduledTaskService.layer.pipe(Layer.provide(layerDependencies))));
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );

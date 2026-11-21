@@ -7,6 +7,10 @@ desktop app, `t3 service` self-update, `t3 update`, and `scripts/install.sh` all
 `https://github.com/greaber/t3code/releases` (`CLI_RELEASE_REPOSITORY` in
 `packages/shared/src/cliRelease.ts`). `T3CODE_RELEASE_BASE_URL` still overrides it.
 
+## Where releases come from
+
+`origin/grant/main` is the deployable fork branch. Merge current `upstream/main` into a topic branch based on it; a stable upstream tag or a particular bug fix is not a prerequisite. Review overlaps with the fork and run `vp run check:changed upstream/main` before promoting the merge. In particular, smoke-test the Mac app's SSH reconnect against an already running Linux server, rather than only checking that the app starts. Fast-forward `grant/main` to the tested commit and push it before cutting the release. Don't install binaries built from an uncommitted change or an unpushed commit.
+
 ## Versions
 
 Fork versions are `<next upstream version>-grant.<n>`, for example `0.1.9-grant.1`:
@@ -31,7 +35,7 @@ version, so build the desktop app from the same commit as the release.
 ## Cutting a release
 
 1. Commit the version bump and push the branch.
-2. Tag and push: `git tag v<version> && git push greaber v<version>`. Pushing the tag runs
+2. Tag and push: `git tag v<version> && git push origin v<version>`. Pushing the tag runs
    `.github/workflows/fork-release.yml`. Running the workflow by hand
    (`gh workflow run fork-release.yml --ref <branch> -R greaber/t3code`) releases the branch tip
    and creates the tag.
@@ -47,10 +51,10 @@ that use `blacksmith-*` runners) would sit queued on the fork, so disable them i
 
 ## Desktop app
 
-The workflow does not build the desktop app. Build it on the Mac from the release commit:
+After the release publishes, build the app on the Mac from the same commit. This command checks the working tree, pushed branch, release tag, and Linux SSH helper assets before packaging:
 
 ```bash
-vp run dist:desktop:dmg:arm64
+bash scripts/build-fork-desktop.sh
 ```
 
 The DMG lands in `release/`. A local build has no update feed, so the app's own auto-update is

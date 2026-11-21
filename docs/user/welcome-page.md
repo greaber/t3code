@@ -74,9 +74,10 @@ three conversations, already checked. Projects already in T3 Code are not checke
 again. Uncheck the box to start without them, or
 select **Review all** to pick from everything found, with "Select all" and
 "Select none". Linked worktrees of bare repositories
-can be offered as separate projects. Other linked git worktrees, Codex scratch
-directories under `Documents/Codex`, and anything under `Downloads` are not
-offered.
+can be offered as separate projects. Conversations in other linked git worktrees
+count toward their main checkout, so a repository is offered even if you only
+worked in its worktrees. Codex scratch directories under `Documents/Codex`, and
+anything under `Downloads` are not offered.
 
 A large or malformed history can reach the scan limit. T3 Code keeps the
 projects it found and warns when projects or conversations may be missing.
@@ -93,7 +94,10 @@ Conversation import is best effort. T3 Code imports every visible user and
 assistant message. It omits tool activity and attachments. For Codex, it omits
 generated setup context only when a canonical user event and a valid shared turn
 ID identify the same user turn. Ambiguous legacy or response-only context stays
-in the imported conversation so T3 Code does not remove user text. It reads one
+in the imported conversation so T3 Code does not remove user text. For Claude, slash commands
+and `!` shell commands appear as you typed them; their output, background task
+notifications and interruption markers are left out, and a conversation that
+only ran commands such as `/clear`, with no reply, is skipped. It reads one
 conversation at a time and ignores malformed records.
 
 Some conversations are skipped: files larger than 4 GiB, conversations whose

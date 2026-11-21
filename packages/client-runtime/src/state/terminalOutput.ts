@@ -1,4 +1,12 @@
-import { TERMINAL_HISTORY_PAGE_BYTES, TERMINAL_VIEW_SCROLLBACK_ROWS } from "@t3tools/contracts";
+import {
+  retainedTerminalHistory,
+  TERMINAL_HISTORY_PAGE_BYTES,
+  TERMINAL_VIEW_SCROLLBACK_ROWS,
+  TERMINAL_VIEW_SCROLLBACK_BYTES,
+  TERMINAL_SEQUENCE_GROUND,
+  terminalSequenceEnd,
+  terminalSequenceStateAfter,
+} from "@t3tools/contracts";
 
 export interface TerminalOutputChunk {
   readonly startOffset: number;
@@ -43,18 +51,26 @@ export interface TerminalOutputState {
   readonly olderHistory: boolean;
   readonly detached: TerminalDetachedWindow | null;
   readonly anchor: (TerminalOutputAnchor & { readonly resetVersion: number }) | null;
+  // The terminal parser's state at the first retained code unit. Trimming can cut a control
+  // sequence, and a replay has to skip the rest of it instead of printing it.
+  readonly sequenceState: number;
+  /** Chunks before this offset are replayed to emulators but are no longer displayed text. */
+  readonly textStartOffset: number;
 }
 
 export interface TerminalOutputCursor {
   readonly generation: number;
   readonly resetVersion: number;
   readonly offset: number;
+  // The cut control sequence still open at `offset`, which the reader's terminal never entered.
+  readonly sequenceState: number;
 }
 
 export const INITIAL_TERMINAL_OUTPUT_CURSOR = Object.freeze<TerminalOutputCursor>({
   generation: -1,
   resetVersion: -1,
   offset: 0,
+  sequenceState: TERMINAL_SEQUENCE_GROUND,
 });
 
 export type TerminalOutputUpdate =
@@ -77,6 +93,7 @@ export type TerminalOutputUpdate =
 
 /** A page of server output, as `terminal.history` returns it. */
 export interface TerminalHistoryPageInput {
+  readonly sequenceState?: number;
   readonly data: string;
   readonly offset: number;
   readonly end: number;
@@ -106,6 +123,8 @@ export const EMPTY_TERMINAL_OUTPUT_STATE = Object.freeze<TerminalOutputState>({
   olderHistory: false,
   detached: null,
   anchor: null,
+  sequenceState: TERMINAL_SEQUENCE_GROUND,
+  textStartOffset: 0,
 });
 
 const utf8Length = (data: string) => textEncoder.encode(data).byteLength;
@@ -242,6 +261,7 @@ function trimChunkStart(chunk: TerminalOutputChunk, bytes: number, lines: number
 }
 
 interface Window {
+  sequenceState: number;
   chunks: TerminalOutputChunk[];
   bytes: number;
   lines: number;
@@ -260,7 +280,13 @@ const VIEW_ROW_BUDGET = Math.floor(TERMINAL_VIEW_SCROLLBACK_ROWS * 0.9);
  * mix of short and wrapped lines. Past the view's rows, older output would not show.
  */
 function byteBudget(maxBytes: number, lines: number, cols: number): number {
-  return Math.min(maxBytes, (VIEW_ROW_BUDGET - lines) * Math.max(1, cols));
+  // The native scrollbar is byte-limited: wide grids retain fewer rows even for short lines.
+  const columns = Math.max(1, cols);
+  const rows = Math.min(
+    VIEW_ROW_BUDGET,
+    Math.floor(TERMINAL_VIEW_SCROLLBACK_BYTES / (32 * columns + 64)),
+  );
+  return Math.min(maxBytes, (rows - lines) * columns);
 }
 
 /**
@@ -280,6 +306,12 @@ function trimFront(window: Window, maxBytes: number, cols: number): void {
       (first.exact || (first.serverEnd === null && !first.pendingEnd))
     ) {
       const trimmed = trimChunkStart(first, bytesOver, 0);
+      window.sequenceState = terminalSequenceStateAfter(
+        window.sequenceState,
+        first.data,
+        0,
+        first.data.length - trimmed.chunk.data.length,
+      );
       window.bytes -= trimmed.droppedBytes;
       window.lines -= first.lineBreaks - trimmed.chunk.lineBreaks;
       window.historyOffset =
@@ -295,6 +327,7 @@ function trimFront(window: Window, maxBytes: number, cols: number): void {
     let droppedBytes = 0;
     for (;;) {
       window.chunks.shift();
+      window.sequenceState = terminalSequenceStateAfter(window.sequenceState, dropped.data);
       window.bytes -= dropped.byteLength;
       window.lines -= dropped.lineBreaks;
       droppedBytes += dropped.byteLength;
@@ -312,6 +345,7 @@ function windowOf(state: TerminalOutputState, chunks: ReadonlyArray<TerminalOutp
     chunks: [...chunks],
     bytes: chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
     lines: chunks.reduce((total, chunk) => total + chunk.lineBreaks, 0),
+    sequenceState: state.sequenceState,
     historyOffset: state.historyOffset,
     dropped: false,
   };
@@ -330,6 +364,7 @@ function fromWindow(
     chunks,
     retainedBytes: window.bytes,
     retainedLines: window.lines,
+    sequenceState: window.sequenceState,
     historyOffset: window.historyOffset,
     olderHistory: window.historyOffset !== null && (current.olderHistory || window.dropped),
     nextOffset: last === undefined ? current.nextOffset : last.startOffset + last.data.length,
@@ -366,6 +401,8 @@ function appendOutput(
       retainedLines: 0,
       resetVersion: current.resetVersion + 1,
       nextOffset: current.nextOffset + data.length,
+      sequenceState: TERMINAL_SEQUENCE_GROUND,
+      textStartOffset: current.textStartOffset,
       historyOffset: null,
       olderHistory: false,
       detached: null,
@@ -392,10 +429,25 @@ function resetOutput(
   current: TerminalOutputState,
   data: string,
   maxBufferBytes: number,
-  history?: { readonly offset: number; readonly end: number; readonly older: boolean },
+  history?: {
+    readonly offset: number;
+    readonly end: number;
+    readonly older: boolean;
+    readonly sequenceState?: number;
+  },
   cols = DEFAULT_TERMINAL_COLS,
 ): TerminalOutputState {
+  const retained = retainedTerminalHistory(data, maxBufferBytes);
+  const skipped = utf8Length(data) - utf8Length(retained);
+  const state = terminalSequenceStateAfter(
+    history?.sequenceState ?? TERMINAL_SEQUENCE_GROUND,
+    data,
+    0,
+    data.length - retained.length,
+  );
+  data = retained;
   const window: Window = {
+    sequenceState: state,
     chunks: [
       ...makeChunks(
         data,
@@ -408,8 +460,8 @@ function resetOutput(
     ],
     bytes: utf8Length(data),
     lines: countLineBreaks(data),
-    historyOffset: history?.offset ?? null,
-    dropped: false,
+    historyOffset: history === undefined ? null : history.offset + skipped,
+    dropped: skipped > 0,
   };
   if (maxBufferBytes <= 0) {
     window.chunks = [];
@@ -418,7 +470,8 @@ function resetOutput(
   }
   trimFront(window, Math.max(0, maxBufferBytes), cols);
   return {
-    ...fromWindow({ ...current, olderHistory: history?.older ?? false }, window, {}),
+    ...fromWindow({ ...current, nextOffset: 0, olderHistory: history?.older ?? false }, window, {}),
+    textStartOffset: 0,
     resetVersion: current.resetVersion + 1,
     detached: null,
     anchor: null,
@@ -483,7 +536,14 @@ function prependOutput(
     }
     newEnd = chunks.at(-1)!.serverEnd!;
   }
-  const window: Window = { chunks, bytes, lines, historyOffset: page.offset, dropped: false };
+  const window: Window = {
+    chunks,
+    bytes,
+    lines,
+    historyOffset: page.offset,
+    sequenceState: page.sequenceState ?? TERMINAL_SEQUENCE_GROUND,
+    dropped: false,
+  };
   // A page larger than the whole budget keeps its newest part.
   trimFront(window, maxBufferBytes, cols);
   const split =
@@ -577,7 +637,12 @@ function showLatestOutput(
     current,
     page.data,
     maxBufferBytes,
-    { offset: page.offset, end: page.end, older: page.olderHistory },
+    {
+      offset: page.offset,
+      end: page.end,
+      older: page.olderHistory,
+      sequenceState: page.sequenceState ?? TERMINAL_SEQUENCE_GROUND,
+    },
     cols,
   );
   if (page.newerHistory || detached.bufferedFrom > page.end) {
@@ -592,15 +657,50 @@ function showLatestOutput(
   );
 }
 
+// Erases the screen and scrollback only. A full emulator reset would drop the
+// screen and input modes the still-running program negotiated.
+const CLEAR_TERMINAL_TEXT = "\u001b[H\u001b[2J\u001b[3J";
+
+/** Earlier output stays retained so a replay from the start restores those modes. */
+function clearOutput(current: TerminalOutputState, maxBufferBytes: number): TerminalOutputState {
+  // The erase rides over the budget: trimming here would evict the output that set those modes.
+  const cleared = appendOutput(
+    current,
+    CLEAR_TERMINAL_TEXT,
+    maxBufferBytes <= 0
+      ? maxBufferBytes
+      : Math.max(maxBufferBytes, current.retainedBytes + CLEAR_TERMINAL_TEXT.length),
+  );
+  return {
+    ...cleared,
+    textStartOffset: cleared.nextOffset,
+    detached: null,
+    olderHistory: false,
+    historyOffset: null,
+    anchor: null,
+  };
+}
+
+/** Everything a fresh emulator replays: retained output from outside any control sequence. */
+export function terminalOutputReplay(output: TerminalOutputState): string {
+  const text = output.chunks.map((chunk) => chunk.data).join("");
+  return text.slice(terminalSequenceEnd(output.sequenceState, text));
+}
+
+/** The output as plain text, for surfaces that do not interpret escape sequences. */
 export function terminalOutputText(output: TerminalOutputState): string {
-  return output.chunks.map((chunk) => chunk.data).join("");
+  const text = output.chunks.map((chunk) => chunk.data).join("");
+  const firstOffset = output.chunks[0]?.startOffset ?? output.nextOffset;
+  return text.slice(
+    Math.max(terminalSequenceEnd(output.sequenceState, text), output.textStartOffset - firstOffset),
+  );
 }
 
 export function readTerminalOutputUpdate(
   output: TerminalOutputState,
   cursor: TerminalOutputCursor,
 ): TerminalOutputUpdate {
-  const nextCursor = {
+  const position = {
     generation: output.generation,
     resetVersion: output.resetVersion,
     offset: output.nextOffset,
@@ -612,17 +712,22 @@ export function readTerminalOutputUpdate(
     cursor.offset < (firstChunk?.startOffset ?? output.nextOffset)
   ) {
     const anchor = output.anchor;
+    const text = output.chunks.map((chunk) => chunk.data).join("");
+    const start = terminalSequenceEnd(output.sequenceState, text);
     return {
       type: "reset",
-      data: terminalOutputText(output),
-      cursor: nextCursor,
+      data: text.slice(start),
+      cursor: {
+        ...position,
+        sequenceState: terminalSequenceStateAfter(output.sequenceState, text, 0, start),
+      },
       // Only a reader that had everything before this reset can keep its place.
       anchor:
         anchor !== null &&
         anchor.resetVersion === output.resetVersion &&
         cursor.generation === output.generation &&
         cursor.resetVersion === output.resetVersion - 1
-          ? { split: anchor.split, keep: anchor.keep }
+          ? { split: Math.max(0, anchor.split - start), keep: anchor.keep }
           : null,
     };
   }
@@ -634,17 +739,26 @@ export function readTerminalOutputUpdate(
     if (!(chunk.startOffset + chunk.data.length > cursor.offset)) break;
     firstUnread -= 1;
   }
-  const appended = output.chunks.slice(firstUnread);
-  if (appended.length === 0) {
+  const text = output.chunks
+    .slice(firstUnread)
+    .map((chunk) => chunk.data.slice(Math.max(0, cursor.offset - chunk.startOffset)))
+    .join("");
+  const start = terminalSequenceEnd(cursor.sequenceState, text);
+  const nextCursor = {
+    ...position,
+    sequenceState: terminalSequenceStateAfter(cursor.sequenceState, text, 0, start),
+  };
+  if (start === text.length) {
     return { type: "none", cursor: nextCursor };
   }
-  return {
-    type: "append",
-    data: appended
-      .map((chunk) => chunk.data.slice(Math.max(0, cursor.offset - chunk.startOffset)))
-      .join(""),
-    cursor: nextCursor,
-  };
+  return { type: "append", data: text.slice(start), cursor: nextCursor };
 }
 
-export { appendNewerOutput, appendOutput, prependOutput, resetOutput, showLatestOutput };
+export {
+  appendNewerOutput,
+  appendOutput,
+  clearOutput,
+  prependOutput,
+  resetOutput,
+  showLatestOutput,
+};

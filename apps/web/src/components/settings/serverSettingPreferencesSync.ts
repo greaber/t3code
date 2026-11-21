@@ -1,3 +1,5 @@
+import { msg } from "gt-react";
+import { m } from "~/i18n/messages";
 import {
   type EnvironmentId,
   requiredScopesForServerSettingsPatch,
@@ -112,8 +114,13 @@ function applyServerSettingPreferences(): void {
       reportedFailures.add(reportKey);
       toastManager.add({
         type: "error",
-        title: "Settings not applied",
-        description: `Could not apply your all-environment settings on ${label}: ${failed.message}`,
+        title: m(msg("Settings not applied")),
+        description: m(
+          msg("Could not apply your all-environment settings on {label}: {message}", {
+            label,
+            message: failed.message,
+          }),
+        ),
       });
     });
   }
