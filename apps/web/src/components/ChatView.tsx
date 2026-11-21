@@ -3165,8 +3165,8 @@ export default function ChatView(props: ChatViewProps) {
       toastManager.add(
         stackedThreadToast({
           type: "info",
-          title: m(msg("Finish your draft first")),
-          description: m(msg("Send or clear the composer, then edit the waiting message.")),
+          title: gt("Finish your draft first"),
+          description: gt("Send or clear the composer, then edit the waiting message."),
         }),
       );
       return;
@@ -3178,7 +3178,7 @@ export default function ChatView(props: ChatViewProps) {
       cursor: message.draftText.length,
       prompt: message.draftText,
     });
-    scheduleComposerFocus();
+    scheduleComposerFocusStable();
   };
   const editOutboxMessageStable = useStableCallback(editOutboxMessage);
   const onExpandTimelineImage = (preview: ExpandedImagePreview) => {

@@ -495,12 +495,18 @@ describe("SSH server restart update", () => {
       const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
         Effect.sync(() => value.dispose()),
       );
+      yield* AtomRegistry.mount(registry, serverUpdateStateAtom(TARGET.environmentId));
       const result = yield* Effect.promise(() =>
-        atoms.updateServer.run(registry, {
-          environmentId: TARGET.environmentId,
-          input: { targetVersion: "0.0.31" },
-          restartSshServer: true,
-        }),
+        runAtomCommand(
+          registry,
+          atoms.updateServer,
+          {
+            environmentId: TARGET.environmentId,
+            input: { targetVersion: "0.0.31" },
+            restartSshServer: true,
+          },
+          { reportFailure: false, reportDefect: false },
+        ),
       );
 
       expect(yield* Ref.get(restarts)).toBe(1);

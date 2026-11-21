@@ -93,7 +93,7 @@ export type TerminalOutputUpdate =
 
 /** A page of server output, as `terminal.history` returns it. */
 export interface TerminalHistoryPageInput {
-  readonly sequenceState?: number;
+  readonly sequenceState?: number | undefined;
   readonly data: string;
   readonly offset: number;
   readonly end: number;
@@ -433,7 +433,7 @@ function resetOutput(
     readonly offset: number;
     readonly end: number;
     readonly older: boolean;
-    readonly sequenceState?: number;
+    readonly sequenceState?: number | undefined;
   },
   cols = DEFAULT_TERMINAL_COLS,
 ): TerminalOutputState {

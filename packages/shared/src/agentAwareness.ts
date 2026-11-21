@@ -129,12 +129,14 @@ export function projectThreadAwarenessV2(
     return null;
   }
   const asking =
-    subagentRequest !== null && resolveThreadAwarenessPhaseV2(thread, false) !== phase
+    subagentRequest !== null && resolveThreadAwarenessPhaseV2(thread, null) !== phase
       ? subagentRequest
       : null;
   const detail =
     asking !== null
-      ? `${asking.title} needs approval.`
+      ? asking.waitsForInput
+        ? `${asking.title} needs input.`
+        : `${asking.title} needs approval.`
       : phase === "completed"
         ? "Review the completed task."
         : phase === "failed"

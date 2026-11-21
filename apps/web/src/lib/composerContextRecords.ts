@@ -417,7 +417,7 @@ export function oversizedComposerContextLabels(input: {
           comment.text.length > COMPOSER_CONTEXT_REVIEW_TEXT_MAX_CHARS ||
           comment.diff.length > COMPOSER_CONTEXT_REVIEW_DIFF_MAX_CHARS,
       )
-      .map(reviewCommentContextLabel),
+      .map((comment) => reviewCommentContextLabel(comment)),
   ];
 }
 
