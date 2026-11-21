@@ -19,17 +19,7 @@ const state = vi.hoisted(() => ({
   badge: vi.fn(),
   settingsListeners: new Set<() => void>(),
 }));
-vi.mock(import("./ui/toast"), async (original) => {
-  const actual = await original();
-  return {
-    ...actual,
-    toastManager: {
-      ...actual.toastManager,
-      add: state.toast as never,
-      close: state.closeToast as never,
-    },
-  };
-});
+vi.mock("./ui/toast", () => ({ toastManager: { add: state.toast, close: state.closeToast } }));
 vi.mock(import("../state/shell"), async (original) => {
   const actual = await original();
   return {
