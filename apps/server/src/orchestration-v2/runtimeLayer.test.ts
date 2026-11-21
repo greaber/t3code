@@ -7092,7 +7092,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                   commits: [],
                 }),
               threadComments: (input) => {
-                pagesRead += 1;
+                if (input.projectId === projectId) pagesRead += 1;
                 assert.equal(input.threadId, "review-thread");
                 if (input.cursor === "after-10") {
                   return Effect.succeed({ comments: [eleventh], nextCursor: "after-11" });
@@ -7135,6 +7135,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       }
       yield* reactor.sweep;
       const pagesBefore = pagesRead;
+      if (mode !== "single page") assert.isAbove(pagesBefore, 0);
       yield* reactor.sweep;
       assert.equal(pagesRead, pagesBefore);
 
