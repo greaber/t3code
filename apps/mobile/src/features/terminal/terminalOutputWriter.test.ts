@@ -26,16 +26,17 @@ it("appends across rollover without replay and seeds fresh writers with only bou
   let state = EMPTY_TERMINAL_BUFFER_STATE;
   const chunks: string[] = [];
   await writer.write(state.output);
-  const retainedChunks = DEFAULT_MAX_TERMINAL_BUFFER_BYTES / (16 * 1024);
+  const retainedChunks = 4;
+  const byteLimit = retainedChunks * 16 * 1024;
   const total = retainedChunks * 4;
   for (let index = 0; index < total; index += 1) {
     const chunk = `${index}\r\n`.padEnd(16 * 1024, "x");
     chunks.push(chunk);
-    state = append(state, chunk);
+    state = append(state, chunk, byteLimit);
     await writer.write(state.output);
     expect(write).toHaveBeenLastCalledWith(chunk, false);
   }
-  expect(state.output.retainedBytes).toBe(DEFAULT_MAX_TERMINAL_BUFFER_BYTES);
+  expect(state.output.retainedBytes).toBe(byteLimit);
   const retained = chunks.slice(-retainedChunks).join("");
   expect(terminalOutputText(state.output)).toBe(retained);
   expect(write.mock.calls.filter(([, reset]) => reset)).toEqual([["", true]]);
