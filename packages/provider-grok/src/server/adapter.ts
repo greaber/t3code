@@ -387,7 +387,7 @@ export function makeGrokAcpAdapterFlavor(
     },
     resolveModelId: (selection) => resolveGrokAcpBaseModelId(selection.model),
     getModelContextWindow: (selection, session) => {
-      if (selection.instanceId !== options.instanceId) return undefined;
+      if (!session || selection.instanceId !== options.instanceId) return undefined;
       const modelId = resolveGrokAcpBaseModelId(selection.model);
       const models =
         session.sessionSetupResult.models ??

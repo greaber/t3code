@@ -72,6 +72,38 @@ function permissionRequest(
 }
 
 describe("AntigravityAdapterV2 flavor", () => {
+  it("sizes a first Neon handoff without guessing windows for aliases or other instances", () => {
+    const selection = {
+      instanceId: ProviderInstanceId.make("antigravity-test"),
+      model: "gemini-4-neon",
+    };
+    assert.equal(flavor.getModelContextWindow?.(selection, null), 1_000_000);
+    assert.isUndefined(
+      flavor.getModelContextWindow?.({ ...selection, model: "gemini-pro-orchestrator-neon" }, null),
+    );
+    assert.isUndefined(
+      flavor.getModelContextWindow?.(
+        { ...selection, instanceId: ProviderInstanceId.make("elsewhere") },
+        null,
+      ),
+    );
+    const setup: AcpSessionRuntime.AcpSessionRuntimeStartResult = {
+      sessionId: "test",
+      modelConfigId: undefined,
+      initializeResult: { protocolVersion: 1 },
+      sessionSetupResult: {
+        sessionId: "test",
+        models: {
+          currentModelId: selection.model,
+          availableModels: [
+            { modelId: selection.model, name: "Neon", _meta: { totalContextTokens: 32_000 } },
+          ],
+        },
+      },
+    };
+    assert.equal(flavor.getModelContextWindow?.(selection, setup), 32_000);
+  });
+
   it("keeps a successful subagent launch running until the parent turn becomes idle", () => {
     const batch = flavor.extractSubagentUpdate?.({
       toolCallId: "trajectory:4",

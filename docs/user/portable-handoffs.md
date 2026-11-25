@@ -3,20 +3,25 @@
 T3 Code transfers conversation context when you switch providers, continue through a portable
 restart, or use a fork that the provider cannot resume itself.
 
-Short conversations transfer intact. For longer conversations, T3 Code favors recent requests and
-answers, the original request, and relevant activity such as command outcomes. Selected messages
-keep their full text, order, and user or assistant role, including partial work from failed or
-interrupted turns. Your new request stays separate and is never shortened to make history fit.
+When the conversation fits, T3 transfers all eligible items. For longer conversations, it favors your
+original request, later instructions and corrections, then replies and plans, while keeping space
+for recent evidence such as command outcomes. Selected messages keep their full text, order, and
+user or assistant role, including partial work from failed or interrupted turns. Your new request stays separate and is never shortened to make history fit.
 
 Codex receives historical messages directly when its installed version supports that operation.
 Other providers receive the same selection as attributed conversation context. A handoff does not
 copy the outgoing provider's reasoning, tool-call state, or attachments.
 
-When history is left out, the thread shows a notice saying how many items did not fit, and the
-handoff includes references to them. The agent can use T3 Code's thread-reading tool to retrieve
-saved messages and activity, including the remainder of a long item. For an important constraint,
-you can still repeat it in your next message. A handoff is a budgeted selection, not an
-agent-written summary.
+On desktop and web, when you select a different provider in an existing conversation, the pending
+handoff offers **Ask outgoing model for a brief** if the previous model is available. This requests
+one extra reply from that model about your goal, decisions, verified work, and next steps. It leaves
+your draft and destination model selected. Send your message while the brief is being written to
+queue it for the new provider. To switch immediately, just send without requesting a brief; this
+also works when the old provider is rate-limited.
+
+If T3 leaves items out of the handoff, they remain in the thread. The notice refers to T3's handoff
+allowance, not a rejection by the model. The new agent can use the thread-reading tool to retrieve
+specific older messages and activity. A brief supplements the selected history; it does not replace it.
 
 ## Context limits
 
@@ -39,9 +44,10 @@ including attribution and JSON escaping. Your current input and attachments do n
 the allowance.
 
 T3 Code uses available capacity information for your selected model and options, together with
-provider context telemetry. Starting a fresh provider conversation clears prior usage, while keeping
-known model capacity. Changing models or context-window options discards stale usage and compaction
-thresholds.
+provider context telemetry. For native Antigravity's Gemini 4 Neon, T3 can use the published
+one-million-token window on the first handoff; a window reported for that model by the agent takes
+precedence. Starting a fresh provider conversation clears prior usage, while keeping known model
+capacity. Changing models or context-window options discards stale usage and compaction thresholds.
 
 When no capacity information is available, T3 Code assumes a 128,000-token window. It reserves at
 least 16,000 tokens, or a quarter of the window when larger, for instructions, tools, and subsequent
