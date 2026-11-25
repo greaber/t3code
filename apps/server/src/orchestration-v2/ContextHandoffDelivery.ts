@@ -28,7 +28,7 @@ export const textBesideHistory = (input: {
 
 /** The user-visible counterpart of the coverage note that tells the agent how to recover history. */
 export const omittedHistoryNotice = (omittedItems: number): string =>
-  `${omittedItems} earlier ${omittedItems === 1 ? "item" : "items"} of this thread did not fit in the model's context and ${omittedItems === 1 ? "was" : "were"} not passed along. The agent can read ${omittedItems === 1 ? "it" : "them"} from the thread when needed.`;
+  `T3 left ${omittedItems} earlier ${omittedItems === 1 ? "item" : "items"} out of this handoff to leave room for the new turn. The agent can still read ${omittedItems === 1 ? "it" : "them"} from the thread.`;
 
 /** Persist around injection; ambiguous delivery requires a fresh native thread. Call unsent if refused before prompt consumption. */
 export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextHandoffs")(

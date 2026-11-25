@@ -275,20 +275,32 @@ export function selectHistory(input: {
     input.budget -
     // Reserve both counters and the ID list at maximum width so the final context cannot exceed the budget.
     historyCost([], contextFor(messages.length, maxOmitted, widestIds));
-  const tryAdd = (index: number) => {
+  const tryAdd = (index: number, reserve = 0) => {
     const message = messages[index];
-    if (message === undefined || selected.has(index) || message.text.length > remaining) return;
+    const available = remaining - reserve;
+    if (message === undefined || selected.has(index) || message.text.length > available) return;
     const cost = Math.max(
       Buffer.byteLength(JSON.stringify(historyResponseItems([message], "")[1])) + 1,
       Buffer.byteLength(JSON.stringify(renderHistoricalMessage(message))) + 4,
     );
-    if (cost > remaining) return;
+    if (cost > available) return;
     selected.add(index);
     remaining -= cost;
   };
   tryAdd(messages.findLastIndex((message) => message.role === "user"));
-  tryAdd(messages.findLastIndex((message) => message.role === "assistant"));
+  // Tool output is attributed to the assistant too. Anchor an actual reply, not a shell log.
+  tryAdd(messages.findLastIndex((message) => message.kind === "assistant_message"));
   tryAdd(messages.findIndex((message) => message.role === "user"));
+  // Keep requests and corrections, then replies/plans. Leave room for recent evidence;
+  // unused space from either pass is available to every kind of item in the final pass.
+  const activityReserve = Math.floor(remaining / 3);
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index]?.role === "user") tryAdd(index, activityReserve);
+  }
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const kind = messages[index]?.kind;
+    if (kind === "assistant_message" || kind === "proposed_plan") tryAdd(index, activityReserve);
+  }
   for (let index = messages.length - 1; index >= 0; index--) tryAdd(index);
   const omittedItemIds = messages
     .filter((_, index) => !selected.has(index))

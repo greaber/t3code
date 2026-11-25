@@ -217,6 +217,18 @@ export function makeAntigravityAcpAdapterFlavor(
   return {
     driver: ANTIGRAVITY_PROVIDER,
     runtimeHarness: "Antigravity",
+    getModelContextWindow: (selection, session) => {
+      if (selection.instanceId !== options.instanceId) return undefined;
+      const reported = session?.sessionSetupResult.models?.availableModels.find(
+        (model) => model.modelId === selection.model,
+      )?._meta?.totalContextTokens;
+      if (typeof reported === "number" && Number.isSafeInteger(reported) && reported > 0)
+        return reported;
+      // Published model capacity, not available space. Never infer the window of aliases,
+      // orchestrators or other models from their name. Delivery still respects live limits.
+      // https://ai.google.dev/gemini-api/docs/models/gemini-4-neon
+      return selection.model === "gemini-4-neon" ? 1_000_000 : undefined;
+    },
     capabilities: AntigravityProviderCapabilitiesV2,
     supportsNativeGoals: options.supportsNativeGoals ?? Effect.succeed(false),
     // Agents that advertise HTTP MCP skip the stdio bridge process; others keep stdio.

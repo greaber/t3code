@@ -465,9 +465,10 @@ export interface AcpAdapterV2Flavor {
    * is not inferred from the setup result.
    */
   readonly modelOptionArrivesLate?: boolean;
+  /** Handoffs may need the window before the first native session has started. */
   readonly getModelContextWindow?: (
     selection: ModelSelection,
-    session: AcpSessionRuntime.AcpSessionRuntimeStartResult,
+    session: AcpSessionRuntime.AcpSessionRuntimeStartResult | null,
   ) => number | undefined;
   readonly applyModelSelection?: (input: {
     readonly runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
@@ -9799,12 +9800,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           ...(flavor.getModelContextWindow === undefined
             ? {}
             : {
-                getModelContextWindow: (selection) => {
-                  const session = Ref.getUnsafe(activeSessionSetup);
-                  return session === null
-                    ? undefined
-                    : flavor.getModelContextWindow?.(selection, session);
-                },
+                getModelContextWindow: (selection) =>
+                  flavor.getModelContextWindow?.(selection, Ref.getUnsafe(activeSessionSetup)),
               }),
           ...(canReportBackgroundWork
             ? {

@@ -184,6 +184,23 @@ describe("handoff budget", () => {
     assert.isAtMost(historyCost(selected.messages, selected.context), 3_000);
   });
 
+  it("retains user corrections, a real reply and recent evidence in a noisy handoff", () => {
+    const requests = Array.from({ length: 12 }, (_, i) =>
+      message(`constraint:${i}`, "user", `Keep requirement ${i} in effect.`),
+    );
+    const reply = message("reply", "assistant", "The index fix is verified; the retry fix is not.");
+    const logs = Array.from({ length: 40 }, (_, i) => ({
+      ...message(`log:${i}`, "assistant", "build output\n".repeat(100)),
+      kind: "command_execution" as const,
+    }));
+    const candidates = [...requests, reply, ...logs];
+    const selected = selectHistory({ messages: candidates, coverage: "test", budget: 12_000 });
+    assert.deepEqual(selected.messages.slice(0, requests.length + 1), [...requests, reply]);
+    assert.include(selected.messages, logs.at(-1));
+    assert.isAbove(selected.omittedItems, 0);
+    assert.isAtMost(historyCost(selected.messages, selected.context), 12_000);
+  });
+
   it("points history recovery at the omitted items instead of a read from the thread's start", () => {
     const omitted = message("item:omitted", "assistant", "o".repeat(4_000));
     const selected = selectHistory({
