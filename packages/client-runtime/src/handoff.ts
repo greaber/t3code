@@ -27,7 +27,7 @@ export function resolvePendingHandoff(
   projection: Pick<ThreadStructure, "runs" | "visibleTurnItems"> | null | undefined,
   selection: ModelSelection | null | undefined,
   providers: ReadonlyArray<ServerProvider>,
-): HandoffEndpoints | null {
+): { from: readonly [ModelSelection]; to: ModelSelection } | null {
   // A thread with an empty timeline has nothing to hand off. Any loaded row
   // counts: paging can leave a window of only tool rows.
   if (!projection?.visibleTurnItems.length) return null;

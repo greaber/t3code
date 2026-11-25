@@ -75,6 +75,7 @@ import {
   type EnvironmentId,
   type MessageId,
   type ModelSelection,
+  type RunId,
   type PreviewAnnotationPayload,
   ProviderInstanceId,
   type ServerProvider,
@@ -239,6 +240,7 @@ import { useOpenPanelPullRequestUrl } from "../hooks/useOpenPanelPullRequestUrl"
 import { isPreviewFocused } from "../lib/previewFocus";
 import { getTerminalFocusOwner } from "../lib/terminalFocus";
 import { draftModelSelectionApplies, threadHasStarted } from "../lib/chatThreadActions";
+import { isHandoffSourceOffered } from "../modelSelection";
 import {
   deriveLogicalProjectKeyFromSettings,
   selectProjectGroupingSettings,
@@ -421,6 +423,8 @@ const EMPTY_TURN_ITEMS: ThreadStructure["turnItems"] = [];
 const EMPTY_RUNS: ThreadStructure["runs"] = [];
 const EMPTY_AUTO_UPDATE_ENVIRONMENTS: ReadonlyArray<EnvironmentPresentation> = [];
 const EMPTY_COMPOSER_BANNER_ITEMS: ReadonlyArray<ComposerBannerStackItem> = [];
+const HANDOFF_BRIEF_REQUEST =
+  "Write a handoff brief of at most 250 words for the next agent, in the language of this conversation. State the current task, the user's decisions and constraints, what was changed and verified (with evidence), and the next steps or open questions. Distinguish confirmed facts from assumptions. Reply here; do not use tools, change files, or continue the task.";
 
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
 
@@ -1921,7 +1925,7 @@ export default function ChatView(props: ChatViewProps) {
     useComposerFocus(composerRef);
   const canInterruptRunningThread =
     canOperateThread && deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime);
-  const onInterrupt = async () => {
+  const onInterrupt = async (runId?: RunId) => {
     if (
       !activeThread ||
       !readEnvironmentScope(activeThread.environmentId, AuthOrchestrationOperateScope)
@@ -1929,7 +1933,7 @@ export default function ChatView(props: ChatViewProps) {
       return;
     const result = await interruptThreadTurn({
       environmentId,
-      input: { threadId: activeThread.id },
+      input: { threadId: activeThread.id, ...(runId ? { runId } : {}) },
     });
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
       const error = squashAtomCommandFailure(result);
@@ -2577,13 +2581,11 @@ export default function ChatView(props: ChatViewProps) {
     pendingHandoffSelectionUsable ? pendingHandoffSelection : null,
     providerStatuses,
   );
-  const compactThreadUnavailable =
+  const standaloneTurnUnavailable =
     !canOperateThread ||
     !activeThread ||
-    !activeThreadHasCompactableConversation ||
     !activeProject ||
     !isServerThread ||
-    !manualCompactionProviderAvailable ||
     isWorking ||
     isRevertingCheckpoint ||
     threadDetailLoading ||
@@ -2592,6 +2594,10 @@ export default function ChatView(props: ChatViewProps) {
     feedbackUploading ||
     pendingApprovals.length > 0 ||
     pendingUserInputs.length > 0;
+  const compactThreadUnavailable =
+    standaloneTurnUnavailable ||
+    !activeThreadHasCompactableConversation ||
+    !manualCompactionProviderAvailable;
   const compactDisabled = compactThreadUnavailable;
   const freshSessionAvailable =
     activeMessageCount > 0 && serverConfig?.environment.capabilities.freshContext === true;
@@ -3271,6 +3277,30 @@ export default function ChatView(props: ChatViewProps) {
         message.inputIntent === "queued_turn" &&
         !serverProjection?.messages.some((committed) => committed.id === message.id),
     );
+  const briefSource = pendingHandoff?.from[0];
+  const briefRunId =
+    latestServerUserItem?.type === "user_message" &&
+    latestServerUserItem.text === HANDOFF_BRIEF_REQUEST
+      ? latestServerUserItem.runId
+      : null;
+  const writingBrief = briefRunId !== null && briefRunId === activeRuntime?.activeRunId;
+  const canRequestBrief =
+    briefSource &&
+    composerModelSelectionExplicit &&
+    clientSettingsHydrated &&
+    !standaloneTurnUnavailable &&
+    !hasQueuedTurns &&
+    !queuedRunEdit.isEditing &&
+    multipleModelSelections === null &&
+    !freshSessionPending &&
+    !worktreeSetupBlocksSend &&
+    !projectCloneSendBlockReason &&
+    !(
+      briefRunId !== null &&
+      briefRunId === activeLatestRun?.runId &&
+      activeLatestRun.status === "completed"
+    ) &&
+    isHandoffSourceOffered(settings, providerInstanceEntries, briefSource);
   const scrollToEndSummary =
     [
       childInputNow?.waitingLabel ?? null,
@@ -3297,6 +3327,24 @@ export default function ChatView(props: ChatViewProps) {
               environmentId={environmentId}
               endpoints={pendingHandoff}
               providers={providerStatuses}
+              briefAction={
+                writingBrief && canInterruptRunningThread
+                  ? {
+                      label: gt("Stop generation"),
+                      onClick: () => void onInterruptStable(briefRunId),
+                    }
+                  : canRequestBrief
+                    ? {
+                        label: gt("Ask outgoing model for a brief"),
+                        onClick: () =>
+                          void sendStandaloneCommand(
+                            HANDOFF_BRIEF_REQUEST,
+                            gt("Failed to send message."),
+                            briefSource,
+                          ),
+                      }
+                    : null
+              }
               pending
             />
           </div>
@@ -3803,7 +3851,9 @@ export default function ChatView(props: ChatViewProps) {
                                   isLocalDraftThread && activeProject === null
                                 }
                                 phase={phase}
-                                canSteer={!compactionBlocksSteer}
+                                canSteer={
+                                  !compactionBlocksSteer && !(pendingHandoff && writingBrief)
+                                }
                                 canInterrupt={canInterruptRunningThread}
                                 isSendBusy={
                                   (isSendBusy && !sendQueuesBehindSetup) ||

@@ -676,6 +676,7 @@ export function HandoffRow(props: {
   readonly endpoints: HandoffEndpoints;
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly pending?: boolean;
+  readonly briefAction?: { readonly label: string; readonly onClick: () => void } | null;
   readonly failed?: boolean;
 }) {
   const gt = useGT();
@@ -712,6 +713,11 @@ export function HandoffRow(props: {
             <ArrowRightIcon aria-hidden="true" className="size-3 shrink-0" />
           ) : null}
           <HandoffEndpoint entries={entries} instanceId={to.instanceId} model={to.model} />
+          {props.briefAction ? (
+            <Button size="xs" variant="outline" onClick={props.briefAction.onClick}>
+              {props.briefAction.label}
+            </Button>
+          ) : null}
         </span>
       }
     />

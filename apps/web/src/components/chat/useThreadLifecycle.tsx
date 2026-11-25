@@ -21,6 +21,7 @@ import {
   AuthOrchestrationOperateScope,
   AuthSourceControlWriteScope,
   type EnvironmentId,
+  type ModelSelection,
   type ScopedThreadRef,
   type ThreadId,
   ProviderInteractionMode,
@@ -542,11 +543,16 @@ export function useThreadLifecycle(input: ThreadLifecycleInput) {
     messages,
   );
 
-  const sendStandaloneCommand = async (text: string, failureMessage: string) => {
+  const sendStandaloneCommand = async (
+    text: string,
+    failureMessage: string,
+    handoffSource?: ModelSelection,
+  ) => {
     if (!activeThread || !clientSettingsHydrated || sendInFlightRef.current) return;
     const context = composerRef.current?.getSendContext();
     if (!context?.providerAvailable) return;
 
+    const interactionMode = handoffSource ? activeThread.interactionMode : DEFAULT_INTERACTION_MODE;
     const threadId = activeThread.id;
     const messageId = newMessageId();
     const createdAt = new Date().toISOString();
@@ -572,7 +578,7 @@ export function useThreadLifecycle(input: ThreadLifecycleInput) {
       createdAt,
       ...(localCheckoutBranchMismatch ? { branch: localCheckoutBranchMismatch.currentBranch } : {}),
       runtimeMode,
-      interactionMode: DEFAULT_INTERACTION_MODE,
+      interactionMode,
     });
     const result =
       settingsResult._tag === "Failure"
@@ -582,9 +588,11 @@ export function useThreadLifecycle(input: ThreadLifecycleInput) {
             input: {
               threadId,
               message: { messageId, role: "user", text, attachments: [] },
-              modelSelection: context.selectedModelSelection,
+              modelSelection: handoffSource ?? context.selectedModelSelection,
+              // A brief is a separate turn; never steer another client's active run.
+              ...(handoffSource ? { dispatchMode: "start" } : {}),
               runtimeMode,
-              interactionMode: DEFAULT_INTERACTION_MODE,
+              interactionMode,
               createdAt,
             },
           });

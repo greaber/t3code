@@ -33,6 +33,7 @@ import { ModelEsque } from "./components/chat/providerIconUtils";
 import {
   type ProviderInstanceEntry,
   deriveProviderInstanceEntries,
+  isProviderInstancePickerReady,
   NO_PROVIDER_MODEL_SELECTION,
   resolveDefaultProviderModelSelection,
   resolveProjectDefaultProviderModelSelection,
@@ -247,6 +248,25 @@ export function getAppModelOptionsForInstance(
     entry.driverKind,
     selectedModel,
     preferences.hiddenModels,
+  );
+}
+
+/** A handoff brief must use the outgoing model itself, never the picker's fallback. */
+export function isHandoffSourceOffered(
+  settings: UnifiedSettings,
+  entries: ReadonlyArray<ProviderInstanceEntry>,
+  source: ModelSelection,
+): boolean {
+  const entry = entries.find((candidate) => candidate.instanceId === source.instanceId);
+  if (!entry || !isProviderInstancePickerReady(entry)) return false;
+  const model = getAppModelOptionsForInstance(settings, entry).find(
+    (option) => option.slug === source.model,
+  );
+  return (
+    model !== undefined &&
+    !entry.snapshot.subProviders?.some(
+      (sub) => sub.name === model.subProvider && sub.unavailableReason !== undefined,
+    )
   );
 }
 
